@@ -38,18 +38,18 @@ public:
     ~RPC();
 
     void setConnection(Connection* c);
-    void setEZclassicd(QProcess* p);
-    const QProcess* getEZclassicD() { return ezclassicd; }
+    void setEZClassicd(QProcess* p);
+    const QProcess* getEZClassicD() { return ezclassicd; }
 
     void refresh(bool force = false);
 
-    void refreshAddresses();
-
+    void refreshAddresses();    
+    
     void checkForUpdate(bool silent = true);
     void refreshZCLPrice();
     void getZboardTopics(std::function<void(QMap<QString, QString>)> cb);
 
-    void executeTransaction(Tx tx,
+    void executeTransaction(Tx tx, 
         const std::function<void(QString opid)> submitted,
         const std::function<void(QString opid, QString txid)> computed,
         const std::function<void(QString opid, QString errStr)> error);
@@ -57,10 +57,13 @@ public:
     void fillTxJsonParams(json& params, Tx tx);
     void sendZTransaction(json params, const std::function<void(json)>& cb, const std::function<void(QString)>& err);
     void watchTxStatus();
-    void addNewTxToWatch(const QString& newOpid, WatchedTx wtx);
+
+    const QMap<QString, WatchedTx> getWatchingTxns() { return watchingOps; }
+    void addNewTxToWatch(const QString& newOpid, WatchedTx wtx); 
 
     const TxTableModel*               getTransactionsModel() { return transactionsTableModel; }
     const QList<QString>*             getAllZAddresses()     { return zaddresses; }
+    const QList<QString>*             getAllTAddresses()     { return taddresses; }
     const QList<UnspentOutput>*       getUTXOs()             { return utxos; }
     const QMap<QString, double>*      getAllBalances()       { return allBalances; }
     const QMap<QString, bool>*        getUsedAddresses()     { return usedAddresses; }
@@ -73,10 +76,12 @@ public:
     void importZPrivKey(QString addr, bool rescan, const std::function<void(json)>& cb);
     void importTPrivKey(QString addr, bool rescan, const std::function<void(json)>& cb);
 
-    void shutdownZclassicd();
+    void shutdownZClassicd();
     void noConnection();
+    bool isEmbedded() { return ezclassicd != nullptr; }
 
     QString getDefaultSaplingAddress();
+    QString getDefaultTAddress();
 
     void getAllPrivKeys(const std::function<void(QList<QPair<QString, QString>>)>);
 
@@ -86,11 +91,11 @@ public:
 private:
     void refreshBalances();
 
-    void refreshTransactions();
+    void refreshTransactions();    
     void refreshSentZTrans();
     void refreshReceivedZTrans(QList<QString> zaddresses);
 
-    bool processUnspent     (const json& reply);
+    bool processUnspent     (const json& reply, QMap<QString, double>* newBalances, QList<UnspentOutput>* newUtxos);
     void updateUI           (bool anyUnconfirmed);
 
     void getInfoThenRefresh(bool force);
@@ -101,6 +106,7 @@ private:
     void getZUnspent            (const std::function<void(json)>& cb);
     void getTransactions        (const std::function<void(json)>& cb);
     void getZAddresses          (const std::function<void(json)>& cb);
+    void getTAddresses          (const std::function<void(json)>& cb);
 
     Connection*                 conn                        = nullptr;
     QProcess*                   ezclassicd                     = nullptr;
@@ -109,7 +115,8 @@ private:
     QMap<QString, double>*      allBalances                 = nullptr;
     QMap<QString, bool>*        usedAddresses               = nullptr;
     QList<QString>*             zaddresses                  = nullptr;
-
+    QList<QString>*             taddresses                  = nullptr;
+    
     QMap<QString, WatchedTx>    watchingOps;
 
     TxTableModel*               transactionsTableModel      = nullptr;

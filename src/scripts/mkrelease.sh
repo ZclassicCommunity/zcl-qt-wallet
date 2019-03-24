@@ -1,30 +1,30 @@
 #!/bin/bash
-if [ -z $QT_STATIC ]; then
-    echo "QT_STATIC is not set. Please set it to the base directory of a statically compiled Qt";
-    exit 1;
+if [ -z $QT_STATIC ]; then 
+    echo "QT_STATIC is not set. Please set it to the base directory of a statically compiled Qt"; 
+    exit 1; 
 fi
 
 if [ -z $APP_VERSION ]; then echo "APP_VERSION is not set"; exit 1; fi
 if [ -z $PREV_VERSION ]; then echo "PREV_VERSION is not set"; exit 1; fi
 
-if [ -z $ZCLASSIC_DIR ]; then
-    echo "ZCLASSIC_DIR is not set. Please set it to the base directory of a Zclassic project with built Zclassic binaries."
+if [ -z $ZCASH_DIR ]; then
+    echo "ZCASH_DIR is not set. Please set it to the base directory of a ZClassic project with built ZClassic binaries."
     exit 1;
 fi
 
-if [ ! -f $ZCLASSIC_DIR/artifacts/zclassicd ]; then
-    echo "Couldn't find zclassicd in $ZCLASSIC_DIR/artifacts/. Please build zclassicd."
+if [ ! -f $ZCASH_DIR/artifacts/zclassicd ]; then
+    echo "Couldn't find zclassicd in $ZCASH_DIR/artifacts/. Please build zclassicd."
     exit 1;
 fi
 
-if [ ! -f $ZCLASSIC_DIR/artifacts/zclassic-cli ]; then
-    echo "Couldn't find zclassic-cli in $ZCLASSIC_DIR/artifacts/. Please build zclassicd."
+if [ ! -f $ZCASH_DIR/artifacts/zclassic-cli ]; then
+    echo "Couldn't find zclassic-cli in $ZCASH_DIR/artifacts/. Please build zclassicd."
     exit 1;
 fi
 
 # Ensure that zclassicd is the right build
 echo -n "zclassicd version........."
-if grep -q "zqwMagicBean" $ZCLASSIC_DIR/artifacts/zclassicd && ! readelf -s $ZCLASSIC_DIR/artifacts/zclassicd | grep -q "GLIBC_2\.25"; then
+if grep -q "zqwMagicBean" $ZCASH_DIR/artifacts/zclassicd && ! readelf -s $ZCASH_DIR/artifacts/zclassicd | grep -q "GLIBC_2\.25"; then 
     echo "[OK]"
 else
     echo "[ERROR]"
@@ -33,7 +33,7 @@ else
 fi
 
 echo -n "zclassicd.exe version....."
-if grep -q "zqwMagicBean" $ZCLASSIC_DIR/artifacts/zclassicd.exe; then
+if grep -q "zqwMagicBean" $ZCASH_DIR/artifacts/zclassicd.exe; then 
     echo "[OK]"
 else
     echo "[ERROR]"
@@ -66,70 +66,72 @@ echo "[OK]"
 
 echo -n "Building..............."
 rm -rf bin/zcl-qt-wallet* > /dev/null
+rm -rf bin/zclwallet* > /dev/null
+make clean > /dev/null
 make -j$(nproc) > /dev/null
 echo "[OK]"
 
 
 # Test for Qt
 echo -n "Static link............"
-if [[ $(ldd zcl-qt-wallet | grep -i "Qt") ]]; then
-    echo "FOUND QT; ABORT";
+if [[ $(ldd zclwallet | grep -i "Qt") ]]; then
+    echo "FOUND QT; ABORT"; 
     exit 1
 fi
 echo "[OK]"
 
 
 echo -n "Packaging.............."
-mkdir bin/zcl-qt-wallet-v$APP_VERSION > /dev/null
-strip zcl-qt-wallet
+mkdir bin/zclwallet-v$APP_VERSION > /dev/null
+strip zclwallet
 
-cp zcl-qt-wallet                  bin/zcl-qt-wallet-v$APP_VERSION > /dev/null
-cp $ZCLASSIC_DIR/artifacts/zclassicd    bin/zcl-qt-wallet-v$APP_VERSION > /dev/null
-cp $ZCLASSIC_DIR/artifacts/zclassic-cli bin/zcl-qt-wallet-v$APP_VERSION > /dev/null
-cp README.md                      bin/zcl-qt-wallet-v$APP_VERSION > /dev/null
-cp LICENSE                        bin/zcl-qt-wallet-v$APP_VERSION > /dev/null
+cp zclwallet                  bin/zclwallet-v$APP_VERSION > /dev/null
+cp $ZCASH_DIR/artifacts/zclassicd    bin/zclwallet-v$APP_VERSION > /dev/null
+cp $ZCASH_DIR/artifacts/zclassic-cli bin/zclwallet-v$APP_VERSION > /dev/null
+cp README.md                      bin/zclwallet-v$APP_VERSION > /dev/null
+cp LICENSE                        bin/zclwallet-v$APP_VERSION > /dev/null
 
-cd bin && tar czf linux-zcl-qt-wallet-v$APP_VERSION.tar.gz zcl-qt-wallet-v$APP_VERSION/ > /dev/null
-cd ..
+cd bin && tar czf linux-zclwallet-v$APP_VERSION.tar.gz zclwallet-v$APP_VERSION/ > /dev/null
+cd .. 
 
 mkdir artifacts >/dev/null 2>&1
-cp bin/linux-zcl-qt-wallet-v$APP_VERSION.tar.gz ./artifacts/linux-binaries-zcl-qt-wallet-v$APP_VERSION.tar.gz
+cp bin/linux-zclwallet-v$APP_VERSION.tar.gz ./artifacts/linux-binaries-zclwallet-v$APP_VERSION.tar.gz
 echo "[OK]"
 
 
-if [ -f artifacts/linux-binaries-zcl-qt-wallet-v$APP_VERSION.tar.gz ] ; then
+if [ -f artifacts/linux-binaries-zclwallet-v$APP_VERSION.tar.gz ] ; then
     echo -n "Package contents......."
     # Test if the package is built OK
-    if tar tf "artifacts/linux-binaries-zcl-qt-wallet-v$APP_VERSION.tar.gz" | wc -l | grep -q "6"; then
+    if tar tf "artifacts/linux-binaries-zclwallet-v$APP_VERSION.tar.gz" | wc -l | grep -q "6"; then 
         echo "[OK]"
     else
         echo "[ERROR]"
         exit 1
-    fi
+    fi    
 else
     echo "[ERROR]"
     exit 1
 fi
 
 echo -n "Building deb..........."
-debdir=bin/deb/zcl-qt-wallet-v$APP_VERSION
+debdir=bin/deb/zclwallet-v$APP_VERSION
 mkdir -p $debdir > /dev/null
 mkdir    $debdir/DEBIAN
 mkdir -p $debdir/usr/local/bin
 
 cat src/scripts/control | sed "s/RELEASE_VERSION/$APP_VERSION/g" > $debdir/DEBIAN/control
 
-cp zcl-qt-wallet               $debdir/usr/local/bin/
-cp $ZCLASSIC_DIR/artifacts/zclassicd $debdir/usr/local/bin/zqw-zclassicd
+cp zclwallet                   $debdir/usr/local/bin/
+cp $ZCASH_DIR/artifacts/zclassicd $debdir/usr/local/bin/zqw-zclassicd
 
 mkdir -p $debdir/usr/share/pixmaps/
-cp res/zcl-qt-wallet.xpm       $debdir/usr/share/pixmaps/
+cp res/zclwallet.xpm           $debdir/usr/share/pixmaps/
 
 mkdir -p $debdir/usr/share/applications
 cp src/scripts/desktopentry    $debdir/usr/share/applications/zcl-qt-wallet.desktop
 
 dpkg-deb --build $debdir >/dev/null
-cp $debdir.deb                 artifacts/linux-deb-zcl-qt-wallet-v$APP_VERSION.deb
+cp $debdir.deb                 artifacts/linux-deb-zclwallet-v$APP_VERSION.deb
 echo "[OK]"
 
 
@@ -137,20 +139,20 @@ echo "[OK]"
 echo ""
 echo "[Windows]"
 
-if [ -z $MXE_PATH ]; then
+if [ -z $MXE_PATH ]; then 
     echo "MXE_PATH is not set. Set it to ~/github/mxe/usr/bin if you want to build Windows"
     echo "Not building Windows"
-    exit 0;
+    exit 0; 
 fi
 
-if [ ! -f $ZCLASSIC_DIR/artifacts/zclassicd.exe ]; then
-    echo "Couldn't find zclassicd.exe in $ZCLASSIC_DIR/artifacts/. Please build zclassicd.exe"
+if [ ! -f $ZCASH_DIR/artifacts/zclassicd.exe ]; then
+    echo "Couldn't find zclassicd.exe in $ZCASH_DIR/artifacts/. Please build zclassicd.exe"
     exit 1;
 fi
 
 
-if [ ! -f $ZCLASSIC_DIR/artifacts/zclassic-cli.exe ]; then
-    echo "Couldn't find zclassic-cli.exe in $ZCLASSIC_DIR/artifacts/. Please build zclassicd.exe"
+if [ ! -f $ZCASH_DIR/artifacts/zclassic-cli.exe ]; then
+    echo "Couldn't find zclassic-cli.exe in $ZCASH_DIR/artifacts/. Please build zclassicd.exe"
     exit 1;
 fi
 
@@ -172,22 +174,22 @@ echo "[OK]"
 
 
 echo -n "Packaging.............."
-mkdir release/zcl-qt-wallet-v$APP_VERSION
-cp release/zcl-qt-wallet.exe          release/zcl-qt-wallet-v$APP_VERSION
-cp $ZCLASSIC_DIR/artifacts/zclassicd.exe    release/zcl-qt-wallet-v$APP_VERSION > /dev/null
-cp $ZCLASSIC_DIR/artifacts/zclassic-cli.exe release/zcl-qt-wallet-v$APP_VERSION > /dev/null
-cp README.md                          release/zcl-qt-wallet-v$APP_VERSION
-cp LICENSE                            release/zcl-qt-wallet-v$APP_VERSION
-cd release && zip -r Windows-binaries-zcl-qt-wallet-v$APP_VERSION.zip zcl-qt-wallet-v$APP_VERSION/ > /dev/null
+mkdir release/zclwallet-v$APP_VERSION  
+cp release/zclwallet.exe          release/zclwallet-v$APP_VERSION 
+cp $ZCASH_DIR/artifacts/zclassicd.exe    release/zclwallet-v$APP_VERSION > /dev/null
+cp $ZCASH_DIR/artifacts/zclassic-cli.exe release/zclwallet-v$APP_VERSION > /dev/null
+cp README.md                          release/zclwallet-v$APP_VERSION 
+cp LICENSE                            release/zclwallet-v$APP_VERSION 
+cd release && zip -r Windows-binaries-zclwallet-v$APP_VERSION.zip zclwallet-v$APP_VERSION/ > /dev/null
 cd ..
 
 mkdir artifacts >/dev/null 2>&1
-cp release/Windows-binaries-zcl-qt-wallet-v$APP_VERSION.zip ./artifacts/
+cp release/Windows-binaries-zclwallet-v$APP_VERSION.zip ./artifacts/
 echo "[OK]"
 
-if [ -f artifacts/Windows-binaries-zcl-qt-wallet-v$APP_VERSION.zip ] ; then
+if [ -f artifacts/Windows-binaries-zclwallet-v$APP_VERSION.zip ] ; then
     echo -n "Package contents......."
-    if unzip -l "artifacts/Windows-binaries-zcl-qt-wallet-v$APP_VERSION.zip" | wc -l | grep -q "11"; then
+    if unzip -l "artifacts/Windows-binaries-zclwallet-v$APP_VERSION.zip" | wc -l | grep -q "11"; then 
         echo "[OK]"
     else
         echo "[ERROR]"

@@ -786,7 +786,7 @@ Please set the host/port and user/password in the Edit-&gt;Settings menu.</sourc
     </message>
     <message>
         <location filename="../src/addressbook.cpp" line="127"/>
-        <source> doesn&apos;t seem to be a valid Zclassic address.</source>
+        <source> doesn&apos;t seem to be a valid ZClassic address.</source>
         <translation type="unfinished">YOUR_TRANSLATION_HERE</translation>
     </message>
     <message>
@@ -1094,7 +1094,7 @@ You either have unconfirmed funds or the balance is too low for an automatic mig
     </message>
     <message>
         <location filename="../src/zboard.ui" line="85"/>
-        <source>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;ZBoard: Fully anonymous and untraceable chat messages based on the Zclassic blockchain. &lt;a href=&quot;http://www.z-board.net/&quot;&gt;&lt;span style=&quot; text-decoration: underline; color:#0000ff;&quot;&gt;http://www.z-board.net/&lt;/span&gt;&lt;/a&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</source>
+        <source>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;ZBoard: Fully anonymous and untraceable chat messages based on the ZClassic blockchain. &lt;a href=&quot;http://www.z-board.net/&quot;&gt;&lt;span style=&quot; text-decoration: underline; color:#0000ff;&quot;&gt;http://www.z-board.net/&lt;/span&gt;&lt;/a&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</source>
         <translation type="unfinished">YOUR_TRANSLATION_HERE</translation>
     </message>
     <message>

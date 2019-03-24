@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
-	<Product Id="*" Name="zcl-qt-wallet vRELEASE_VERSION" Language="1033" Version="RELEASE_VERSION" Manufacturer="zcl-qt-wallet-org" UpgradeCode="fb9bf166-b55f-46b5-a990-9189bdf64533">
+	<Product Id="*" Name="ZclWallet vRELEASE_VERSION" Language="1033" Version="RELEASE_VERSION" Manufacturer="zcl-qt-wallet-org" UpgradeCode="fb9bf166-b55f-46b5-a990-9189bdf64533">
 		<Package InstallerVersion="200" Compressed="yes" InstallScope="perMachine" />
 
 		<MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
@@ -10,12 +10,12 @@
         <Property Id="ARPPRODUCTICON" Value="zclqtwalleticon.exe" />
 
 		<Feature Id="ProductFeature" Title="zcl-qt-wallet" Level="1">
-			<ComponentGroupRef Id="ProductComponents" />
+			<ComponentGroupRef Id="ProductComponents" /> 
             <ComponentRef Id="ProgramMenuDir"/>
 		</Feature>
 
         <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
-
+        
         <WixVariable Id="WixUIBannerBmp" Value="res/wxsbanner.bmp" />
         <WixVariable Id="WixUIDialogBmp" Value="res/wxsdialog.bmp" />
 
@@ -31,7 +31,7 @@
                   Event="NewDialog"
                   Value="WelcomeDlg"
                   Order="2">1</Publish>
-        </UI>
+        </UI>        
 	</Product>
 
 	<Fragment>
@@ -51,19 +51,30 @@
 		</Directory>
 	</Fragment>
 
-
+    
 	<Fragment>
 		<ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
 			<Component Id="ProductComponent" Guid="0D210F5A-53E0-4E7E-CAAD-15A26995505E">
-                <File Source="zcl-qt-wallet.exe" KeyPath="yes">
+                <File Source="zclwallet.exe" KeyPath="yes">
                     <Shortcut Id="startMenuShotcut" Advertise="yes" Directory="ApplicationProgramsFolder"
-                        Name="zcl-qt-wallet" WorkingDirectory="INSTALLFOLDER" Icon="zclqtwalleticon.exe" >
+                        Name="ZclWallet" WorkingDirectory="INSTALLFOLDER" Icon="zclqtwalleticon.exe" >
                     </Shortcut>
                 </File>
                 <File Source="LICENSE" />
                 <File Source="zclassicd.exe" />
                 <File Source="zclassic-cli.exe" />
                 <File Source="README.md" />
+
+                <RegistryKey Root="HKCR" Key="zclassic">
+                    <RegistryValue Type="string" Name="URL Protocol" Value=""/>
+                    <RegistryValue Type="string" Value="URL:zclassic URI protocol"/>
+                    <RegistryKey Key="DefaultIcon">
+                    <RegistryValue Type="string" Value="zclwallet.exe" />
+                    </RegistryKey>
+                    <RegistryKey Key="shell\open\command">
+                    <RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]zclwallet.exe&quot; &quot;%1&quot;" />
+                    </RegistryKey>
+                </RegistryKey>
 			</Component>
 		</ComponentGroup>
 	</Fragment>

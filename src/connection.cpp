@@ -20,14 +20,15 @@ ConnectionLoader::ConnectionLoader(MainWindow* main, RPC* rpc) {
     connD->topIcon->setBasePixmap(logo.scaled(256, 256, Qt::KeepAspectRatio, Qt::SmoothTransformation));
 }
 
-ConnectionLoader::~ConnectionLoader() {
+ConnectionLoader::~ConnectionLoader() {    
     delete d;
     delete connD;
 }
 
 void ConnectionLoader::loadConnection() {
     QTimer::singleShot(1, [=]() { this->doAutoConnect(); });
-    d->exec();
+    if (!Settings::getInstance()->isHeadless())
+        d->exec();
 }
 
 void ConnectionLoader::doAutoConnect(bool tryEzclassicdStart) {
@@ -38,30 +39,30 @@ void ConnectionLoader::doAutoConnect(bool tryEzclassicdStart) {
     }
 
     // Priority 2: Try to connect to detect zclassic.conf and connect to it.
-    auto config = autoDetectZclassicConf();
+    auto config = autoDetectZClassicConf();
     main->logger->write(QObject::tr("Attempting autoconnect"));
 
     if (config.get() != nullptr) {
         auto connection = makeConnection(config);
 
-        refreshZclassicdState(connection, [=] () {
+        refreshZClassicdState(connection, [=] () {
             // Refused connection. So try and start embedded zclassicd
             if (Settings::getInstance()->useEmbedded()) {
                 if (tryEzclassicdStart) {
                     this->showInformation(QObject::tr("Starting embedded zclassicd"));
-                    if (this->startEmbeddedZclassicd()) {
+                    if (this->startEmbeddedZClassicd()) {
                         // Embedded zclassicd started up. Wait a second and then refresh the connection
                         main->logger->write("Embedded zclassicd started up, trying autoconnect in 1 sec");
                         QTimer::singleShot(1000, [=]() { doAutoConnect(); } );
                     } else {
                         if (config->zclassicDaemon) {
                             // zclassicd is configured to run as a daemon, so we must wait for a few seconds
-                            // to let it start up.
+                            // to let it start up. 
                             main->logger->write("zclassicd is daemon=1. Waiting for it to start up");
                             this->showInformation(QObject::tr("zclassicd is set to run as daemon"), QObject::tr("Waiting for zclassicd"));
                             QTimer::singleShot(5000, [=]() { doAutoConnect(/* don't attempt to start ezclassicd */ false); });
                         } else {
-                            // Something is wrong.
+                            // Something is wrong. 
                             // We're going to attempt to connect to the one in the background one last time
                             // and see if that works, else throw an error
                             main->logger->write("Unknown problem while trying to start zclassicd");
@@ -69,27 +70,27 @@ void ConnectionLoader::doAutoConnect(bool tryEzclassicdStart) {
                         }
                     }
                 } else {
-                    // We tried to start ezclassicd previously, and it didn't work. So, show the error.
+                    // We tried to start ezclassicd previously, and it didn't work. So, show the error. 
                     main->logger->write("Couldn't start embedded zclassicd for unknown reason");
                     QString explanation;
                     if (config->zclassicDaemon) {
                         explanation = QString() % QObject::tr("You have zclassicd set to start as a daemon, which can cause problems "
-                            "with zcl-qt-wallet\n\n."
-                            "Please remove the following line from your zclassic.conf and restart zcl-qt-wallet\n"
+                            "with ZclWallet\n\n."
+                            "Please remove the following line from your zclassic.conf and restart ZclWallet\n"
                             "daemon=1");
                     } else {
-                        explanation = QString() % QObject::tr("Couldn't start the embedded zclassicd.\n\n"
-                            "Please try restarting.\n\nIf you previously started zclassicd with custom arguments, you might need to reset zclassic.conf.\n\n"
-                            "If all else fails, please run zclassicd manually.") %
+                        explanation = QString() % QObject::tr("Couldn't start the embedded zclassicd.\n\n" 
+                            "Please try restarting.\n\nIf you previously started zclassicd with custom arguments, you might need to reset zclassic.conf.\n\n" 
+                            "If all else fails, please run zclassicd manually.") %  
                             (ezclassicd ? QObject::tr("The process returned") + ":\n\n" % ezclassicd->errorString() : QString(""));
                     }
-
+                    
                     this->showError(explanation);
-                }
+                }                
             } else {
                 // zclassic.conf exists, there's no connection, and the user asked us not to start zclassicd. Error!
                 main->logger->write("Not using embedded and couldn't connect to zclassicd");
-                QString explanation = QString() % QObject::tr("Couldn't connect to zclassicd configured in zclassic.conf.\n\n"
+                QString explanation = QString() % QObject::tr("Couldn't connect to zclassicd configured in zclassic.conf.\n\n" 
                                       "Not starting embedded zclassicd because --no-embedded was passed");
                 this->showError(explanation);
             }
@@ -97,12 +98,12 @@ void ConnectionLoader::doAutoConnect(bool tryEzclassicdStart) {
     } else {
         if (Settings::getInstance()->useEmbedded()) {
             // zclassic.conf was not found, so create one
-            createZclassicConf();
+            createZClassicConf();
         } else {
             // Fall back to manual connect
             doManualConnect();
         }
-    }
+    } 
 }
 
 QString randomPassword() {
@@ -123,16 +124,16 @@ QString randomPassword() {
 }
 
 /**
- * This will create a new zclassic.conf, download Zclassic parameters.
- */
-void ConnectionLoader::createZclassicConf() {
-    main->logger->write("createZclassicConf");
+ * This will create a new zclassic.conf, download ZClassic parameters.
+ */ 
+void ConnectionLoader::createZClassicConf() {
+    main->logger->write("createZClassicConf");
 
     auto confLocation = zclassicConfWritableLocation();
     QFileInfo fi(confLocation);
 
     QDialog d(main);
-    Ui_createZclassicConf ui;
+    Ui_createZClassicConf ui;
     ui.setupUi(&d);
 
     QPixmap logo(":/img/res/zclassicdlogo.gif");
@@ -177,11 +178,11 @@ void ConnectionLoader::createZclassicConf() {
         main->logger->write("Could not create zclassic.conf, returning");
         return;
     }
-
-    QTextStream out(&file);
-
+        
+    QTextStream out(&file); 
+    
     out << "server=1\n";
-    out << "addnode=dnsseed.zcl.community\n";
+    out << "addnode=mainnet.z.cash\n";
     out << "rpcuser=zcl-qt-wallet\n";
     out << "rpcpassword=" % randomPassword() << "\n";
     if (!datadir.isEmpty()) {
@@ -198,19 +199,19 @@ void ConnectionLoader::createZclassicConf() {
 }
 
 
-void ConnectionLoader::downloadParams(std::function<void(void)> cb) {
+void ConnectionLoader::downloadParams(std::function<void(void)> cb) {    
     main->logger->write("Adding params to download queue");
     // Add all the files to the download queue
     downloadQueue = new QQueue<QUrl>();
-    client = new QNetworkAccessManager(main);
-
+    client = new QNetworkAccessManager(main);   
+    
     downloadQueue->enqueue(QUrl("https://z.cash/downloads/sapling-output.params"));
-    downloadQueue->enqueue(QUrl("https://z.cash/downloads/sapling-spend.params"));
+    downloadQueue->enqueue(QUrl("https://z.cash/downloads/sapling-spend.params"));    
     downloadQueue->enqueue(QUrl("https://z.cash/downloads/sprout-proving.key"));
     downloadQueue->enqueue(QUrl("https://z.cash/downloads/sprout-verifying.key"));
     downloadQueue->enqueue(QUrl("https://z.cash/downloads/sprout-groth16.params"));
 
-    doNextDownload(cb);
+    doNextDownload(cb);    
 }
 
 void ConnectionLoader::doNextDownload(std::function<void(void)> cb) {
@@ -245,7 +246,7 @@ void ConnectionLoader::doNextDownload(std::function<void(void)> cb) {
     }
 
     // The downloaded file is written to a new name, and then renamed when the operation completes.
-    currentOutput = new QFile(QDir(paramsDir).filePath(filename + ".part"));
+    currentOutput = new QFile(QDir(paramsDir).filePath(filename + ".part"));   
 
     if (!currentOutput->open(QIODevice::WriteOnly)) {
         main->logger->write("Couldn't open " + currentOutput->fileName() + " for writing");
@@ -253,12 +254,12 @@ void ConnectionLoader::doNextDownload(std::function<void(void)> cb) {
     }
     main->logger->write("Downloading to " + filename);
     qDebug() << "Downloading " << url << " to " << filename;
-
+    
     QNetworkRequest request(url);
     request.setAttribute(QNetworkRequest::FollowRedirectsAttribute, true);
     currentDownload = client->get(request);
     downloadTime.start();
-
+    
     // Download Progress
     QObject::connect(currentDownload, &QNetworkReply::downloadProgress, [=] (auto done, auto total) {
         // calculate the download speed
@@ -278,7 +279,7 @@ void ConnectionLoader::doNextDownload(std::function<void(void)> cb) {
             QObject::tr("Downloading ") % filename % (filesRemaining > 1 ? " ( +" % QString::number(filesRemaining)  % QObject::tr(" more remaining )") : QString("")),
             QString::number(done/1024/1024, 'f', 0) % QObject::tr("MB of ") % QString::number(total/1024/1024, 'f', 0) + QObject::tr("MB at ") % QString::number(speed, 'f', 2) % unit);
     });
-
+    
     // Download Finished
     QObject::connect(currentDownload, &QNetworkReply::finished, [=] () {
         // Rename file
@@ -291,22 +292,22 @@ void ConnectionLoader::doNextDownload(std::function<void(void)> cb) {
 
         if (currentDownload->error()) {
             main->logger->write("Downloading " + filename + " failed");
-            this->showError(QObject::tr("Downloading ") + filename + QObject::tr(" failed. Please check the help site for more info"));
+            this->showError(QObject::tr("Downloading ") + filename + QObject::tr(" failed. Please check the help site for more info"));                
         } else {
             doNextDownload(cb);
         }
     });
 
-    // Download new data available.
+    // Download new data available. 
     QObject::connect(currentDownload, &QNetworkReply::readyRead, [=] () {
         currentOutput->write(currentDownload->readAll());
-    });
+    });    
 }
 
-bool ConnectionLoader::startEmbeddedZclassicd() {
-    if (!Settings::getInstance()->useEmbedded())
+bool ConnectionLoader::startEmbeddedZClassicd() {
+    if (!Settings::getInstance()->useEmbedded()) 
         return false;
-
+    
     main->logger->write("Trying to start embedded zclassicd");
 
     // Static because it needs to survive even after this method returns.
@@ -315,16 +316,16 @@ bool ConnectionLoader::startEmbeddedZclassicd() {
     if (ezclassicd != nullptr) {
         if (ezclassicd->state() == QProcess::NotRunning) {
             if (!processStdErrOutput.isEmpty()) {
-                QMessageBox::critical(main, QObject::tr("zclassicd error"), "zclassicd said: " + processStdErrOutput,
+                QMessageBox::critical(main, QObject::tr("zclassicd error"), "zclassicd said: " + processStdErrOutput, 
                                       QMessageBox::Ok);
             }
             return false;
         } else {
             return true;
-        }
+        }        
     }
 
-    // Finally, start zclassicd
+    // Finally, start zclassicd    
     QDir appPath(QCoreApplication::applicationDirPath());
 #ifdef Q_OS_LINUX
     auto zclassicdProgram = appPath.absoluteFilePath("zqw-zclassicd");
@@ -336,21 +337,21 @@ bool ConnectionLoader::startEmbeddedZclassicd() {
 #else
     auto zclassicdProgram = appPath.absoluteFilePath("zclassicd.exe");
 #endif
-
+    
     if (!QFile(zclassicdProgram).exists()) {
         qDebug() << "Can't find zclassicd at " << zclassicdProgram;
-        main->logger->write("Can't find zclassicd at " + zclassicdProgram);
+        main->logger->write("Can't find zclassicd at " + zclassicdProgram); 
         return false;
     }
 
-    ezclassicd = new QProcess(main);
+    ezclassicd = new QProcess(main);    
     QObject::connect(ezclassicd, &QProcess::started, [=] () {
         //qDebug() << "zclassicd started";
     });
 
     QObject::connect(ezclassicd, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
                         [=](int, QProcess::ExitStatus) {
-        //qDebug() << "zclassicd finished with code " << exitCode << "," << exitStatus;
+        //qDebug() << "zclassicd finished with code " << exitCode << "," << exitStatus;    
     });
 
     QObject::connect(ezclassicd, &QProcess::errorOccurred, [&] (auto) {
@@ -392,9 +393,9 @@ void ConnectionLoader::doManualConnect() {
     }
 
     auto connection = makeConnection(config);
-    refreshZclassicdState(connection, [=] () {
+    refreshZClassicdState(connection, [=] () {
         QString explanation = QString()
-                % QObject::tr("Could not connect to zclassicd configured in settings.\n\n"
+                % QObject::tr("Could not connect to zclassicd configured in settings.\n\n" 
                 "Please set the host/port and user/password in the Edit->Settings menu.");
 
         showError(explanation);
@@ -405,9 +406,9 @@ void ConnectionLoader::doManualConnect() {
 }
 
 void ConnectionLoader::doRPCSetConnection(Connection* conn) {
-    rpc->setEZclassicd(ezclassicd);
+    rpc->setEZClassicd(ezclassicd);
     rpc->setConnection(conn);
-
+    
     d->accept();
 
     delete this;
@@ -415,7 +416,7 @@ void ConnectionLoader::doRPCSetConnection(Connection* conn) {
 
 Connection* ConnectionLoader::makeConnection(std::shared_ptr<ConnectionConfig> config) {
     QNetworkAccessManager* client = new QNetworkAccessManager(main);
-
+         
     QUrl myurl;
     myurl.setScheme("http");
     myurl.setHost(config.get()->host);
@@ -424,15 +425,15 @@ Connection* ConnectionLoader::makeConnection(std::shared_ptr<ConnectionConfig> c
     QNetworkRequest* request = new QNetworkRequest();
     request->setUrl(myurl);
     request->setHeader(QNetworkRequest::ContentTypeHeader, "text/plain");
-
+    
     QString userpass = config.get()->rpcuser % ":" % config.get()->rpcpassword;
     QString headerData = "Basic " + userpass.toLocal8Bit().toBase64();
-    request->setRawHeader("Authorization", headerData.toLocal8Bit());
+    request->setRawHeader("Authorization", headerData.toLocal8Bit());    
 
     return new Connection(main, client, request, config);
 }
 
-void ConnectionLoader::refreshZclassicdState(Connection* connection, std::function<void(void)> refused) {
+void ConnectionLoader::refreshZClassicdState(Connection* connection, std::function<void(void)> refused) {
     json payload = {
         {"jsonrpc", "1.0"},
         {"id", "someid"},
@@ -440,28 +441,29 @@ void ConnectionLoader::refreshZclassicdState(Connection* connection, std::functi
     };
     connection->doRPC(payload,
         [=] (auto) {
-            // Success, hide the dialog if it was shown.
+            // Success, hide the dialog if it was shown. 
             d->hide();
+            main->logger->write("zclassicd is online.");
             this->doRPCSetConnection(connection);
         },
-        [=] (auto reply, auto res) {
-            // Failed, see what it is.
+        [=] (auto reply, auto res) {            
+            // Failed, see what it is. 
             auto err = reply->error();
             //qDebug() << err << ":" << QString::fromStdString(res.dump());
 
-            if (err == QNetworkReply::NetworkError::ConnectionRefusedError) {
+            if (err == QNetworkReply::NetworkError::ConnectionRefusedError) {   
                 refused();
             } else if (err == QNetworkReply::NetworkError::AuthenticationRequiredError) {
                 main->logger->write("Authentication failed");
-                QString explanation = QString() %
+                QString explanation = QString() % 
                         QObject::tr("Authentication failed. The username / password you specified was "
                         "not accepted by zclassicd. Try changing it in the Edit->Settings menu");
 
                 this->showError(explanation);
-            } else if (err == QNetworkReply::NetworkError::InternalServerError &&
+            } else if (err == QNetworkReply::NetworkError::InternalServerError && 
                     !res.is_discarded()) {
                 // The server is loading, so just poll until it succeeds
-                QString status    = QString::fromStdString(res["error"]["message"]);
+                QString status      = QString::fromStdString(res["error"]["message"]);
                 {
                     static int dots = 0;
                     status = status.left(status.length() - 3) + QString(".").repeated(dots);
@@ -472,35 +474,48 @@ void ConnectionLoader::refreshZclassicdState(Connection* connection, std::functi
                 this->showInformation(QObject::tr("Your zclassicd is starting up. Please wait."), status);
                 main->logger->write("Waiting for zclassicd to come online.");
                 // Refresh after one second
-                QTimer::singleShot(1000, [=]() { this->refreshZclassicdState(connection, refused); });
+                QTimer::singleShot(1000, [=]() { this->refreshZClassicdState(connection, refused); });
             }
         }
     );
 }
 
+// Update the UI with the status
 void ConnectionLoader::showInformation(QString info, QString detail) {
+    static int rescanCount = 0;
+    if (detail.toLower().startsWith("rescan")) {
+        rescanCount++;
+    }
+    
+    if (rescanCount > 10) {
+        detail = detail + "\n" + QObject::tr("This may take several hours");
+    }
+
     connD->status->setText(info);
     connD->statusDetail->setText(detail);
+
+    if (rescanCount < 10)
+        main->logger->write(info + ":" + detail);
 }
 
 /**
- * Show error will close the loading dialog and show an error.
+ * Show error will close the loading dialog and show an error. 
 */
-void ConnectionLoader::showError(QString explanation) {
-    rpc->setEZclassicd(nullptr);
+void ConnectionLoader::showError(QString explanation) {    
+    rpc->setEZClassicd(nullptr);
     rpc->noConnection();
 
     QMessageBox::critical(main, QObject::tr("Connection Error"), explanation, QMessageBox::Ok);
     d->close();
 }
 
-QString ConnectionLoader::locateZclassicConfFile() {
+QString ConnectionLoader::locateZClassicConfFile() {
 #ifdef Q_OS_LINUX
     auto confLocation = QStandardPaths::locate(QStandardPaths::HomeLocation, ".zclassic/zclassic.conf");
 #elif defined(Q_OS_DARWIN)
-    auto confLocation = QStandardPaths::locate(QStandardPaths::HomeLocation, "Library/Application Support/Zclassic/zclassic.conf");
+    auto confLocation = QStandardPaths::locate(QStandardPaths::HomeLocation, "Library/Application Support/ZClassic/zclassic.conf");
 #else
-    auto confLocation = QStandardPaths::locate(QStandardPaths::AppDataLocation, "../../Zclassic/zclassic.conf");
+    auto confLocation = QStandardPaths::locate(QStandardPaths::AppDataLocation, "../../ZClassic/zclassic.conf");
 #endif
 
     main->logger->write("Found zclassicconf at " + QDir::cleanPath(confLocation));
@@ -511,9 +526,9 @@ QString ConnectionLoader::zclassicConfWritableLocation() {
 #ifdef Q_OS_LINUX
     auto confLocation = QDir(QStandardPaths::writableLocation(QStandardPaths::HomeLocation)).filePath(".zclassic/zclassic.conf");
 #elif defined(Q_OS_DARWIN)
-    auto confLocation = QDir(QStandardPaths::writableLocation(QStandardPaths::HomeLocation)).filePath("Library/Application Support/Zclassic/zclassic.conf");
+    auto confLocation = QDir(QStandardPaths::writableLocation(QStandardPaths::HomeLocation)).filePath("Library/Application Support/ZClassic/zclassic.conf");
 #else
-    auto confLocation = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath("../../Zclassic/zclassic.conf");
+    auto confLocation = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath("../../ZClassic/zclassic.conf");
 #endif
 
     main->logger->write("Found zclassicconf at " + QDir::cleanPath(confLocation));
@@ -534,7 +549,7 @@ QString ConnectionLoader::zcashParamsDir() {
         QDir().mkpath(paramsLocation.absolutePath());
     }
 
-    main->logger->write("Found Zclassic params directory at " + paramsLocation.absolutePath());
+    main->logger->write("Found ZClassic params directory at " + paramsLocation.absolutePath());
     return paramsLocation.absolutePath();
 }
 
@@ -552,12 +567,12 @@ bool ConnectionLoader::verifyParams() {
 
 /**
  * Try to automatically detect a zclassic.conf file in the correct location and load parameters
- */
-std::shared_ptr<ConnectionConfig> ConnectionLoader::autoDetectZclassicConf() {
-    auto confLocation = locateZclassicConfFile();
+ */ 
+std::shared_ptr<ConnectionConfig> ConnectionLoader::autoDetectZClassicConf() {    
+    auto confLocation = locateZClassicConfFile();
 
     if (confLocation.isNull()) {
-        // No Zclassic file, just return with nothing
+        // No ZClassic file, just return with nothing
         return nullptr;
     }
 
@@ -571,12 +586,12 @@ std::shared_ptr<ConnectionConfig> ConnectionLoader::autoDetectZclassicConf() {
 
     auto zclassicconf = new ConnectionConfig();
     zclassicconf->host     = "127.0.0.1";
-    zclassicconf->connType = ConnectionType::DetectedConfExternalZclassicD;
-    zclassicconf->usingZclassicConf = true;
+    zclassicconf->connType = ConnectionType::DetectedConfExternalZClassicD;
+    zclassicconf->usingZClassicConf = true;
     zclassicconf->zclassicDir = QFileInfo(confLocation).absoluteDir().absolutePath();
     zclassicconf->zclassicDaemon = false;
 
-    Settings::getInstance()->setUsingZclassicConf(confLocation);
+    Settings::getInstance()->setUsingZClassicConf(confLocation);
 
     while (!in.atEnd()) {
         QString line = in.readLine();
@@ -610,27 +625,27 @@ std::shared_ptr<ConnectionConfig> ConnectionLoader::autoDetectZclassicConf() {
     if (zclassicconf->port.isEmpty()) zclassicconf->port = "8023";
     file.close();
 
-    // In addition to the zclassic.conf file, also double check the params.
+    // In addition to the zclassic.conf file, also double check the params. 
 
     return std::shared_ptr<ConnectionConfig>(zclassicconf);
 }
 
 /**
  * Load connection settings from the UI, which indicates an unknown, external zclassicd
- */
+ */ 
 std::shared_ptr<ConnectionConfig> ConnectionLoader::loadFromSettings() {
-    // Load from the QT Settings.
+    // Load from the QT Settings. 
     QSettings s;
-
+    
     auto host        = s.value("connection/host").toString();
     auto port        = s.value("connection/port").toString();
     auto username    = s.value("connection/rpcuser").toString();
-    auto password    = s.value("connection/rpcpassword").toString();
+    auto password    = s.value("connection/rpcpassword").toString();    
 
     if (username.isEmpty() || password.isEmpty())
         return nullptr;
 
-    auto uiConfig = new ConnectionConfig{ host, port, username, password, false, false, "", "", ConnectionType::UISettingsZclassicD};
+    auto uiConfig = new ConnectionConfig{ host, port, username, password, false, false, "", "", ConnectionType::UISettingsZClassicD};
 
     return std::shared_ptr<ConnectionConfig>(uiConfig);
 }
@@ -641,8 +656,8 @@ std::shared_ptr<ConnectionConfig> ConnectionLoader::loadFromSettings() {
 
 /***********************************************************************************
  *  Connection Class
- ************************************************************************************/
-Connection::Connection(MainWindow* m, QNetworkAccessManager* c, QNetworkRequest* r,
+ ************************************************************************************/ 
+Connection::Connection(MainWindow* m, QNetworkAccessManager* c, QNetworkRequest* r, 
                         std::shared_ptr<ConnectionConfig> conf) {
     this->restclient  = c;
     this->request     = r;
@@ -655,7 +670,7 @@ Connection::~Connection() {
     delete request;
 }
 
-void Connection::doRPC(const json& payload, const std::function<void(json)>& cb,
+void Connection::doRPC(const json& payload, const std::function<void(json)>& cb, 
                        const std::function<void(QNetworkReply*, const json&)>& ne) {
     if (shutdownInProgress) {
         // Ignoring RPC because shutdown in progress
@@ -670,27 +685,27 @@ void Connection::doRPC(const json& payload, const std::function<void(json)>& cb,
             // Ignoring callback because shutdown in progress
             return;
         }
-
+        
         if (reply->error() != QNetworkReply::NoError) {
             auto parsed = json::parse(reply->readAll(), nullptr, false);
             ne(reply, parsed);
-
+            
             return;
-        }
-
+        } 
+        
         auto parsed = json::parse(reply->readAll(), nullptr, false);
         if (parsed.is_discarded()) {
             ne(reply, "Unknown error");
         }
-
-        cb(parsed["result"]);
+        
+        cb(parsed["result"]);        
     });
 }
 
 void Connection::doRPCWithDefaultErrorHandling(const json& payload, const std::function<void(json)>& cb) {
     doRPC(payload, cb, [=] (auto reply, auto parsed) {
         if (!parsed.is_discarded() && !parsed["error"]["message"].is_null()) {
-            this->showTxError(QString::fromStdString(parsed["error"]["message"]));
+            this->showTxError(QString::fromStdString(parsed["error"]["message"]));    
         } else {
             this->showTxError(reply->errorString());
         }
@@ -719,7 +734,7 @@ void Connection::showTxError(const QString& error) {
 
 /**
  * Prevent all future calls from going through
- */
+ */ 
 void Connection::shutdown() {
     shutdownInProgress = true;
 }

@@ -10,9 +10,10 @@ CONFIG += precompile_header
 
 PRECOMPILED_HEADER = src/precompiled.h
 
-greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
+QT += widgets
+QT += websockets
 
-TARGET = zcl-qt-wallet
+TARGET = zclwallet
 
 TEMPLATE = app
 
@@ -45,13 +46,15 @@ SOURCES += \
     src/sendtab.cpp \
     src/senttxstore.cpp \
     src/txtablemodel.cpp \
-	src/turnstile.cpp \
+    src/turnstile.cpp \
     src/qrcodelabel.cpp \
     src/connection.cpp \
     src/fillediconlabel.cpp \
     src/addressbook.cpp \
     src/logger.cpp \
     src/addresscombo.cpp \
+    src/websockets.cpp \
+    src/mobileappconnector.cpp \
     src/recurring.cpp
 
 HEADERS += \
@@ -66,13 +69,15 @@ HEADERS += \
     src/settings.h \
     src/txtablemodel.h \
     src/senttxstore.h \
-	src/turnstile.h \
+    src/turnstile.h \
     src/qrcodelabel.h \
     src/connection.h \
     src/fillediconlabel.h \
     src/addressbook.h \
     src/logger.h \
-    src/addresscombo.h \
+    src/addresscombo.h \ 
+    src/websockets.h \
+    src/mobileappconnector.h \
     src/recurring.h
 
 FORMS += \
@@ -83,10 +88,11 @@ FORMS += \
     src/turnstile.ui \
     src/turnstileprogress.ui \
     src/privkey.ui \
-    src/memodialog.ui \
+    src/memodialog.ui \ 
     src/connection.ui \
     src/zboard.ui \
     src/addressbook.ui \
+    src/mobileappconnector.ui \
     src/createzclassicconfdialog.ui \
     src/recurringdialog.ui \
     src/newrecurring.ui
@@ -95,14 +101,37 @@ FORMS += \
 TRANSLATIONS = res/zcl_qt_wallet_es.ts \
                res/zcl_qt_wallet_fr.ts \
                res/zcl_qt_wallet_de.ts \
-               res/zcl_qt_wallet_pt.ts
+               res/zcl_qt_wallet_pt.ts \
+               res/zcl_qt_wallet_it.ts 
+
+include(singleapplication/singleapplication.pri)
+DEFINES += QAPPLICATION_CLASS=QApplication
+
+QMAKE_INFO_PLIST = res/Info.plist
 
 win32: RC_ICONS = res/icon.ico
 ICON = res/logo.icns
 
+libsodium.target = $$PWD/res/libsodium.a
+libsodium.commands = res/libsodium/buildlibsodium.sh
+
+QMAKE_EXTRA_TARGETS += libsodium
+QMAKE_CLEAN += res/libsodium.a
 
 # Default rules for deployment.
 qnx: target.path = /tmp/$${TARGET}/bin
 else: unix:!android: target.path = /opt/$${TARGET}/bin
 !isEmpty(target.path): INSTALLS += target
 
+win32:CONFIG(release, debug|release): LIBS += -L$$PWD/res/ -llibsodium
+else:win32:CONFIG(debug, debug|release): LIBS += -L$$PWD/res/ -llibsodiumd
+else:unix: LIBS += -L$$PWD/res/ -lsodium
+
+INCLUDEPATH += $$PWD/res
+DEPENDPATH += $$PWD/res
+
+win32-g++:CONFIG(release, debug|release): PRE_TARGETDEPS += $$PWD/res/liblibsodium.a
+else:win32-g++:CONFIG(debug, debug|release): PRE_TARGETDEPS += $$PWD/res/liblibsodium.a
+else:win32:!win32-g++:CONFIG(release, debug|release): PRE_TARGETDEPS += $$PWD/res/libsodium.lib
+else:win32:!win32-g++:CONFIG(debug, debug|release): PRE_TARGETDEPS += $$PWD/res/libsodiumd.lib
+else:unix: PRE_TARGETDEPS += $$PWD/res/libsodium.a

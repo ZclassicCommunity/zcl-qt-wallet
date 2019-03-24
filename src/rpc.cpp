@@ -5,13 +5,14 @@
 #include "senttxstore.h"
 #include "turnstile.h"
 #include "version.h"
+#include "websockets.h"
 
 using json = nlohmann::json;
 
 RPC::RPC(MainWindow* main) {
     auto cl = new ConnectionLoader(main, this);
 
-    // Execute the load connection async, so we can set up the rest of RPC properly.
+    // Execute the load connection async, so we can set up the rest of RPC properly. 
     QTimer::singleShot(1, [=]() { cl->loadConnection(); });
 
     this->main = main;
@@ -40,7 +41,7 @@ RPC::RPC(MainWindow* main) {
     QObject::connect(timer, &QTimer::timeout, [=]() {
         refresh();
     });
-    timer->start(Settings::updateSpeed);
+    timer->start(Settings::updateSpeed);    
 
     // Set up the timer to watch for tx status
     txTimer = new QTimer(main);
@@ -48,7 +49,7 @@ RPC::RPC(MainWindow* main) {
         watchTxStatus();
     });
     // Start at every 10s. When an operation is pending, this will change to every second
-    txTimer->start(Settings::updateSpeed);
+    txTimer->start(Settings::updateSpeed);  
 
     usedAddresses = new QMap<QString, bool>();
 }
@@ -65,11 +66,12 @@ RPC::~RPC() {
     delete allBalances;
     delete usedAddresses;
     delete zaddresses;
+    delete taddresses;
 
     delete conn;
 }
 
-void RPC::setEZclassicd(QProcess* p) {
+void RPC::setEZClassicd(QProcess* p) {
     ezclassicd = p;
 
     if (ezclassicd && ui->tabWidget->widget(4) == nullptr) {
@@ -77,6 +79,7 @@ void RPC::setEZclassicd(QProcess* p) {
     }
 }
 
+// Called when a connection to zclassicd is available. 
 void RPC::setConnection(Connection* c) {
     if (c == nullptr) return;
 
@@ -85,12 +88,29 @@ void RPC::setConnection(Connection* c) {
 
     ui->statusBar->showMessage("Ready!");
 
-    refreshZCLPrice();
+    // See if we need to remove the reindex/rescan flags from the zclassic.conf file
+    auto zclassicConfLocation = Settings::getInstance()->getZClassicdConfLocation();
+    Settings::removeFromZClassicConf(zclassicConfLocation, "rescan");
+    Settings::removeFromZClassicConf(zclassicConfLocation, "reindex");
+
+    // Refresh the UI
+    refreshZCLPrice();    
     checkForUpdate();
 
     // Force update, because this might be coming from a settings update
     // where we need to immediately refresh
     refresh(true);
+}
+
+void RPC::getTAddresses(const std::function<void(json)>& cb) {
+    json payload = {
+        {"jsonrpc", "1.0"},
+        {"id", "someid"},
+        {"method", "getaddressesbyaccount"},
+        {"params", {""}}
+    };
+
+    conn->doRPCWithDefaultErrorHandling(payload, cb);
 }
 
 void RPC::getZAddresses(const std::function<void(json)>& cb) {
@@ -132,7 +152,7 @@ void RPC::newZaddr(bool sapling, const std::function<void(json)>& cb) {
         {"method", "z_getnewaddress"},
         {"params", { sapling ? "sapling" : "sprout" }},
     };
-
+    
     conn->doRPCWithDefaultErrorHandling(payload, cb);
 }
 
@@ -153,7 +173,7 @@ void RPC::getZPrivKey(QString addr, const std::function<void(json)>& cb) {
         {"method", "z_exportkey"},
         {"params", { addr.toStdString() }},
     };
-
+    
     conn->doRPCWithDefaultErrorHandling(payload, cb);
 }
 
@@ -164,7 +184,7 @@ void RPC::getTPrivKey(QString addr, const std::function<void(json)>& cb) {
         {"method", "dumpprivkey"},
         {"params", { addr.toStdString() }},
     };
-
+    
     conn->doRPCWithDefaultErrorHandling(payload, cb);
 }
 
@@ -175,7 +195,7 @@ void RPC::importZPrivKey(QString addr, bool rescan, const std::function<void(jso
         {"method", "z_importkey"},
         {"params", { addr.toStdString(), (rescan? "yes" : "no") }},
     };
-
+    
     conn->doRPCWithDefaultErrorHandling(payload, cb);
 }
 
@@ -187,7 +207,7 @@ void RPC::importTPrivKey(QString addr, bool rescan, const std::function<void(jso
         {"method", "importprivkey"},
         {"params", { addr.toStdString(), (rescan? "yes" : "no") }},
     };
-
+    
     conn->doRPCWithDefaultErrorHandling(payload, cb);
 }
 
@@ -213,7 +233,7 @@ void RPC::getTransactions(const std::function<void(json)>& cb) {
     conn->doRPCWithDefaultErrorHandling(payload, cb);
 }
 
-void RPC::sendZTransaction(json params, const std::function<void(json)>& cb,
+void RPC::sendZTransaction(json params, const std::function<void(json)>& cb, 
     const std::function<void(QString)>& err) {
     json payload = {
         {"jsonrpc", "1.0"},
@@ -224,7 +244,7 @@ void RPC::sendZTransaction(json params, const std::function<void(json)>& cb,
 
     conn->doRPC(payload, cb,  [=] (auto reply, auto parsed) {
         if (!parsed.is_discarded() && !parsed["error"]["message"].is_null()) {
-            err(QString::fromStdString(parsed["error"]["message"]));
+            err(QString::fromStdString(parsed["error"]["message"]));    
         } else {
             err(reply->errorString());
         }
@@ -235,7 +255,7 @@ void RPC::sendZTransaction(json params, const std::function<void(json)>& cb,
  * Method to get all the private keys for both z and t addresses. It will make 2 batch calls,
  * combine the result, and call the callback with a single list containing both the t-addr and z-addr
  * private keys
- */
+ */ 
 void RPC::getAllPrivKeys(const std::function<void(QList<QPair<QString, QString>>)> cb) {
     if (conn == nullptr) {
         // No connection, just return
@@ -247,34 +267,34 @@ void RPC::getAllPrivKeys(const std::function<void(QList<QPair<QString, QString>>
     holder->first = 0;  // This is the number of times the callback has been called, initialized to 0
     auto fnCombineTwoLists = [=] (QList<QPair<QString, QString>> list) {
         // Increment the callback counter
-        holder->first++;
+        holder->first++;    
 
         // Add all
         std::copy(list.begin(), list.end(), std::back_inserter(holder->second));
-
-        // And if the caller has been called twice, do the parent callback with the
+        
+        // And if the caller has been called twice, do the parent callback with the 
         // collected list
         if (holder->first == 2) {
             // Sort so z addresses are on top
-            std::sort(holder->second.begin(), holder->second.end(),
+            std::sort(holder->second.begin(), holder->second.end(), 
                         [=] (auto a, auto b) { return a.first > b.first; });
 
             cb(holder->second);
             delete holder;
-        }
+        }            
     };
 
     // A utility fn to do the batch calling
     auto fnDoBatchGetPrivKeys = [=](json getAddressPayload, std::string privKeyDumpMethodName) {
         conn->doRPCWithDefaultErrorHandling(getAddressPayload, [=] (json resp) {
             QList<QString> addrs;
-            for (auto addr : resp.get<json::array_t>()) {
+            for (auto addr : resp.get<json::array_t>()) {   
                 addrs.push_back(QString::fromStdString(addr.get<json::string_t>()));
             }
 
             // Then, do a batch request to get all the private keys
             conn->doBatchRPC<QString>(
-                addrs,
+                addrs, 
                 [=] (auto addr) {
                     json payload = {
                         {"jsonrpc", "1.0"},
@@ -289,7 +309,7 @@ void RPC::getAllPrivKeys(const std::function<void(QList<QPair<QString, QString>>
                     for (QString addr: privkeys->keys()) {
                         allTKeys.push_back(
                             QPair<QString, QString>(
-                                addr,
+                                addr, 
                                 QString::fromStdString(privkeys->value(addr).get<json::string_t>())));
                     }
 
@@ -320,12 +340,12 @@ void RPC::getAllPrivKeys(const std::function<void(QList<QPair<QString, QString>>
 
 
 // Build the RPC JSON Parameters for this tx
-void RPC::fillTxJsonParams(json& params, Tx tx) {
+void RPC::fillTxJsonParams(json& params, Tx tx) {   
     Q_ASSERT(params.is_array());
     // Get all the addresses and amounts
     json allRecepients = json::array();
 
-    // For each addr/amt/memo, construct the JSON and also build the confirm dialog box
+    // For each addr/amt/memo, construct the JSON and also build the confirm dialog box    
     for (int i=0; i < tx.toAddrs.size(); i++) {
         auto toAddr = tx.toAddrs[i];
 
@@ -334,14 +354,14 @@ void RPC::fillTxJsonParams(json& params, Tx tx) {
         rec["address"]      = toAddr.addr.toStdString();
         // Force it through string for rounding. Without this, decimal points beyond 8 places
         // will appear, causing an "invalid amount" error
-        rec["amount"]       = Settings::getDecimalString(toAddr.amount).toStdString(); //.toDouble();
+        rec["amount"]       = Settings::getDecimalString(toAddr.amount).toStdString(); //.toDouble(); 
         if (toAddr.addr.startsWith("z") && !toAddr.encodedMemo.trimmed().isEmpty())
             rec["memo"]     = toAddr.encodedMemo.toStdString();
 
         allRecepients.push_back(rec);
     }
 
-    // Add sender
+    // Add sender    
     params.push_back(tx.fromAddr.toStdString());
     params.push_back(allRecepients);
 
@@ -353,7 +373,7 @@ void RPC::fillTxJsonParams(json& params, Tx tx) {
 }
 
 
-void RPC::noConnection() {
+void RPC::noConnection() {    
     QIcon i = QApplication::style()->standardIcon(QStyle::SP_MessageBoxCritical);
     main->statusIcon->setPixmap(i.pixmap(16, 16));
     main->statusIcon->setToolTip("");
@@ -387,7 +407,7 @@ void RPC::noConnection() {
 
 // Refresh received z txs by calling z_listreceivedbyaddress/gettransaction
 void RPC::refreshReceivedZTrans(QList<QString> zaddrs) {
-    if  (conn == nullptr)
+    if  (conn == nullptr) 
         return noConnection();
 
     // We'll only refresh the received Z txs if settings allows us.
@@ -396,13 +416,13 @@ void RPC::refreshReceivedZTrans(QList<QString> zaddrs) {
         transactionsTableModel->addZRecvData(emptylist);
         return;
     }
+        
+    // This method is complicated because z_listreceivedbyaddress only returns the txid, and 
+    // we have to make a follow up call to gettransaction to get details of that transaction. 
+    // Additionally, it has to be done in batches, because there are multiple z-Addresses, 
+    // and each z-Addr can have multiple received txs. 
 
-    // This method is complicated because z_listreceivedbyaddress only returns the txid, and
-    // we have to make a follow up call to gettransaction to get details of that transaction.
-    // Additionally, it has to be done in batches, because there are multiple z-Addresses,
-    // and each z-Addr can have multiple received txs.
-
-    // 1. For each z-Addr, get list of received txs
+    // 1. For each z-Addr, get list of received txs    
     conn->doBatchRPC<QString>(zaddrs,
         [=] (QString zaddr) {
             json payload = {
@@ -413,7 +433,7 @@ void RPC::refreshReceivedZTrans(QList<QString> zaddrs) {
             };
 
             return payload;
-        },
+        },          
         [=] (QMap<QString, json>* zaddrTxids) {
             // Process all txids, removing duplicates. This can happen if the same address
             // appears multiple times in a single tx's outputs.
@@ -421,14 +441,14 @@ void RPC::refreshReceivedZTrans(QList<QString> zaddrs) {
             QMap<QString, QString> memos;
             for (auto it = zaddrTxids->constBegin(); it != zaddrTxids->constEnd(); it++) {
                 auto zaddr = it.key();
-                for (auto& i : it.value().get<json::array_t>()) {
+                for (auto& i : it.value().get<json::array_t>()) {   
                     // Mark the address as used
                     usedAddresses->insert(zaddr, true);
 
                     // Filter out change txs
                     if (! i["change"].get<json::boolean_t>()) {
                         auto txid = QString::fromStdString(i["txid"].get<json::string_t>());
-                        txids.insert(txid);
+                        txids.insert(txid);    
 
                         // Check for Memos
                         QString memoBytes = QString::fromStdString(i["memo"].get<json::string_t>());
@@ -439,7 +459,7 @@ void RPC::refreshReceivedZTrans(QList<QString> zaddrs) {
                                 memos[zaddr + txid] = memo;
                         }
                     }
-                }
+                }                        
             }
 
             // 2. For all txids, go and get the details of that txid.
@@ -458,12 +478,12 @@ void RPC::refreshReceivedZTrans(QList<QString> zaddrs) {
                     QList<TransactionItem> txdata;
 
                     // Combine them both together. For every zAddr's txid, get the amount, fee, confirmations and time
-                    for (auto it = zaddrTxids->constBegin(); it != zaddrTxids->constEnd(); it++) {
-                        for (auto& i : it.value().get<json::array_t>()) {
+                    for (auto it = zaddrTxids->constBegin(); it != zaddrTxids->constEnd(); it++) {                        
+                        for (auto& i : it.value().get<json::array_t>()) {   
                             // Filter out change txs
                             if (i["change"].get<json::boolean_t>())
                                 continue;
-
+                            
                             auto zaddr = it.key();
                             auto txid  = QString::fromStdString(i["txid"].get<json::string_t>());
 
@@ -476,11 +496,11 @@ void RPC::refreshReceivedZTrans(QList<QString> zaddrs) {
                             } else {
                                 timestamp = txidInfo["blocktime"].get<json::number_unsigned_t>();
                             }
-
+                            
                             auto amount        = i["amount"].get<json::number_float_t>();
-                            auto confirmations = (unsigned long)txidInfo["confirmations"].get<json::number_unsigned_t>();
+                            auto confirmations = (unsigned long)txidInfo["confirmations"].get<json::number_unsigned_t>();                            
 
-                            TransactionItem tx{ QString("receive"), timestamp, zaddr, txid, amount,
+                            TransactionItem tx{ QString("receive"), timestamp, zaddr, txid, amount, 
                                                 confirmations, "", memos.value(zaddr + txid, "") };
                             txdata.push_front(tx);
                         }
@@ -495,11 +515,11 @@ void RPC::refreshReceivedZTrans(QList<QString> zaddrs) {
             );
         }
     );
-}
+} 
 
 /// This will refresh all the balance data from zclassicd
 void RPC::refresh(bool force) {
-    if  (conn == nullptr)
+    if  (conn == nullptr) 
         return noConnection();
 
     getInfoThenRefresh(force);
@@ -507,7 +527,7 @@ void RPC::refresh(bool force) {
 
 
 void RPC::getInfoThenRefresh(bool force) {
-    if  (conn == nullptr)
+    if  (conn == nullptr) 
         return noConnection();
 
     json payload = {
@@ -517,7 +537,7 @@ void RPC::getInfoThenRefresh(bool force) {
     };
 
     static bool prevCallSucceeded = false;
-    conn->doRPC(payload, [=] (const json& reply) {
+    conn->doRPC(payload, [=] (const json& reply) {   
         prevCallSucceeded = true;
         // Testnet?
         if (!reply["testnet"].is_null()) {
@@ -531,6 +551,7 @@ void RPC::getInfoThenRefresh(bool force) {
         static int    lastBlock = 0;
         int curBlock  = reply["blocks"].get<json::number_integer_t>();
         int version = reply["version"].get<json::number_integer_t>();
+        Settings::getInstance()->setZClassicdVersion(version);
 
         if ( force || (curBlock != lastBlock) ) {
             // Something changed, so refresh everything.
@@ -539,7 +560,7 @@ void RPC::getInfoThenRefresh(bool force) {
             // See if the turnstile migration has any steps that need to be done.
             turnstile->executeMigrationStep();
 
-            refreshBalances();
+            refreshBalances();        
             refreshAddresses(); // This calls refreshZSentTransactions() and refreshReceivedZTrans()
             refreshTransactions();
         }
@@ -548,7 +569,7 @@ void RPC::getInfoThenRefresh(bool force) {
         Settings::getInstance()->setPeers(connections);
 
         if (connections == 0) {
-            // If there are no peers connected, then the internet is probably off or something else is wrong.
+            // If there are no peers connected, then the internet is probably off or something else is wrong. 
             QIcon i = QApplication::style()->standardIcon(QStyle::SP_MessageBoxWarning);
             main->statusIcon->setPixmap(i.pixmap(16, 16));
         }
@@ -567,9 +588,9 @@ void RPC::getInfoThenRefresh(bool force) {
                 ui->numconnections->setText(QString::number(connections));
                 ui->solrate->setText(QString::number(solrate) % " Sol/s");
             });
-        }
+        } 
 
-        // Call to see if the blockchain is syncing.
+        // Call to see if the blockchain is syncing. 
         json payload = {
             {"jsonrpc", "1.0"},
             {"id", "someid"},
@@ -595,7 +616,7 @@ void RPC::getInfoThenRefresh(bool force) {
                     QString txt = QString::number(blockNumber);
                     if (estimatedheight > 0) {
                         txt = txt % " / ~" % QString::number(estimatedheight);
-                        // If estimated height is available, then use the download blocks
+                        // If estimated height is available, then use the download blocks 
                         // as the progress instead of verification progress.
                         progress = (double)blockNumber / (double)estimatedheight;
                     }
@@ -616,7 +637,7 @@ void RPC::getInfoThenRefresh(bool force) {
                 QString::number(blockNumber) %
                 (isSyncing ? ("/" % QString::number(progress*100, 'f', 2) % "%") : QString()) %
                 ")";
-            main->statusLabel->setText(statusText);
+            main->statusLabel->setText(statusText);   
 
             auto zclPrice = Settings::getUSDFormat(1);
             QString tooltip;
@@ -626,7 +647,7 @@ void RPC::getInfoThenRefresh(bool force) {
             else {
                 tooltip = QObject::tr("zclassicd has no peer connections");
             }
-            tooltip = tooltip % "(v " % QString::number(version) % ")";
+            tooltip = tooltip % "(v " % QString::number(Settings::getInstance()->getZClassicdVersion()) % ")";
 
             if (!zclPrice.isEmpty()) {
                 tooltip = "1 ZCL = " % zclPrice % "\n" % tooltip;
@@ -653,14 +674,14 @@ void RPC::getInfoThenRefresh(bool force) {
 }
 
 void RPC::refreshAddresses() {
-    if  (conn == nullptr)
+    if  (conn == nullptr) 
         return noConnection();
 
     delete zaddresses;
     zaddresses = new QList<QString>();
 
     getZAddresses([=] (json reply) {
-        for (auto& it : reply.get<json::array_t>()) {
+        for (auto& it : reply.get<json::array_t>()) {   
             auto addr = QString::fromStdString(it.get<json::string_t>());
             zaddresses->push_back(addr);
         }
@@ -669,34 +690,37 @@ void RPC::refreshAddresses() {
         refreshSentZTrans();
         refreshReceivedZTrans(*zaddresses);
     });
+
+    delete taddresses;
+    taddresses = new QList<QString>();
+    getTAddresses([=] (json reply) {
+        for (auto& it : reply.get<json::array_t>()) {   
+            auto addr = QString::fromStdString(it.get<json::string_t>());
+            if (Settings::isTAddress(addr))
+                taddresses->push_back(addr);
+        }
+
+        // If there are no t Addresses, create one
+        newTaddr([=] (json reply) {
+            // What if taddress gets deleted before this executes?
+            taddresses->append(QString::fromStdString(reply.get<json::string_t>()));
+        });
+    });
 }
 
 // Function to create the data model and update the views, used below.
-void RPC::updateUI(bool anyUnconfirmed) {
+void RPC::updateUI(bool anyUnconfirmed) {    
     ui->unconfirmedWarning->setVisible(anyUnconfirmed);
 
     // Update balances model data, which will update the table too
     balancesTableModel->setNewData(allBalances, utxos);
 
-    // Add all the addresses into the inputs combo box
-    auto lastFromAddr = ui->inputsCombo->currentText();
-
-    ui->inputsCombo->clear();
-    auto i = allBalances->constBegin();
-    while (i != allBalances->constEnd()) {
-         ui->inputsCombo->addItem(i.key(), i.value());
-        if (i.key() == lastFromAddr) ui->inputsCombo->setCurrentText(i.key());
-
-        ++i;
-    }
-
-    if (lastFromAddr.isEmpty()) {
-        main->setDefaultPayFrom();
-    }
+    // Update from address
+    main->updateFromCombo();
 };
 
 // Function to process reply of the listunspent and z_listunspent API calls, used below.
-bool RPC::processUnspent(const json& reply) {
+bool RPC::processUnspent(const json& reply, QMap<QString, double>* balancesMap, QList<UnspentOutput>* newUtxos) {
     bool anyUnconfirmed = false;
     for (auto& it : reply.get<json::array_t>()) {
         QString qsAddr = QString::fromStdString(it["address"]);
@@ -705,62 +729,71 @@ bool RPC::processUnspent(const json& reply) {
             anyUnconfirmed = true;
         }
 
-        utxos->push_back(
+        newUtxos->push_back(
             UnspentOutput{ qsAddr, QString::fromStdString(it["txid"]),
                             Settings::getDecimalString(it["amount"].get<json::number_float_t>()),
                             (int)confirmations, it["spendable"].get<json::boolean_t>() });
 
-        (*allBalances)[qsAddr] = (*allBalances)[qsAddr] + it["amount"].get<json::number_float_t>();
+        (*balancesMap)[qsAddr] = (*balancesMap)[qsAddr] + it["amount"].get<json::number_float_t>();
     }
     return anyUnconfirmed;
 };
 
-void RPC::refreshBalances() {
-    if  (conn == nullptr)
+void RPC::refreshBalances() {    
+    if  (conn == nullptr) 
         return noConnection();
 
     // 1. Get the Balances
-    getBalance([=] (json reply) {
-        auto balT = QString::fromStdString(reply["transparent"]).toDouble();
-        auto balZ = QString::fromStdString(reply["private"]).toDouble();
-        auto tot  = QString::fromStdString(reply["total"]).toDouble();
+    getBalance([=] (json reply) {    
+        auto balT      = QString::fromStdString(reply["transparent"]).toDouble();
+        auto balZ      = QString::fromStdString(reply["private"]).toDouble();
+        auto balTotal  = QString::fromStdString(reply["total"]).toDouble();
+
+        AppDataModel::getInstance()->setBalances(balT, balZ);
 
         ui->balSheilded   ->setText(Settings::getZCLDisplayFormat(balZ));
         ui->balTransparent->setText(Settings::getZCLDisplayFormat(balT));
-        ui->balTotal      ->setText(Settings::getZCLDisplayFormat(tot));
+        ui->balTotal      ->setText(Settings::getZCLDisplayFormat(balTotal));
 
         ui->balSheilded   ->setToolTip(Settings::getUSDFormat(balZ));
         ui->balTransparent->setToolTip(Settings::getUSDFormat(balT));
-        ui->balTotal      ->setToolTip(Settings::getUSDFormat(tot));
+        ui->balTotal      ->setToolTip(Settings::getUSDFormat(balTotal));
     });
 
     // 2. Get the UTXOs
-    // First, create a new UTXO list, deleting the old one;
-    delete utxos;
-    utxos = new QList<UnspentOutput>();
-    delete allBalances;
-    allBalances = new QMap<QString, double>();
+    // First, create a new UTXO list. It will be replacing the existing list when everything is processed.
+    auto newUtxos = new QList<UnspentOutput>();
+    auto newBalances = new QMap<QString, double>();
 
     // Call the Transparent and Z unspent APIs serially and then, once they're done, update the UI
     getTransparentUnspent([=] (json reply) {
-        auto anyTUnconfirmed = processUnspent(reply);
+        auto anyTUnconfirmed = processUnspent(reply, newBalances, newUtxos);
 
         getZUnspent([=] (json reply) {
-            auto anyZUnconfirmed = processUnspent(reply);
+            auto anyZUnconfirmed = processUnspent(reply, newBalances, newUtxos);
+
+            // Swap out the balances and UTXOs
+            delete allBalances;
+            delete utxos;
+
+            allBalances = newBalances;
+            utxos       = newUtxos;
 
             updateUI(anyTUnconfirmed || anyZUnconfirmed);
-        });
+
+            main->balancesReady();
+        });        
     });
 }
 
-void RPC::refreshTransactions() {
-    if  (conn == nullptr)
+void RPC::refreshTransactions() {    
+    if  (conn == nullptr) 
         return noConnection();
 
     getTransactions([=] (json reply) {
         QList<TransactionItem> txdata;
 
-        for (auto& it : reply.get<json::array_t>()) {
+        for (auto& it : reply.get<json::array_t>()) {  
             double fee = 0;
             if (!it["fee"].is_null()) {
                 fee = it["fee"].get<json::number_float_t>();
@@ -783,18 +816,18 @@ void RPC::refreshTransactions() {
         }
 
         // Update model data, which updates the table view
-        transactionsTableModel->addTData(txdata);
+        transactionsTableModel->addTData(txdata);        
     });
 }
 
 // Read sent Z transactions from the file.
 void RPC::refreshSentZTrans() {
-    if  (conn == nullptr)
+    if  (conn == nullptr) 
         return noConnection();
 
     auto sentZTxs = SentTxStore::readSentTxFile();
 
-    // If there are no sent z txs, then empty the table.
+    // If there are no sent z txs, then empty the table. 
     // This happens when you clear history.
     if (sentZTxs.isEmpty()) {
         transactionsTableModel->addZSentData(sentZTxs);
@@ -807,18 +840,18 @@ void RPC::refreshSentZTrans() {
         txids.push_back(sentTx.txid);
     }
 
-    // Look up all the txids to get the confirmation count for them.
+    // Look up all the txids to get the confirmation count for them. 
     conn->doBatchRPC<QString>(txids,
         [=] (QString txid) {
             json payload = {
                 {"jsonrpc", "1.0"},
                 {"id", "senttxid"},
                 {"method", "gettransaction"},
-                {"params", {txid.toStdString()}}
+                {"params", {txid.toStdString()}} 
             };
 
             return payload;
-        },
+        },          
         [=] (QMap<QString, json>* txidList) {
             auto newSentZTxs = sentZTxs;
             // Update the original sent list with the confirmation count
@@ -833,14 +866,14 @@ void RPC::refreshSentZTrans() {
                 if (!error)
                     sentTx.confirmations = j["confirmations"].get<json::number_unsigned_t>();
             }
-
+            
             transactionsTableModel->addZSentData(newSentZTxs);
             delete txidList;
         }
      );
 }
 
-void RPC::addNewTxToWatch(const QString& newOpid, WatchedTx wtx) {
+void RPC::addNewTxToWatch(const QString& newOpid, WatchedTx wtx) {    
     watchingOps.insert(newOpid, wtx);
 
     watchTxStatus();
@@ -848,7 +881,7 @@ void RPC::addNewTxToWatch(const QString& newOpid, WatchedTx wtx) {
 
 
 // Execute a transaction!
-void RPC::executeTransaction(Tx tx,
+void RPC::executeTransaction(Tx tx, 
         const std::function<void(QString opid)> submitted,
         const std::function<void(QString opid, QString txid)> computed,
         const std::function<void(QString opid, QString errStr)> error) {
@@ -871,7 +904,7 @@ void RPC::executeTransaction(Tx tx,
 
 
 void RPC::watchTxStatus() {
-    if  (conn == nullptr)
+    if  (conn == nullptr) 
         return noConnection();
 
     // Make an RPC to load pending operation statues
@@ -883,7 +916,7 @@ void RPC::watchTxStatus() {
 
     conn->doRPCIgnoreError(payload, [=] (const json& reply) {
         // There's an array for each item in the status
-        for (auto& it : reply.get<json::array_t>()) {
+        for (auto& it : reply.get<json::array_t>()) {  
             // If we were watching this Tx and its status became "success", then we'll show a status bar alert
             QString id = QString::fromStdString(it["id"]);
             if (watchingOps.contains(id)) {
@@ -893,23 +926,23 @@ void RPC::watchTxStatus() {
 
                 if (status == "success") {
                     auto txid = QString::fromStdString(it["result"]["txid"]);
-
+                    
                     SentTxStore::addToSentTx(watchingOps[id].tx, txid);
 
                     auto wtx = watchingOps[id];
                     watchingOps.remove(id);
                     wtx.completed(id, txid);
 
-                    // Refresh balances to show unconfirmed balances
+                    // Refresh balances to show unconfirmed balances                    
                     refresh(true);
                 } else if (status == "failed") {
-                    // If it failed, then we'll actually show a warning.
+                    // If it failed, then we'll actually show a warning. 
                     auto errorMsg = QString::fromStdString(it["error"]["message"]);
 
                     auto wtx = watchingOps[id];
                     watchingOps.remove(id);
                     wtx.error(id, errorMsg);
-                }
+                } 
             }
 
             if (watchingOps.isEmpty()) {
@@ -930,14 +963,14 @@ void RPC::watchTxStatus() {
 }
 
 void RPC::checkForUpdate(bool silent) {
-    if  (conn == nullptr)
+    if  (conn == nullptr) 
         return noConnection();
 
-    QUrl cmcURL("https://api.github.com/repos/ZclassicCommunity/zcl-qt-wallet/releases");
+    QUrl cmcURL("https://api.github.com/repos/ZClassicFoundation/zcl-qt-wallet/releases");
 
     QNetworkRequest req;
     req.setUrl(cmcURL);
-
+    
     QNetworkReply *reply = conn->restclient->get(req);
 
     QObject::connect(reply, &QNetworkReply::finished, [=] {
@@ -965,51 +998,51 @@ void RPC::checkForUpdate(bool silent) {
                 }
 
                 auto currentVersion = QVersionNumber::fromString(APP_VERSION);
-
+                
                 // Get the max version that the user has hidden updates for
                 QSettings s;
                 auto maxHiddenVersion = QVersionNumber::fromString(s.value("update/lastversion", "0.0.0").toString());
 
                 qDebug() << "Version check: Current " << currentVersion << ", Available " << maxVersion;
 
-                if (maxVersion > currentVersion && maxVersion > maxHiddenVersion) {
-                    auto ans = QMessageBox::information(main, QObject::tr("Update Available"),
+                if (maxVersion > currentVersion && (!silent || maxVersion > maxHiddenVersion)) {
+                    auto ans = QMessageBox::information(main, QObject::tr("Update Available"), 
                         QObject::tr("A new release v%1 is available! You have v%2.\n\nWould you like to visit the releases page?")
                             .arg(maxVersion.toString())
                             .arg(currentVersion.toString()),
                         QMessageBox::Yes, QMessageBox::Cancel);
                     if (ans == QMessageBox::Yes) {
-                        QDesktopServices::openUrl(QUrl("https://github.com/ZclassicCommunity/zcl-qt-wallet/releases"));
+                        QDesktopServices::openUrl(QUrl("https://github.com/ZClassicFoundation/zcl-qt-wallet/releases"));
                     } else {
                         // If the user selects cancel, don't bother them again for this version
                         s.setValue("update/lastversion", maxVersion.toString());
                     }
                 } else {
                     if (!silent) {
-                        QMessageBox::information(main, QObject::tr("No updates available"),
+                        QMessageBox::information(main, QObject::tr("No updates available"), 
                             QObject::tr("You already have the latest release v%1")
                                 .arg(currentVersion.toString()));
                     }
-                }
+                } 
             }
         }
         catch (...) {
             // If anything at all goes wrong, just set the price to 0 and move on.
             qDebug() << QString("Caught something nasty");
-        }
+        }       
     });
 }
 
 // Get the ZCL->USD price from coinmarketcap using their API
 void RPC::refreshZCLPrice() {
-    if  (conn == nullptr)
+    if  (conn == nullptr) 
         return noConnection();
 
     QUrl cmcURL("https://api.coinmarketcap.com/v1/ticker/");
 
     QNetworkRequest req;
     req.setUrl(cmcURL);
-
+    
     QNetworkReply *reply = conn->restclient->get(req);
 
     QObject::connect(reply, &QNetworkReply::finished, [=] {
@@ -1019,16 +1052,16 @@ void RPC::refreshZCLPrice() {
             if (reply->error() != QNetworkReply::NoError) {
                 auto parsed = json::parse(reply->readAll(), nullptr, false);
                 if (!parsed.is_discarded() && !parsed["error"]["message"].is_null()) {
-                    qDebug() << QString::fromStdString(parsed["error"]["message"]);
+                    qDebug() << QString::fromStdString(parsed["error"]["message"]);    
                 } else {
                     qDebug() << reply->errorString();
                 }
                 Settings::getInstance()->setZCLPrice(0);
                 return;
-            }
+            } 
 
             auto all = reply->readAll();
-
+            
             auto parsed = json::parse(all, nullptr, false);
             if (parsed.is_discarded()) {
                 Settings::getInstance()->setZCLPrice(0);
@@ -1054,7 +1087,7 @@ void RPC::refreshZCLPrice() {
     });
 }
 
-void RPC::shutdownZclassicd() {
+void RPC::shutdownZClassicd() {
     // Shutdown embedded zclassicd if it was started
     if (ezclassicd == nullptr || ezclassicd->processId() == 0 || conn == nullptr) {
         // No zclassicd running internally, just return
@@ -1066,7 +1099,7 @@ void RPC::shutdownZclassicd() {
         {"id", "someid"},
         {"method", "stop"}
     };
-
+    
     conn->doRPCWithDefaultErrorHandling(payload, [=](auto) {});
     conn->shutdown();
 
@@ -1074,19 +1107,19 @@ void RPC::shutdownZclassicd() {
     Ui_ConnectionDialog connD;
     connD.setupUi(&d);
     connD.topIcon->setBasePixmap(QIcon(":/icons/res/icon.ico").pixmap(256, 256));
-    connD.status->setText(QObject::tr("Please wait for zcl-qt-wallet to exit"));
+    connD.status->setText(QObject::tr("Please wait for ZclWallet to exit"));
     connD.statusDetail->setText(QObject::tr("Waiting for zclassicd to exit"));
 
     QTimer waiter(main);
 
-    // We capture by reference all the local variables because of the d.exec()
-    // below, which blocks this function until we exit.
+    // We capture by reference all the local variables because of the d.exec() 
+    // below, which blocks this function until we exit. 
     int waitCount = 0;
     QObject::connect(&waiter, &QTimer::timeout, [&] () {
         waitCount++;
 
         if ((ezclassicd->atEnd() && ezclassicd->processId() == 0) ||
-            waitCount > 30 ||
+            waitCount > 30 || 
             conn->config->zclassicDaemon)  {   // If zclassicd is daemon, then we don't have to do anything else
             qDebug() << "Ended";
             waiter.stop();
@@ -1098,7 +1131,15 @@ void RPC::shutdownZclassicd() {
     waiter.start(1000);
 
     // Wait for the zclassic process to exit.
-    d.exec();
+    if (!Settings::getInstance()->isHeadless()) {
+        d.exec(); 
+    } else {
+        while (waiter.isActive()) {
+            QCoreApplication::processEvents();
+
+            QThread::sleep(1);
+        }
+    }
 }
 
 
@@ -1143,7 +1184,7 @@ void RPC::getZboardTopics(std::function<void(QMap<QString, QString>)> cb) {
 
                 QString addr  = QString::fromStdString(item["addr"].get<json::string_t>());
                 QString topic = QString::fromStdString(item["topicName"].get<json::string_t>());
-
+                
                 topics.insert(topic, addr);
             }
 
@@ -1156,9 +1197,9 @@ void RPC::getZboardTopics(std::function<void(QMap<QString, QString>)> cb) {
     });
 }
 
-/**
+/** 
  * Get a Sapling address from the user's wallet
- */
+ */ 
 QString RPC::getDefaultSaplingAddress() {
     for (QString addr: *zaddresses) {
         if (Settings::getInstance()->isSaplingAddress(addr))
@@ -1166,4 +1207,11 @@ QString RPC::getDefaultSaplingAddress() {
     }
 
     return QString();
+}
+
+QString RPC::getDefaultTAddress() {
+    if (getAllTAddresses()->length() > 0)
+        return getAllTAddresses()->at(0);
+    else 
+        return QString();
 }

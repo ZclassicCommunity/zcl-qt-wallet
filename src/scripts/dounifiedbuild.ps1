@@ -7,11 +7,13 @@ param (
 )
 
 Write-Host "[Initializing]"
-Remove-Item -Force -ErrorAction Ignore ./artifacts/linux-binaries-zcl-qt-wallet-v$version.tar.gz
-Remove-Item -Force -ErrorAction Ignore ./artifacts/linux-deb-zcl-qt-wallet-v$version.deb
-Remove-Item -Force -ErrorAction Ignore ./artifacts/Windows-binaries-zcl-qt-wallet-v$version.zip
-Remove-Item -Force -ErrorAction Ignore ./artifacts/Windows-installer-zcl-qt-wallet-v$version.msi
-Remove-Item -Force -ErrorAction Ignore ./artifacts/macOS-zcl-qt-wallet-v$version.dmg
+Remove-Item -Force -ErrorAction Ignore ./artifacts/linux-binaries-zclwallet-v$version.tar.gz
+Remove-Item -Force -ErrorAction Ignore ./artifacts/linux-deb-zclwallet-v$version.deb
+Remove-Item -Force -ErrorAction Ignore ./artifacts/Windows-binaries-zclwallet-v$version.zip
+Remove-Item -Force -ErrorAction Ignore ./artifacts/Windows-installer-zclwallet-v$version.msi
+Remove-Item -Force -ErrorAction Ignore ./artifacts/macOS-zclwallet-v$version.dmg
+Remove-Item -Force -ErrorAction Ignore ./artifacts/signatures-v$version.tar.gz
+
 
 Remove-Item -Recurse -Force -ErrorAction Ignore ./bin
 Remove-Item -Recurse -Force -ErrorAction Ignore ./debug
@@ -25,7 +27,7 @@ Write-Host ""
 
 
 Write-Host "[Building on Mac]"
-bash src/scripts/mkmacdmg.sh --qt_path ~/Qt/5.11.1/clang_64/ --version $version --zclassic_path ~/github/zclassic
+bash src/scripts/mkmacdmg.sh --qt_path ~/Qt/5.11.1/clang_64/ --version $version --zclassic_path ~/github/zclassic 
 if (! $?) {
     Write-Output "[Error]"
     exit 1;
@@ -37,7 +39,7 @@ Write-Host "[Building Linux + Windows]"
 Write-Host -NoNewline "Copying files.........."
 ssh $server "rm -rf /tmp/zqwbuild"
 ssh $server "mkdir /tmp/zqwbuild"
-scp -r src/ res/ ./zcl-qt-wallet.pro ./application.qrc ./LICENSE ./README.md ${server}:/tmp/zqwbuild/ | Out-Null
+scp -r src/ singleapplication/ res/ ./zcl-qt-wallet.pro ./application.qrc ./LICENSE ./README.md ${server}:/tmp/zqwbuild/ | Out-Null
 ssh $server "dos2unix -q /tmp/zqwbuild/src/scripts/mkrelease.sh" | Out-Null
 ssh $server "dos2unix -q /tmp/zqwbuild/src/version.h"
 Write-Host "[OK]"
@@ -56,16 +58,22 @@ Write-Host -NoNewline "Building Installer....."
 ssh $winserver "Remove-Item -Path zqwbuild -Recurse"   | Out-Null
 ssh $winserver "New-Item zqwbuild -itemtype directory" | Out-Null
 
-# Note: For some mysterious reason, we can't seem to do a scp from here to windows machine.
+# Note: For some mysterious reason, we can't seem to do a scp from here to windows machine. 
 # So, we'll ssh to windows, and execute an scp command to pull files from here to there.
 # Same while copying the built msi. A straight scp pull from windows to here doesn't work,
 # so we ssh to windows, and then scp push the file to here.
 $myhostname = (hostname) | Out-String -NoNewline
-Remove-Item -Path /tmp/zqwbuild -Recurse -ErrorAction Ignore | Out-Null
-New-Item    -Path /tmp/zqwbuild -itemtype directory          | Out-Null
-Copy-Item src     /tmp/zqwbuild/ -Recurse
-Copy-Item res     /tmp/zqwbuild/ -Recurse
-Copy-Item release /tmp/zqwbuild/ -Recurse
+# Powershell seems not to be able to remove this directory for some reason!
+# Remove-Item -Path /tmp/zqwbuild -Recurse -ErrorAction Ignore | Out-Null
+bash "rm -rf /tmp/zqwbuild" 2>&1 | Out-Null
+New-Item    -Path /tmp/zqwbuild -itemtype directory -Force | Out-Null
+Copy-Item src     /tmp/zqwbuild/ -Recurse -Force 
+Copy-Item res     /tmp/zqwbuild/ -Recurse -Force
+Copy-Item release /tmp/zqwbuild/ -Recurse -Force
+
+# Remove some unnecessary stuff from the tmp directory to speed up copying
+Remove-Item -Recurse -ErrorAction Ignore /tmp/zqwbuild/res/libsodium
+
 ssh $winserver "scp -r ${myhostname}:/tmp/zqwbuild/* zqwbuild/"
 ssh $winserver "cd zqwbuild ; src/scripts/mkwininstaller.ps1 -version $version" >/dev/null
 if (!$?) {
@@ -78,16 +86,16 @@ Write-Host "[OK]"
 
 # Finally, test to make sure all files exist
 Write-Host -NoNewline "Checking Build........."
-if (! (Test-Path ./artifacts/linux-binaries-zcl-qt-wallet-v$version.tar.gz) -or
-    ! (Test-Path ./artifacts/linux-deb-zcl-qt-wallet-v$version.deb) -or
-    ! (Test-Path ./artifacts/Windows-binaries-zcl-qt-wallet-v$version.zip) -or
-    ! (Test-Path ./artifacts/macOS-zcl-qt-wallet-v$version.dmg) -or
-    ! (Test-Path ./artifacts/Windows-installer-zcl-qt-wallet-v$version.msi) ) {
+if (! (Test-Path ./artifacts/linux-binaries-zclwallet-v$version.tar.gz) -or
+    ! (Test-Path ./artifacts/linux-deb-zclwallet-v$version.deb) -or
+    ! (Test-Path ./artifacts/Windows-binaries-zclwallet-v$version.zip) -or
+    ! (Test-Path ./artifacts/macOS-zclwallet-v$version.dmg) -or 
+    ! (Test-Path ./artifacts/Windows-installer-zclwallet-v$version.msi) ) {
         Write-Host "[Error]"
         exit 1;
     }
 Write-Host "[OK]"
 
-Write-Host -NoNewline "Signing Binaries......"
-APP_VERSION=$version bash src/scripts/signbinaries.sh
+Write-Host -NoNewline "Signing Binaries......."
+bash src/scripts/signbinaries.sh --version $version
 Write-Host "[OK]"

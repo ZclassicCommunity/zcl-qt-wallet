@@ -10,9 +10,9 @@ using json = nlohmann::json;
 class RPC;
 
 enum ConnectionType {
-    DetectedConfExternalZclassicD = 1,
-    UISettingsZclassicD,
-    InternalZclassicD
+    DetectedConfExternalZClassicD = 1,
+    UISettingsZClassicD,
+    InternalZClassicD
 };
 
 struct ConnectionConfig {
@@ -20,7 +20,7 @@ struct ConnectionConfig {
     QString port;
     QString rpcuser;
     QString rpcpassword;
-    bool    usingZclassicConf;
+    bool    usingZClassicConf;
     bool    zclassicDaemon;
     QString zclassicDir;
     QString proxy;
@@ -39,7 +39,7 @@ public:
     void loadConnection();
 
 private:
-    std::shared_ptr<ConnectionConfig> autoDetectZclassicConf();
+    std::shared_ptr<ConnectionConfig> autoDetectZClassicConf();
     std::shared_ptr<ConnectionConfig> loadFromSettings();
 
     Connection* makeConnection(std::shared_ptr<ConnectionConfig> config);
@@ -47,17 +47,17 @@ private:
     void doAutoConnect(bool tryEzclassicdStart = true);
     void doManualConnect();
 
-    void createZclassicConf();
-    QString locateZclassicConfFile();
+    void createZClassicConf();
+    QString locateZClassicConfFile();
     QString zclassicConfWritableLocation();
     QString zcashParamsDir();
 
     bool verifyParams();
     void downloadParams(std::function<void(void)> cb);
     void doNextDownload(std::function<void(void)> cb);
-    bool startEmbeddedZclassicd();
+    bool startEmbeddedZClassicd();
 
-    void refreshZclassicdState(Connection* connection, std::function<void(void)> refused);
+    void refreshZClassicdState(Connection* connection, std::function<void(void)> refused);
 
     void showError(QString explanation);
     void showInformation(QString info, QString detail = "");
@@ -76,7 +76,7 @@ private:
     QFile*         currentOutput   = nullptr;
     QQueue<QUrl>*  downloadQueue   = nullptr;
 
-    QNetworkAccessManager* client  = nullptr;
+    QNetworkAccessManager* client  = nullptr; 
     QTime downloadTime;
 };
 
@@ -96,24 +96,24 @@ public:
 
     void shutdown();
 
-    void doRPC(const json& payload, const std::function<void(json)>& cb,
+    void doRPC(const json& payload, const std::function<void(json)>& cb, 
                const std::function<void(QNetworkReply*, const json&)>& ne);
     void doRPCWithDefaultErrorHandling(const json& payload, const std::function<void(json)>& cb);
     void doRPCIgnoreError(const json& payload, const std::function<void(json)>& cb) ;
 
     void showTxError(const QString& error);
 
-    // Batch method. Note: Because of the template, it has to be in the header file.
+    // Batch method. Note: Because of the template, it has to be in the header file. 
     template<class T>
     void doBatchRPC(const QList<T>& payloads,
                      std::function<json(T)> payloadGenerator,
-                     std::function<void(QMap<T, json>*)> cb) {
-        auto responses = new QMap<T, json>(); // zAddr -> list of responses for each call.
+                     std::function<void(QMap<T, json>*)> cb) {    
+        auto responses = new QMap<T, json>(); // zAddr -> list of responses for each call. 
         int totalSize = payloads.size();
         if (totalSize == 0)
             return;
 
-        // Keep track of all pending method calls, so as to prevent
+        // Keep track of all pending method calls, so as to prevent 
         // any overlapping calls
         static QMap<QString, bool> inProgress;
 
@@ -126,7 +126,7 @@ public:
         for (auto item: payloads) {
             json payload = payloadGenerator(item);
             inProgress[method] = true;
-
+            
             QNetworkReply *reply = restclient->post(*request, QByteArray::fromStdString(payload.dump()));
 
             QObject::connect(reply, &QNetworkReply::finished, [=] {
@@ -135,11 +135,11 @@ public:
                     // Ignoring callback because shutdown in progress
                     return;
                 }
-
-                auto all = reply->readAll();
+                
+                auto all = reply->readAll();            
                 auto parsed = json::parse(all.toStdString(), nullptr, false);
 
-                if (reply->error() != QNetworkReply::NoError) {
+                if (reply->error() != QNetworkReply::NoError) {            
                     qDebug() << QString::fromStdString(parsed.dump());
                     qDebug() << reply->errorString();
 
@@ -158,25 +158,25 @@ public:
         QObject::connect(waitTimer, &QTimer::timeout, [=]() {
             if (shutdownInProgress) {
                 waitTimer->stop();
-                waitTimer->deleteLater();
+                waitTimer->deleteLater();  
                 return;
             }
 
             // If all responses have arrived, return
             if (responses->size() == totalSize) {
                 waitTimer->stop();
-
+                
                 cb(responses);
                 inProgress[method] = false;
 
-                waitTimer->deleteLater();
+                waitTimer->deleteLater();            
             }
         });
-        waitTimer->start(100);
+        waitTimer->start(100);    
     }
 
 private:
-    bool shutdownInProgress = false;
+    bool shutdownInProgress = false;    
 };
 
 #endif

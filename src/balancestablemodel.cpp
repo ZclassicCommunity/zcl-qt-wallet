@@ -4,12 +4,12 @@
 
 
 BalancesTableModel::BalancesTableModel(QObject *parent)
-    : QAbstractTableModel(parent) {
+    : QAbstractTableModel(parent) {    
 }
 
-void BalancesTableModel::setNewData(const QMap<QString, double>* balances,
+void BalancesTableModel::setNewData(const QMap<QString, double>* balances, 
     const QList<UnspentOutput>* outputs)
-{
+{    
     loading = false;
 
     int currentRows = rowCount(QModelIndex());
@@ -23,7 +23,8 @@ void BalancesTableModel::setNewData(const QMap<QString, double>* balances,
     delete modeldata;
     modeldata = new QList<std::tuple<QString, double>>();
     std::for_each(balances->keyBegin(), balances->keyEnd(), [=] (auto keyIt) {
-        modeldata->push_back(std::make_tuple(keyIt, balances->value(keyIt)));
+        if (balances->value(keyIt) > 0)
+            modeldata->push_back(std::make_tuple(keyIt, balances->value(keyIt)));
     });
 
     // And then update the data
@@ -42,9 +43,9 @@ BalancesTableModel::~BalancesTableModel() {
 int BalancesTableModel::rowCount(const QModelIndex&) const
 {
     if (modeldata == nullptr) {
-        if (loading)
+        if (loading) 
             return 1;
-        else
+        else 
             return 0;
     }
     return modeldata->size();
@@ -58,14 +59,14 @@ int BalancesTableModel::columnCount(const QModelIndex&) const
 QVariant BalancesTableModel::data(const QModelIndex &index, int role) const
 {
     if (loading) {
-        if (role == Qt::DisplayRole)
+        if (role == Qt::DisplayRole) 
             return "Loading...";
         else
             return QVariant();
     }
 
     if (role == Qt::TextAlignmentRole && index.column() == 1) return QVariant(Qt::AlignRight | Qt::AlignVCenter);
-
+    
     if (role == Qt::ForegroundRole) {
         // If any of the UTXOs for this address has zero confirmations, paint it in red
         const auto& addr = std::get<0>(modeldata->at(index.row()));
@@ -80,9 +81,9 @@ QVariant BalancesTableModel::data(const QModelIndex &index, int role) const
         // Else, just return the default brush
         QBrush b;
         b.setColor(Qt::black);
-        return b;
+        return b;    
     }
-
+    
     if (role == Qt::DisplayRole) {
         switch (index.column()) {
         case 0: return AddressBook::addLabelToAddress(std::get<0>(modeldata->at(index.row())));
@@ -96,7 +97,7 @@ QVariant BalancesTableModel::data(const QModelIndex &index, int role) const
         case 1: return Settings::getUSDFormat(std::get<1>(modeldata->at(index.row())));
         }
     }
-
+    
     return QVariant();
 }
 

@@ -14,7 +14,7 @@
    </rect>
   </property>
   <property name="windowTitle">
-   <string>zcl-qt-wallet</string>
+   <string>ZclWallet</string>
   </property>
   <property name="modal">
    <bool>true</bool>
