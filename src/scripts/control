@@ -4,6 +4,6 @@ Section: base
 Priority: optional
 Architecture: amd64
 Maintainer: Aditya Kulkarni <zclassic@adityapk.com>
-Description: zcl-qt-wallet is a full node and UI wallet for Zclassic.
- zcl-qt-wallet is a full node and UI wallet for Zclassic. It comes with
- full support for shielded addresses and many apps for Zclassic.
+Description: ZclWallet is a full node and UI wallet for ZClassic.
+ ZclWallet is a full node and UI wallet for ZClassic. It comes with 
+ full support for shielded addresses and many apps for ZClassic.

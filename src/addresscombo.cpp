@@ -2,7 +2,7 @@
 #include "addressbook.h"
 #include "settings.h"
 
-AddressCombo::AddressCombo(QWidget* parent) :
+AddressCombo::AddressCombo(QWidget* parent) : 
     QComboBox(parent) {
 }
 
@@ -22,18 +22,18 @@ void AddressCombo::setCurrentText(const QString& text) {
             QComboBox::setCurrentIndex(i);
         }
     }
-}
+} 
 
 void AddressCombo::addItem(const QString& text, double bal) {
     QString txt = AddressBook::addLabelToAddress(text);
     if (bal > 0)
         txt = txt % "(" % Settings::getZCLDisplayFormat(bal) % ")";
-
+        
     QComboBox::addItem(txt);
 }
 
 void AddressCombo::insertItem(int index, const QString& text, double bal) {
-    QString txt = AddressBook::addLabelToAddress(text) %
+    QString txt = AddressBook::addLabelToAddress(text) % 
                     "(" % Settings::getZCLDisplayFormat(bal) % ")";
     QComboBox::insertItem(index, txt);
 }

@@ -1,7 +1,7 @@
 #include "senttxstore.h"
 #include "settings.h"
 
-/// Get the location of the app data file to be written.
+/// Get the location of the app data file to be written. 
 QString SentTxStore::writeableFile() {
     auto filename = QStringLiteral("senttxstore.dat");
 
@@ -16,7 +16,7 @@ QString SentTxStore::writeableFile() {
     }
 }
 
-// delete the sent history.
+// delete the sent history. 
 void SentTxStore::deleteHistory() {
     QFile data(writeableFile());
     data.remove();
@@ -28,10 +28,10 @@ QList<TransactionItem> SentTxStore::readSentTxFile() {
     if (!data.exists()) {
         return QList<TransactionItem>();
     }
-
+    
     QJsonDocument jsonDoc;
-
-    data.open(QFile::ReadOnly);
+    
+    data.open(QFile::ReadOnly);    
     jsonDoc = QJsonDocument::fromJson(data.readAll());
     data.close();
 
@@ -39,10 +39,10 @@ QList<TransactionItem> SentTxStore::readSentTxFile() {
 
     for (auto i : jsonDoc.array()) {
         auto sentTx = i.toObject();
-        TransactionItem t{"send", (qint64)sentTx["datetime"].toVariant().toLongLong(),
-                          sentTx["address"].toString(),
-                          sentTx["txid"].toString(),
-                          sentTx["amount"].toDouble() + sentTx["fee"].toDouble(),
+        TransactionItem t{"send", (qint64)sentTx["datetime"].toVariant().toLongLong(), 
+                          sentTx["address"].toString(), 
+                          sentTx["txid"].toString(), 
+                          sentTx["amount"].toDouble() + sentTx["fee"].toDouble(), 
                           0, sentTx["from"].toString(), ""};
         items.push_back(t);
     }
@@ -55,9 +55,9 @@ void SentTxStore::addToSentTx(Tx tx, QString txid) {
     if (!Settings::getInstance()->getSaveZtxs())
         return;
 
-    // Also, only store outgoing txs where the from address is a z-Addr. Else, regular zclassicd
+    // Also, only store outgoing txs where the from address is a z-Addr. Else, regular zclassicd 
     // stores it just fine
-    if (!tx.fromAddr.startsWith("z"))
+    if (!tx.fromAddr.startsWith("z")) 
         return;
 
     QFile data(writeableFile());
@@ -73,7 +73,7 @@ void SentTxStore::addToSentTx(Tx tx, QString txid) {
         newFile.write(jsonDoc.toJson());
         newFile.close();
     } else {
-        data.open(QFile::ReadOnly);
+        data.open(QFile::ReadOnly);    
         jsonDoc = QJsonDocument().fromJson(data.readAll());
         data.close();
     }
@@ -110,6 +110,6 @@ void SentTxStore::addToSentTx(Tx tx, QString txid) {
     QFile writer(writeableFile());
     if (writer.open(QFile::WriteOnly | QFile::Truncate)) {
         writer.write(jsonDoc.toJson());
-    }
+    } 
     writer.close();
 }
