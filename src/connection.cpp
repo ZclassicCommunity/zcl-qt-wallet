@@ -182,7 +182,10 @@ void ConnectionLoader::createZClassicConf() {
     QTextStream out(&file); 
     
     out << "server=1\n";
-    out << "addnode=mainnet.z.cash\n";
+    // No addnode here: mainnet.z.cash is a Zcash (ZEC) node, not a valid ZClassic
+    // peer, and the zclassicd we drive already pins its own compiled bootstrap
+    // peers / seeds as -addnode on every start. Baking a wrong peer into the
+    // user's permanent conf only causes repeated failed connections.
     out << "rpcuser=zcl-qt-wallet\n";
     out << "rpcpassword=" % randomPassword() << "\n";
     if (!datadir.isEmpty()) {
@@ -282,18 +285,25 @@ void ConnectionLoader::doNextDownload(std::function<void(void)> cb) {
     
     // Download Finished
     QObject::connect(currentDownload, &QNetworkReply::finished, [=] () {
-        // Rename file
         main->logger->write("Finished downloading " + filename);
-        currentOutput->rename(QDir(paramsDir).filePath(filename));
-
+        // Flush and close the .part file BEFORE deciding what to do with it.
         currentOutput->close();
-        currentDownload->deleteLater();
-        currentOutput->deleteLater();
 
         if (currentDownload->error()) {
-            main->logger->write("Downloading " + filename + " failed");
-            this->showError(QObject::tr("Downloading ") + filename + QObject::tr(" failed. Please check the help site for more info"));                
+            // Drop the partial/truncated .part so it is re-downloaded next run,
+            // instead of promoting it to the final name where verifyParams()
+            // (existence-only) would treat the corrupt file as valid and the user
+            // would later hit an opaque proving-system failure when spending.
+            main->logger->write("Downloading " + filename + " failed; removing partial file");
+            currentOutput->remove();
+            currentDownload->deleteLater();
+            currentOutput->deleteLater();
+            this->showError(QObject::tr("Downloading ") + filename + QObject::tr(" failed. Please check the help site for more info"));
         } else {
+            // Promote .part -> final name only on a fully successful download.
+            currentOutput->rename(QDir(paramsDir).filePath(filename));
+            currentDownload->deleteLater();
+            currentOutput->deleteLater();
             doNextDownload(cb);
         }
     });
