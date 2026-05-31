@@ -284,6 +284,15 @@ void Settings::setSaveZtxs(bool save) {
     QSettings().setValue("options/savesenttx", save);
 }
 
+bool Settings::getKeepInTray() {
+    // Default OFF: closing the window stops the node, exactly as before.
+    return QSettings().value("options/keepintray", false).toBool();
+}
+
+void Settings::setKeepInTray(bool keep) {
+    QSettings().setValue("options/keepintray", keep);
+}
+
 void Settings::setPeers(int peers) {
     _peerConnections = peers;
 }

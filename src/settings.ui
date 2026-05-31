@@ -210,13 +210,30 @@
         </widget>
        </item>
        <item row="11" column="0" colspan="2">
+        <widget class="QCheckBox" name="chkKeepInTray">
+         <property name="text">
+          <string>Keep running in the background for instant restarts</string>
+         </property>
+        </widget>
+       </item>
+       <item row="12" column="0" colspan="2">
+        <widget class="QLabel" name="label_tray">
+         <property name="text">
+          <string>When you close the window, ZclWallet keeps running in the system tray (notification area) and the node stays warm, so the next time you open it there's no ~1-minute startup wait. Use the tray icon (or File &gt; Exit) to quit completely.</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item row="13" column="0" colspan="2">
         <widget class="Line" name="line_2">
          <property name="orientation">
           <enum>Qt::Horizontal</enum>
          </property>
         </widget>
        </item>
-       <item row="12" column="0" colspan="2">
+       <item row="14" column="0" colspan="2">
         <spacer name="verticalSpacer_2">
          <property name="orientation">
           <enum>Qt::Vertical</enum>

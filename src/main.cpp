@@ -167,11 +167,17 @@ public:
         // Check for a positional argument indicating a zclassic payment URI
         if (a.isSecondary()) {
             if (parser.positionalArguments().length() > 0) {
-                a.sendMessage(parser.positionalArguments()[0].toUtf8());    
+                a.sendMessage(parser.positionalArguments()[0].toUtf8());
+            } else {
+                // No URI: this is just the user launching the app again. Ask the
+                // already-running instance to come to the front (and un-hide from
+                // the tray, in tray-resident mode) instead of starting a second
+                // node. This is what makes a "relaunch" feel instant.
+                a.sendMessage(QByteArray("__SHOW__"));
             }
             a.exit( 0 );
-            return 0;            
-        } 
+            return 0;
+        }
 
         QCoreApplication::setOrganizationName("zcl-qt-wallet-org");
         QCoreApplication::setApplicationName("zcl-qt-wallet");
@@ -225,13 +231,19 @@ public:
             w->payZClassicURI(parser.positionalArguments()[0]);
         }
 
-        // Listen for any secondary instances telling us about a zclassic payment URI
+        // Listen for any secondary instances: bring this window to the front
+        // (un-hiding from the tray if needed) and, if a payment URI was passed,
+        // pay it.
         QObject::connect(&a, &SingleApplication::receivedMessage, [=] (quint32, QByteArray msg) {
             QString uri(msg);
 
             // We need to execute this async, otherwise the app seems to crash for some reason.
-            QTimer::singleShot(1, [=]() { w->payZClassicURI(uri); });            
-        });   
+            QTimer::singleShot(1, [=]() {
+                w->showFromTray();
+                if (uri != QStringLiteral("__SHOW__") && !uri.isEmpty())
+                    w->payZClassicURI(uri);
+            });
+        });
 
         // For MacOS, we have an event filter
         a.installEventFilter(w);

@@ -780,6 +780,18 @@ void RPC::refreshBalances() {
         ui->balSheilded   ->setToolTip(Settings::getUSDFormat(balZ));
         ui->balTransparent->setToolTip(Settings::getUSDFormat(balT));
         ui->balTotal      ->setToolTip(Settings::getUSDFormat(balTotal));
+
+        // Remember the last-known balances so the next launch can paint them
+        // instantly while the node warms up (see MainWindow::restoreSavedStates).
+        // Convenience cache only, stored outside wallet.dat; gated on the same
+        // "keep local data" preference as saved shielded-tx history.
+        if (Settings::getInstance()->getSaveZtxs()) {
+            QSettings cs;
+            cs.setValue("cache/balTransparent", balT);
+            cs.setValue("cache/balShielded",    balZ);
+            cs.setValue("cache/balTotal",       balTotal);
+            cs.setValue("cache/lastSyncEpoch",  QDateTime::currentSecsSinceEpoch());
+        }
     });
 
     // 2. Get the UTXOs

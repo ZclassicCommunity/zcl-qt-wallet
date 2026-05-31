@@ -20,6 +20,9 @@
 #include "connection.h"
 #include "websockets.h"
 
+#include <QSystemTrayIcon>
+#include <QCloseEvent>
+
 using json = nlohmann::json;
 
 MainWindow::MainWindow(QWidget *parent) :
@@ -35,8 +38,10 @@ MainWindow::MainWindow(QWidget *parent) :
     // Settings editor 
     setupSettingsModal();
 
-    // Set up exit action
-    QObject::connect(ui->actionExit, &QAction::triggered, this, &MainWindow::close);
+    // Set up exit action. Use quitApp() (not close()) so that in tray-resident
+    // mode File -> Exit really quits and cleanly stops the node, rather than
+    // just hiding the window to the tray.
+    QObject::connect(ui->actionExit, &QAction::triggered, this, &MainWindow::quitApp);
 
     // Set up donate action
     QObject::connect(ui->actionDonate, &QAction::triggered, this, &MainWindow::donate);
@@ -118,8 +123,12 @@ MainWindow::MainWindow(QWidget *parent) :
 
         createWebsocket(wormholecode);
     }
+
+    // Opt-in tray-resident mode: set up the tray icon + app-exit semantics to
+    // match the saved preference (default OFF -> no tray, quit-on-close as before).
+    applyTraySetting(Settings::getInstance()->getKeepInTray());
 }
- 
+
 void MainWindow::createWebsocket(QString wormholecode) {
     qDebug() << "Listening for app connections on port 8237";
     // Create the websocket server, for listening to direct connections
@@ -156,9 +165,36 @@ void MainWindow::restoreSavedStates() {
 
     ui->balancesTable->horizontalHeader()->restoreState(s.value("baltablegeometry").toByteArray());
     ui->transactionsTable->horizontalHeader()->restoreState(s.value("tratablegeometry").toByteArray());
+
+    // Paint the last-known balances immediately so the first ~1-minute node
+    // warmup shows a usable view instead of a blank "0.00". The live RPC
+    // overwrites these the moment it connects. Gated on the same "keep local
+    // data" preference that governs saved shielded-tx history; the live values
+    // are authoritative, this is only a convenience cache shown while syncing.
+    if (Settings::getInstance()->getSaveZtxs() && s.contains("cache/balTotal")) {
+        double balT   = s.value("cache/balTransparent", 0.0).toDouble();
+        double balZ   = s.value("cache/balShielded",    0.0).toDouble();
+        double balTot = s.value("cache/balTotal",       0.0).toDouble();
+
+        ui->balTransparent->setText(Settings::getZCLDisplayFormat(balT));
+        ui->balSheilded   ->setText(Settings::getZCLDisplayFormat(balZ));
+        ui->balTotal      ->setText(Settings::getZCLDisplayFormat(balTot));
+
+        qint64 epoch = s.value("cache/lastSyncEpoch", (qint64) 0).toLongLong();
+        if (epoch > 0) {
+            QString when = QDateTime::fromSecsSinceEpoch(epoch).toString("MMM d, h:mm AP");
+            QString tip  = tr("Last known balance — last updated %1 (refreshing…)").arg(when);
+            ui->balTransparent->setToolTip(tip);
+            ui->balSheilded   ->setToolTip(tip);
+            ui->balTotal      ->setToolTip(tip);
+        }
+    }
 }
 
 void MainWindow::doClose() {
+    // doClose() is the "really quit" path (e.g. an OS signal handler), so make
+    // sure closeEvent performs the real shutdown rather than hiding to the tray.
+    quitting = true;
     closeEvent(nullptr);
 }
 
@@ -171,12 +207,92 @@ void MainWindow::closeEvent(QCloseEvent* event) {
 
     s.sync();
 
-    // Let the RPC know to shut down any running service.
+    // Tray-resident mode: closing the window just hides it (the node keeps
+    // running so the next open is instant). Only an explicit Quit / File->Exit
+    // (which sets `quitting`) tears the node down. Never silently hide if the
+    // system tray is unavailable -- fall through to a real shutdown so the node
+    // is never orphaned with no way to bring the window back.
+    if (!quitting
+            && Settings::getInstance()->getKeepInTray()
+            && trayIcon != nullptr
+            && QSystemTrayIcon::isSystemTrayAvailable()) {
+        hide();
+        if (event)
+            event->ignore();
+
+        if (!trayHintShown) {
+            trayHintShown = true;
+            trayIcon->showMessage(tr("ZclWallet is still running"),
+                tr("ZclWallet keeps running in the background so it opens instantly next time. "
+                   "Right-click the tray icon (or use File > Exit) to quit completely."),
+                QSystemTrayIcon::Information, 5000);
+        }
+        return;
+    }
+
+    // Real shutdown. Let the RPC know to shut down any running service.
     rpc->shutdownZClassicd();
 
     // Bubble up
     if (event)
         QMainWindow::closeEvent(event);
+
+    // In tray-resident mode we disabled quit-on-last-window-closed, so closing
+    // the window no longer ends the app by itself -- ask it to quit explicitly.
+    if (Settings::getInstance()->getKeepInTray())
+        qApp->quit();
+}
+
+void MainWindow::showFromTray() {
+    showNormal();
+    raise();
+    activateWindow();
+}
+
+void MainWindow::quitApp() {
+    // The real, clean exit: mark quitting so closeEvent stops the node instead
+    // of hiding to the tray, then close (which triggers the shutdown sequence).
+    quitting = true;
+    close();
+}
+
+void MainWindow::setupTrayIcon() {
+    if (trayIcon != nullptr)
+        return;
+
+    trayIcon = new QSystemTrayIcon(QIcon(":/icons/res/icon.ico"), this);
+    trayIcon->setToolTip("ZclWallet");
+
+    auto trayMenu = new QMenu(this);
+    auto showAction = trayMenu->addAction(tr("Show ZclWallet"));
+    QObject::connect(showAction, &QAction::triggered, this, &MainWindow::showFromTray);
+    trayMenu->addSeparator();
+    auto quitAction = trayMenu->addAction(tr("Quit"));
+    QObject::connect(quitAction, &QAction::triggered, this, &MainWindow::quitApp);
+    trayIcon->setContextMenu(trayMenu);
+
+    // A left-click / double-click on the tray icon brings the window back.
+    QObject::connect(trayIcon, &QSystemTrayIcon::activated, this,
+        [=](QSystemTrayIcon::ActivationReason reason) {
+            if (reason == QSystemTrayIcon::Trigger || reason == QSystemTrayIcon::DoubleClick)
+                showFromTray();
+        });
+}
+
+void MainWindow::applyTraySetting(bool enabled) {
+    if (enabled && QSystemTrayIcon::isSystemTrayAvailable()) {
+        setupTrayIcon();
+        trayIcon->show();
+        // The window-close should hide to tray, not end the app.
+        qApp->setQuitOnLastWindowClosed(false);
+    } else {
+        if (trayIcon != nullptr)
+            trayIcon->hide();
+        // Restore the default: closing the (last) window quits the app. Do not
+        // override headless mode, which manages this flag itself.
+        if (!Settings::getInstance()->isHeadless())
+            qApp->setQuitOnLastWindowClosed(true);
+    }
 }
 
 void MainWindow::turnstileProgress() {
@@ -557,6 +673,8 @@ void MainWindow::setupSettingsModal() {
                 "Shielded z-Address transactions are stored locally in your wallet, outside zclassicd. You may delete this saved information safely any time for your privacy.\nDo you want to delete the saved shielded transactions now?",
                 QMessageBox::Yes, QMessageBox::Cancel)) {
                     SentTxStore::deleteHistory();
+                    // Also drop the cached last-known balances (same local data).
+                    QSettings().remove("cache");
                     // Reload after the clear button so existing txs disappear
                     rpc->refresh(true);
             }
@@ -564,6 +682,14 @@ void MainWindow::setupSettingsModal() {
 
         // Save sent transactions
         settings.chkSaveTxs->setChecked(Settings::getInstance()->getSaveZtxs());
+
+        // Keep running in the background (tray-resident). Disable + explain when
+        // there is no system tray available so the user isn't offered a no-op.
+        settings.chkKeepInTray->setChecked(Settings::getInstance()->getKeepInTray());
+        if (!QSystemTrayIcon::isSystemTrayAvailable()) {
+            settings.chkKeepInTray->setEnabled(false);
+            settings.chkKeepInTray->setToolTip(tr("Your desktop doesn't provide a system tray, so this option isn't available."));
+        }
 
         // Custom fees
         settings.chkCustomFees->setChecked(Settings::getInstance()->getAllowCustomFees());
@@ -635,6 +761,12 @@ void MainWindow::setupSettingsModal() {
 
             // Auto shield
             Settings::getInstance()->setAutoShield(settings.chkAutoShield->isChecked());
+
+            // Keep running in the background (tray-resident). Apply immediately
+            // so the change takes effect this session, no restart needed.
+            bool keepInTray = settings.chkKeepInTray->isChecked();
+            Settings::getInstance()->setKeepInTray(keepInTray);
+            applyTraySetting(keepInTray);
 
             if (!isUsingTor && settings.chkTor->isChecked()) {
                 // If "use tor" was previously unchecked and now checked

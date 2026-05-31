@@ -46,6 +46,12 @@ public:
     bool    getSaveZtxs();
     void    setSaveZtxs(bool save);
 
+    // Opt-in: keep ZclWallet (and its embedded node) running in the system tray
+    // when the window is closed, so the next launch is instant instead of paying
+    // the ~1-minute node warmup again. Default OFF -> behaves exactly as before.
+    bool    getKeepInTray();
+    void    setKeepInTray(bool keep);
+
     bool    isWalletBackedUp();
     void    setWalletBackedUp(bool backedUp);
 

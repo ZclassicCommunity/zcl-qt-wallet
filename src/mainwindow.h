@@ -12,6 +12,7 @@ class RPC;
 class Settings;
 class WSServer;
 class WormholeClient;
+class QSystemTrayIcon;
 
 using json = nlohmann::json;
 
@@ -81,8 +82,22 @@ public:
 
     void doClose();
 
-private:    
+    // Opt-in tray-resident mode (Settings -> Options -> "Keep running in the
+    // background"). showFromTray() un-hides+raises the window (also used when a
+    // second launch hands off to this instance); quitApp() performs the real,
+    // clean shutdown (vs. closeEvent hiding to tray). applyTraySetting() wires
+    // the tray icon + app-exit semantics to the current setting.
+    void showFromTray();
+    void quitApp();
+    void applyTraySetting(bool enabled);
+
+private:
     void closeEvent(QCloseEvent* event);
+
+    void setupTrayIcon();
+    QSystemTrayIcon* trayIcon       = nullptr;
+    bool             quitting       = false;
+    bool             trayHintShown  = false;
 
     void setupSendTab();
     void setupTransactionsTab();
