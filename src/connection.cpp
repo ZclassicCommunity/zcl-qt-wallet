@@ -7,6 +7,10 @@
 
 #include "precompiled.h"
 
+#include <QStorageInfo>
+#include <QProgressBar>
+#include <QElapsedTimer>
+
 using json = nlohmann::json;
 
 ConnectionLoader::ConnectionLoader(MainWindow* main, RPC* rpc) {
@@ -18,6 +22,46 @@ ConnectionLoader::ConnectionLoader(MainWindow* main, RPC* rpc) {
     connD->setupUi(d);
     QPixmap logo(":/img/res/logobig.gif");
     connD->topIcon->setBasePixmap(logo.scaled(256, 256, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+
+    // ---- P1-1: friendly, non-scary staged-onboarding card (built in C++ so the
+    // checked-in connection.ui / ui_connection.h stay untouched). It is shown on
+    // first run only and stays visible through the initial sync. ----
+    ezCard = new QLabel(d);
+    ezCard->setWordWrap(true);
+    ezCard->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    ezCard->setTextFormat(Qt::RichText);
+    ezCard->setContentsMargins(16, 8, 16, 8);
+    ezCard->setText(QObject::tr(
+        "<b>Setting up ZClassic</b><br>"
+        "The first run takes about <b>10–20 minutes</b> while your wallet "
+        "prepares itself. You can leave it running — it is safe to come back later.<br><br>"
+        "&nbsp;&nbsp;<b>Step 1.</b> Getting the security files ready<br>"
+        "&nbsp;&nbsp;<b>Step 2.</b> Starting your wallet<br>"
+        "&nbsp;&nbsp;<b>Step 3.</b> Catching up with the network"));
+
+    ezProgress = new QProgressBar(d);
+    ezProgress->setTextVisible(false);
+    // Busy / indeterminate by default; switched to a real 0-100 bar once we have
+    // an actual percentage (param download % or block-sync %).
+    ezProgress->setRange(0, 0);
+
+    // Insert the card above, and the progress bar below, the status labels.
+    // verticalLayout order today: topIcon, line_2, status, statusDetail, line.
+    // We want: topIcon, line_2, [ezCard], status, statusDetail, [ezProgress], line.
+    int statusIdx = connD->verticalLayout->indexOf(connD->status);
+    if (statusIdx < 0) statusIdx = 2;
+    connD->verticalLayout->insertWidget(statusIdx, ezCard);
+    int lineIdx = connD->verticalLayout->indexOf(connD->line);
+    if (lineIdx < 0) lineIdx = connD->verticalLayout->count();
+    connD->verticalLayout->insertWidget(lineIdx, ezProgress);
+
+    // Only show the explanatory card the very first time the user ever launches.
+    bool firstRun = !QSettings().value("ez/onboardingShown", false).toBool();
+    ezCard->setVisible(firstRun);
+    if (firstRun)
+        QSettings().setValue("ez/onboardingShown", true);
+
+    d->setMinimumWidth(540);
 }
 
 ConnectionLoader::~ConnectionLoader() {    
@@ -54,14 +98,15 @@ void ConnectionLoader::doAutoConnect(bool tryEzclassicdStart) {
             // fire a false "Couldn't start the embedded zclassicd" on first launch.)
             if (!Settings::getInstance()->useEmbedded()) {
                 main->logger->write("Not using embedded and couldn't connect to zclassicd");
-                this->showError(QObject::tr("Couldn't connect to the ZClassic node configured in "
-                    "zclassic.conf, and the built-in node is turned off (--no-embedded)."));
+                this->showError(QObject::tr("ZClassic couldn't connect.\n\n"
+                    "It is set to use an outside connection that isn't responding. "
+                    "Please check your internet connection and try opening ZClassic again."));
                 return;
             }
 
             // Never started yet -> start it once.
             if (ezclassicd == nullptr) {
-                this->showInformation(QObject::tr("Starting your ZClassic node…"));
+                this->showInformation(QObject::tr("Step 2 of 3: Starting your wallet…"));
                 if (!this->startEmbeddedZClassicd()) {
                     main->logger->write("Could not launch the embedded zclassicd binary");
                     this->showError(QObject::tr("ZClassic couldn't start its node.\n\n"
@@ -79,8 +124,8 @@ void ConnectionLoader::doAutoConnect(bool tryEzclassicdStart) {
             // polling with a friendly message instead of ever showing an error.
             if (ezclassicd->state() != QProcess::NotRunning ||
                 (ezWarmupTimer.isValid() && ezWarmupTimer.elapsed() < 120000)) {
-                this->showInformation(QObject::tr("Starting your ZClassic node…"),
-                    QObject::tr("Almost ready — preparing the blockchain (this can take a minute)…"));
+                this->showInformation(QObject::tr("Step 2 of 3: Starting your wallet…"),
+                    QObject::tr("Almost ready — getting things going (this can take a minute)…"));
                 QTimer::singleShot(1000, [=]() { doAutoConnect(); });
                 return;
             }
@@ -200,6 +245,15 @@ void ConnectionLoader::createZClassicConf() {
 
 void ConnectionLoader::downloadParams(std::function<void(void)> cb) {    
     main->logger->write("Adding params to download queue");
+
+    // P1-7: make sure there is enough room before pulling ~1.7GB of security files.
+    if (!ensureEnoughDiskSpace(zcashParamsDir()))
+        return;
+
+    // P1-1: this is Step 1 of onboarding.
+    this->showInformation(QObject::tr("Step 1 of 3: Getting the security files ready…"),
+                          QObject::tr("This is a one-time download of about 1.7 GB."));
+
     // Add all the files to the download queue
     downloadQueue = new QQueue<QUrl>();
     client = new QNetworkAccessManager(main);   
@@ -223,22 +277,30 @@ void ConnectionLoader::doNextDownload(std::function<void(void)> cb) {
 
     if (downloadQueue->isEmpty()) {
         delete downloadQueue;
+        downloadQueue = nullptr;
         client->deleteLater();
+        client = nullptr;
 
         main->logger->write("All Downloads done");
-        this->showInformation(QObject::tr("All Downloads Finished Successfully!"));
+        ezRetryCount = 0;
+        // Back to a busy bar; the node-start / sync phase has no per-file %.
+        if (ezProgress) ezProgress->setRange(0, 0);
+        this->showInformation(QObject::tr("Step 1 of 3: Security files ready."),
+                              QObject::tr("Starting your wallet…"));
         cb();
         return;
     }
 
-    QUrl url = downloadQueue->dequeue();
-    int filesRemaining = downloadQueue->size();
+    QUrl url = downloadQueue->head();   // peek; only dequeue on success so retries can re-pull
+    int totalFiles = 5;                 // we enqueue 5 param files
+    int fileNumber = totalFiles - downloadQueue->size() + 1;
 
     QString filename = fnSaveFileName(url);
     QString paramsDir = zcashParamsDir();
 
     if (QFile(QDir(paramsDir).filePath(filename)).exists()) {
         main->logger->write(filename + " already exists, skipping");
+        downloadQueue->dequeue();
         doNextDownload(cb);
 
         return;
@@ -249,58 +311,113 @@ void ConnectionLoader::doNextDownload(std::function<void(void)> cb) {
 
     if (!currentOutput->open(QIODevice::WriteOnly)) {
         main->logger->write("Couldn't open " + currentOutput->fileName() + " for writing");
-        this->showError(QObject::tr("Couldn't download params. Please check the help site for more info."));
+        delete currentOutput;
+        currentOutput = nullptr;
+        // P1-2 fix: must NOT fall through after a failed open.
+        this->showError(QObject::tr("ZClassic couldn't save the security files.\n\n"
+            "Please make sure you have enough free disk space, then open ZClassic again."));
+        return;
     }
     main->logger->write("Downloading to " + filename);
     qDebug() << "Downloading " << url << " to " << filename;
     
     QNetworkRequest request(url);
     request.setAttribute(QNetworkRequest::FollowRedirectsAttribute, true);
+    // P1-5: a stalled socket should fail fast and retry instead of hanging forever.
+    // NOTE: in Qt 5.15 setTransferTimeout lives on QNetworkRequest / QNetworkAccessManager,
+    // NOT on QNetworkReply, so it is set here on the request before get().
+    request.setTransferTimeout(30000);
     currentDownload = client->get(request);
     downloadTime.start();
     
     // Download Progress
     QObject::connect(currentDownload, &QNetworkReply::downloadProgress, [=] (auto done, auto total) {
         // calculate the download speed
-        double speed = done * 1000.0 / downloadTime.elapsed();
+        double speed = done * 1000.0 / (downloadTime.elapsed() > 0 ? downloadTime.elapsed() : 1);
         QString unit;
-        if (speed < 1024) {
-            unit = "bytes/sec";
-        } else if (speed < 1024*1024) {
-            speed /= 1024;
-            unit = "kB/s";
+        double dispSpeed = speed;
+        if (dispSpeed < 1024) {
+            unit = " bytes/sec";
+        } else if (dispSpeed < 1024*1024) {
+            dispSpeed /= 1024;
+            unit = " kB/s";
         } else {
-            speed /= 1024*1024;
-            unit = "MB/s";
+            dispSpeed /= 1024*1024;
+            unit = " MB/s";
         }
+
+        // P1-2: aggregate, friendly progress. Drive the real 0-100 bar off this
+        // file's percentage, and show file X of N plus an ETA for the current file.
+        QString eta;
+        if (total > 0 && speed > 1) {
+            int secsLeft = (int)((total - done) / speed);
+            if (secsLeft > 90)
+                eta = QObject::tr(", about ") % QString::number(secsLeft / 60) % QObject::tr(" min left");
+            else if (secsLeft > 0)
+                eta = QObject::tr(", about ") % QString::number(secsLeft) % QObject::tr(" sec left");
+        }
+        if (total > 0)
+            this->setBarPercent((int)(done * 100 / total));
 
         this->showInformation(
-            QObject::tr("Downloading ") % filename % (filesRemaining > 1 ? " ( +" % QString::number(filesRemaining)  % QObject::tr(" more remaining )") : QString("")),
-            QString::number(done/1024/1024, 'f', 0) % QObject::tr("MB of ") % QString::number(total/1024/1024, 'f', 0) + QObject::tr("MB at ") % QString::number(speed, 'f', 2) % unit);
+            QObject::tr("Step 1 of 3: Getting the security files ready…"),
+            QObject::tr("File ") % QString::number(fileNumber) % QObject::tr(" of ") % QString::number(totalFiles)
+                % " — "
+                % QString::number(done/1024.0/1024.0, 'f', 0) % QObject::tr(" MB of ")
+                % (total > 0 ? QString::number(total/1024.0/1024.0, 'f', 0) : QObject::tr("?")) % QObject::tr(" MB at ")
+                % QString::number(dispSpeed, 'f', 1) % unit % eta);
     });
     
-    // Download Finished
-    QObject::connect(currentDownload, &QNetworkReply::finished, [=] () {
-        // Rename file
-        main->logger->write("Finished downloading " + filename);
-        currentOutput->rename(QDir(paramsDir).filePath(filename));
-
-        currentOutput->close();
-        currentDownload->deleteLater();
-        currentOutput->deleteLater();
-
-        if (currentDownload->error()) {
-            main->logger->write("Downloading " + filename + " failed");
-            this->showError(QObject::tr("Downloading ") + filename + QObject::tr(" failed. Please check the help site for more info"));                
-        } else {
-            doNextDownload(cb);
-        }
-    });
-
     // Download new data available. 
     QObject::connect(currentDownload, &QNetworkReply::readyRead, [=] () {
-        currentOutput->write(currentDownload->readAll());
+        if (currentOutput)
+            currentOutput->write(currentDownload->readAll());
     });    
+
+    // Download Finished
+    QObject::connect(currentDownload, &QNetworkReply::finished, [=] () {
+        bool failed = (currentDownload->error() != QNetworkReply::NoError);
+
+        if (currentOutput) {
+            currentOutput->close();
+        }
+        currentDownload->deleteLater();
+
+        if (failed) {
+            main->logger->write("Downloading " + filename + " failed: " + currentDownload->errorString());
+            // Drop the partial file so a retry starts clean.
+            if (currentOutput) {
+                currentOutput->remove();
+                currentOutput->deleteLater();
+                currentOutput = nullptr;
+            }
+
+            // P1-2/P1-5: auto-retry the same file a few times, then offer a Retry button
+            // instead of a dead end.
+            if (ezRetryCount < 3) {
+                ezRetryCount++;
+                main->logger->write(QString("Auto-retrying download (attempt %1)").arg(ezRetryCount));
+                this->showInformation(QObject::tr("Step 1 of 3: Getting the security files ready…"),
+                                      QObject::tr("Connection hiccup — retrying…"));
+                QTimer::singleShot(1500, [=]() { this->doNextDownload(cb); });
+            } else {
+                this->offerRetry(QObject::tr("The setup files couldn't finish downloading.\n\n"
+                    "This is almost always a temporary internet problem."), cb);
+            }
+            return;
+        }
+
+        // Success: rename the .part into place and move on.
+        main->logger->write("Finished downloading " + filename);
+        if (currentOutput) {
+            currentOutput->rename(QDir(paramsDir).filePath(filename));
+            currentOutput->deleteLater();
+            currentOutput = nullptr;
+        }
+        ezRetryCount = 0;
+        downloadQueue->dequeue();
+        doNextDownload(cb);
+    });
 }
 
 bool ConnectionLoader::startEmbeddedZClassicd() {
@@ -315,7 +432,11 @@ bool ConnectionLoader::startEmbeddedZClassicd() {
     if (ezclassicd != nullptr) {
         if (ezclassicd->state() == QProcess::NotRunning) {
             if (!processStdErrOutput.isEmpty()) {
-                QMessageBox::critical(main, QObject::tr("zclassicd error"), "zclassicd said: " + processStdErrOutput, 
+                main->logger->write("node stderr: " + processStdErrOutput);
+                QMessageBox::critical(main, QObject::tr("ZClassic"),
+                                      QObject::tr("Your wallet had trouble starting up.\n\n"
+                                      "Please open ZClassic again. If it keeps happening, make sure your "
+                                      "security software isn't blocking it and that you have free disk space."),
                                       QMessageBox::Ok);
             }
             return false;
@@ -394,8 +515,8 @@ void ConnectionLoader::doManualConnect() {
     auto connection = makeConnection(config);
     refreshZClassicdState(connection, [=] () {
         QString explanation = QString()
-                % QObject::tr("Could not connect to zclassicd configured in settings.\n\n" 
-                "Please set the host/port and user/password in the Edit->Settings menu.");
+                % QObject::tr("ZClassic couldn't connect to the node in your settings.\n\n" 
+                "Please check the address and sign-in details under Edit → Settings.");
 
         showError(explanation);
         doRPCSetConnection(nullptr);
@@ -455,8 +576,9 @@ void ConnectionLoader::refreshZClassicdState(Connection* connection, std::functi
             } else if (err == QNetworkReply::NetworkError::AuthenticationRequiredError) {
                 main->logger->write("Authentication failed");
                 QString explanation = QString() % 
-                        QObject::tr("Authentication failed. The username / password you specified was "
-                        "not accepted by zclassicd. Try changing it in the Edit->Settings menu");
+                        QObject::tr("ZClassic couldn't sign in to its node.\n\n"
+                        "The saved username or password wasn't accepted. "
+                        "You can correct it under Edit → Settings.");
 
                 this->showError(explanation);
             } else if (err == QNetworkReply::NetworkError::InternalServerError && 
@@ -470,7 +592,7 @@ void ConnectionLoader::refreshZClassicdState(Connection* connection, std::functi
                     if (dots > 3)
                         dots = 0;
                 }
-                this->showInformation(QObject::tr("Your ZClassic node is starting up. Please wait."), status);
+                this->showInformation(QObject::tr("Step 2 of 3: Starting your wallet…"), status);
                 main->logger->write("Waiting for zclassicd to come online.");
                 // Refresh after one second
                 QTimer::singleShot(1000, [=]() { this->refreshZClassicdState(connection, refused); });
@@ -481,6 +603,11 @@ void ConnectionLoader::refreshZClassicdState(Connection* connection, std::functi
 
 // Update the UI with the status
 void ConnectionLoader::showInformation(QString info, QString detail) {
+    // Once we reach the syncing phase, drop the now-stale onboarding card so it
+    // doesn't contradict the live status; the progress bar carries on.
+    if (info.contains(QObject::tr("Step 3")) && ezCard && ezCard->isVisible())
+        ezCard->setVisible(false);
+
     static int rescanCount = 0;
     if (detail.toLower().startsWith("rescan")) {
         rescanCount++;
@@ -652,6 +779,55 @@ std::shared_ptr<ConnectionConfig> ConnectionLoader::loadFromSettings() {
 
 
 
+
+// P1-7: refuse to start a ~1.7GB download / heavy sync when the disk is nearly full.
+bool ConnectionLoader::ensureEnoughDiskSpace(const QString& path) {
+    QStorageInfo storage(path);
+    if (!storage.isValid() || !storage.isReady()) {
+        // Can't tell -- don't block the user on an unknown.
+        main->logger->write("Disk space check skipped (storage not ready) for " + path);
+        return true;
+    }
+
+    const qint64 needed = (qint64)3 * 1024 * 1024 * 1024;   // ~3 GB
+    qint64 avail = storage.bytesAvailable();
+    main->logger->write(QString("Free space at %1: %2 MB").arg(path).arg(avail / 1024 / 1024));
+
+    if (avail < needed) {
+        QString human = QString::number(avail / 1024.0 / 1024.0 / 1024.0, 'f', 1);
+        this->showError(QObject::tr("Not enough free disk space.\n\n"
+            "ZClassic needs about 3 GB free to finish setting up, but only %1 GB is available. "
+            "Please free up some space and open ZClassic again.").arg(human));
+        return false;
+    }
+    return true;
+}
+
+// P1-2: switch the onboarding bar from busy/indeterminate to a real 0-100 reading.
+void ConnectionLoader::setBarPercent(int pct) {
+    if (!ezProgress) return;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    if (ezProgress->maximum() == 0)
+        ezProgress->setRange(0, 100);
+    ezProgress->setValue(pct);
+}
+
+// P1-2: instead of a dead-end error on a failed download, let the user try again.
+void ConnectionLoader::offerRetry(QString explanation, std::function<void(void)> cb) {
+    auto choice = QMessageBox::warning(main, QObject::tr("ZClassic"),
+        explanation % "\n\n" % QObject::tr("Would you like to try again?"),
+        QMessageBox::Retry | QMessageBox::Cancel, QMessageBox::Retry);
+
+    if (choice == QMessageBox::Retry) {
+        ezRetryCount = 0;
+        main->logger->write("User chose to retry param download");
+        QTimer::singleShot(100, [=]() { this->doNextDownload(cb); });
+    } else {
+        this->showError(QObject::tr("Setup was stopped.\n\n"
+            "You can open ZClassic again whenever you're ready to finish setting up."));
+    }
+}
 
 /***********************************************************************************
  *  Connection Class

@@ -1,6 +1,8 @@
 #include "mainwindow.h"
 #include "addressbook.h"
 #include "ui_mainwindow.h"
+#include <QProgressBar>
+#include <QElapsedTimer>
 #include "ui_mobileappconnector.h"
 #include "ui_addressbook.h"
 #include "ui_zboard.h"
@@ -428,6 +430,119 @@ void MainWindow::setupStatusBar() {
     ui->statusBar->addPermanentWidget(statusIcon);
 }
 
+// P0-6: prominent, non-technical-friendly sync banner on the Balance/main tab.
+// Built in C++ (rather than hand-editing the .ui XML) so the insertion is
+// mechanically safe: gridLayout_2 holds exactly one item (horizontalLayout_5),
+// which we move to row 1 while the banner takes row 0.
+void MainWindow::setupSyncBanner() {
+    syncBanner = new QWidget(ui->tab);
+    auto* bannerLayout = new QHBoxLayout(syncBanner);
+    bannerLayout->setContentsMargins(8, 6, 8, 6);
+    bannerLayout->setSpacing(10);
+
+    syncStatusLabel = new QLabel(syncBanner);
+    syncStatusLabel->setWordWrap(true);
+    syncStatusLabel->setText(tr("Connecting to your ZClassic node…"));
+    QFont f = syncStatusLabel->font();
+    f.setBold(true);
+    syncStatusLabel->setFont(f);
+
+    syncProgressBar = new QProgressBar(syncBanner);
+    syncProgressBar->setRange(0, 100);
+    syncProgressBar->setValue(0);
+    syncProgressBar->setTextVisible(true);
+    syncProgressBar->setMinimumWidth(180);
+    syncProgressBar->setMaximumWidth(300);
+    syncProgressBar->setVisible(false);
+
+    bannerLayout->addWidget(syncStatusLabel, 1);
+    bannerLayout->addWidget(syncProgressBar, 0);
+
+    // Move the existing balances content (horizontalLayout_5) down to row 1 and
+    // place the banner on row 0. takeAt(0) is safe: gridLayout_2 has one item.
+    auto* grid = ui->gridLayout_2;
+    QLayoutItem* existing = grid->takeAt(0);
+    grid->addWidget(syncBanner, 0, 0, 1, 1);
+    if (existing && existing->layout()) {
+        grid->addItem(existing, 1, 0, 1, 1);
+    } else if (existing) {
+        // Fallback (shouldn't happen): re-add whatever we took.
+        grid->addItem(existing, 1, 0, 1, 1);
+    }
+    grid->setRowStretch(0, 0);
+    grid->setRowStretch(1, 1);
+
+    // Start in the neutral "connecting" state.
+    setSyncStatusConnecting();
+}
+
+// P0-6: called from rpc.cpp's getblockchaininfo poll on every refresh.
+void MainWindow::setSyncStatus(bool isSyncing, int blockNumber, int estimatedHeight, double progress) {
+    if (syncBanner == nullptr) return;
+
+    if (!isSyncing) {
+        // Fully caught up: unmistakable green "ready" state.
+        syncEtaStarted = false;
+        syncProgressBar->setVisible(false);
+        syncStatusLabel->setText(tr("✓ Synced — Ready to use"));
+        syncBanner->setStyleSheet("QWidget { background-color: #1f7a1f; } QLabel { color: white; }");
+        return;
+    }
+
+    // Syncing: show a progress bar and an estimated time remaining.
+    int pct = (int) (progress * 100.0);
+    if (pct < 0)   pct = 0;
+    if (pct > 100) pct = 100;
+    syncProgressBar->setVisible(true);
+    syncProgressBar->setValue(pct);
+
+    QString etaText;
+    if (estimatedHeight > 0 && blockNumber > 0) {
+        if (!syncEtaStarted) {
+            syncEtaStarted = true;
+            syncEtaStartBlock = blockNumber;
+            syncEtaTimer.restart();
+        } else {
+            qint64 elapsedMs = syncEtaTimer.elapsed();
+            int    blocksDone = blockNumber - syncEtaStartBlock;
+            if (elapsedMs > 2000 && blocksDone > 0) {
+                double blocksPerSec = (double) blocksDone / (elapsedMs / 1000.0);
+                int    remaining    = estimatedHeight - blockNumber;
+                if (blocksPerSec > 0.0 && remaining > 0) {
+                    qint64 secsLeft = (qint64) (remaining / blocksPerSec);
+                    QString human;
+                    if (secsLeft >= 3600)
+                        human = tr("about %1h %2m").arg(secsLeft / 3600).arg((secsLeft % 3600) / 60);
+                    else if (secsLeft >= 60)
+                        human = tr("about %1m").arg(secsLeft / 60);
+                    else
+                        human = tr("less than a minute");
+                    etaText = QString(" • ") % tr("ETA %1").arg(human);
+                }
+            }
+        }
+    }
+
+    QString heightText;
+    if (estimatedHeight > 0) {
+        heightText = QString(" • ") % tr("block %1 / ~%2")
+            .arg(QString::number(blockNumber), QString::number(estimatedHeight));
+    }
+
+    syncStatusLabel->setText(tr("Syncing blockchain… %1%").arg(pct) % heightText % etaText);
+    syncBanner->setStyleSheet("QWidget { background-color: #d9822b; } QLabel { color: white; }");
+}
+
+// P0-6: called from rpc.cpp's noConnection() so the user sees a clear,
+// non-alarming "connecting" state instead of a blank/stuck UI.
+void MainWindow::setSyncStatusConnecting() {
+    if (syncBanner == nullptr) return;
+    syncEtaStarted = false;
+    syncProgressBar->setVisible(false);
+    syncStatusLabel->setText(tr("Connecting to your ZClassic node…"));
+    syncBanner->setStyleSheet("QWidget { background-color: #555555; } QLabel { color: white; }");
+}
+
 void MainWindow::setupSettingsModal() {    
     // Set up File -> Settings action
     QObject::connect(ui->actionSettings, &QAction::triggered, [=]() {
@@ -772,6 +887,117 @@ void MainWindow::balancesReady() {
         pendingURIPayment = "";
     }
 
+    // P0-2: now that the wallet is live, make sure the user has a backup of
+    // wallet.dat. This is the single most important fund-safety step because
+    // the wallet is file-based and has NO seed-phrase recovery.
+    promptWalletBackup();
+}
+
+// P0-2: First-run / until-backed-up fund-safety prompt.
+//
+// The ZClassic wallet is wallet.dat FILE-based: there is NO BIP39 seed phrase.
+// If the user loses wallet.dat (disk failure, reinstall, lost laptop) and has
+// no backup, the coins are gone forever. This prompt nags on every launch
+// until the user backs up (file copy) or exports their private keys, then it
+// is silenced permanently via the persisted "options/walletbackedup" flag.
+//
+// It is modal/blocking but ALWAYS dismissible ("Maybe later") so it can never
+// become an un-closable trap.
+void MainWindow::promptWalletBackup() {
+    // Already backed up at some point? Never nag again.
+    if (QSettings().value("options/walletbackedup", false).toBool())
+        return;
+
+    // We need a live connection to know where wallet.dat lives / to copy it.
+    if (!rpc || !rpc->getConnection())
+        return;
+
+    QMessageBox box(this);
+    box.setWindowTitle(tr("Back up your wallet"));
+    box.setIcon(QMessageBox::Warning);
+    box.setText(tr("Protect your coins — back up your wallet now."));
+    box.setInformativeText(tr(
+        "Your ZClassic is stored in a single file on this computer called "
+        "<b>wallet.dat</b>. There is <b>no seed phrase / recovery phrase</b> for this wallet.<br><br>"
+        "If this computer is lost, reset, or its disk fails and you have no backup, "
+        "<b>your coins are gone forever and cannot be recovered by anyone</b>.<br><br>"
+        "Make a backup now and keep a copy somewhere safe (a USB stick or another "
+        "computer). You can:<br>"
+        "&nbsp;&nbsp;• Save a copy of the wallet.dat file, or<br>"
+        "&nbsp;&nbsp;• Export your private keys to a text file.<br><br>"
+        "Keep your backup private — anyone who has it can spend your coins."));
+
+    QPushButton* backupBtn = box.addButton(tr("Back Up Now"), QMessageBox::AcceptRole);
+    QPushButton* exportBtn = box.addButton(tr("Export Private Keys"), QMessageBox::ActionRole);
+    QPushButton* laterBtn  = box.addButton(tr("Maybe later"), QMessageBox::RejectRole);
+    box.setDefaultButton(backupBtn);
+
+    box.exec();
+    QAbstractButton* clicked = box.clickedButton();
+
+    if (clicked == backupBtn) {
+        // Copy wallet.dat to a user-chosen location. We mirror backupWalletDat()
+        // here (rather than calling it) so we can detect a SUCCESSFUL copy and
+        // only then mark the wallet as backed up.
+        QDir zclassicdir(rpc->getConnection()->config->zclassicDir);
+        QString backupDefaultName = "zclassic-wallet-backup-" +
+            QDateTime::currentDateTime().toString("yyyyMMdd") + ".dat";
+
+        if (Settings::getInstance()->isTestnet()) {
+            zclassicdir.cd("testnet3");
+            backupDefaultName = "testnet-" + backupDefaultName;
+        }
+
+        QFile wallet(zclassicdir.filePath("wallet.dat"));
+        if (!wallet.exists()) {
+            QMessageBox::critical(this, tr("No wallet.dat"),
+                tr("Couldn't find the wallet.dat on this computer") + "\n" +
+                tr("You need to back it up from the machine zclassicd is running on"),
+                QMessageBox::Ok);
+            return;
+        }
+
+        QUrl backupName = QFileDialog::getSaveFileUrl(this, tr("Backup wallet.dat"),
+            backupDefaultName, "Data file (*.dat)");
+        if (backupName.isEmpty())
+            return;  // User cancelled the save dialog: leave the flag unset so we nag again next launch.
+
+        if (wallet.copy(backupName.toLocalFile())) {
+            // Success: remember that the wallet has been backed up.
+            QSettings().setValue("options/walletbackedup", true);
+            QMessageBox::information(this, tr("Backup complete"),
+                tr("Your wallet backup was saved.\n\n"
+                   "Keep this file private and in a safe place. You can restore your "
+                   "coins later by copying it back into the wallet's data folder."),
+                QMessageBox::Ok);
+        } else {
+            QMessageBox::critical(this, tr("Couldn't backup"),
+                tr("Couldn't backup the wallet.dat file.") +
+                tr("You need to back it up manually."), QMessageBox::Ok);
+        }
+    } else if (clicked == exportBtn) {
+        // Reuse the existing private-key export dialog. The user saves the keys
+        // to a file from inside that dialog. Because that dialog's Save is
+        // optional and reports no status, we explicitly confirm the user
+        // actually saved before marking the wallet backed up -- otherwise we'd
+        // give a false sense of safety and never remind them again.
+        exportAllKeys();
+        auto saved = QMessageBox::question(this, tr("Did you save your keys?"),
+            tr("Did you save the file with your private keys somewhere safe?\n\n"
+               "Only choose Yes if you actually saved it — otherwise we'll remind "
+               "you to back up again next time."),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (saved == QMessageBox::Yes)
+            QSettings().setValue("options/walletbackedup", true);
+    } else {
+        // "Maybe later" (or the dialog was closed): make the consequence explicit,
+        // but never block. The flag stays unset, so we nag again next launch.
+        QMessageBox::warning(this, tr("No backup yet"),
+            tr("You have not backed up your wallet.\n\n"
+               "Until you do, you risk losing all your coins if this computer is "
+               "lost or breaks. We'll remind you again next time you open the wallet."),
+            QMessageBox::Ok);
+    }
 }
 
 // Event filter for MacOS specific handling of payment URIs
@@ -921,7 +1147,10 @@ void MainWindow::importPrivKey() {
 
         // Show the dialog that keys will be imported. 
         QMessageBox::information(this,
-            "Imported", tr("The keys were imported. It may take several minutes to rescan the blockchain. Until then, functionality may be limited"),
+            tr("Importing keys"),
+            tr("Your keys are being imported and the wallet will now rescan the "
+               "blockchain. This can take several minutes — your balance will "
+               "update when it finishes. Please leave ZClassic open."),
             QMessageBox::Ok);
     }
 }
@@ -984,6 +1213,13 @@ void MainWindow::exportAllKeys() {
 
 void MainWindow::exportKeys(QString addr) {
     bool allKeys = addr.isEmpty() ? true : false;
+
+    // P1-6: private keys ARE the money — anyone who sees this text can spend your funds, so confirm intent first.
+    if (QMessageBox::warning(this, tr("Export Private Keys"),
+            tr("Anyone who has these private keys can spend all the funds in these addresses. Only export them if you are sure no one else can see your screen or the saved file."),
+            QMessageBox::Ok | QMessageBox::Cancel, QMessageBox::Cancel) != QMessageBox::Ok) {
+        return;
+    }
 
     QDialog d(this);
     Ui_PrivKey pui;
@@ -1062,6 +1298,9 @@ void MainWindow::exportKeys(QString addr) {
 
 void MainWindow::setupBalancesTab() {
     ui->unconfirmedWarning->setVisible(false);
+
+    // P0-6: build the prominent sync banner that sits above the balances.
+    setupSyncBanner();
 
     // Double click on balances table
     auto fnDoSendFrom = [=](const QString& addr, const QString& to = QString(), bool sendMax = false) {

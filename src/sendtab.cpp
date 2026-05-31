@@ -553,8 +553,15 @@ bool MainWindow::confirmTx(Tx tx) {
     int row = 0;
     double totalSpending = 0;
 
+    // P1-3: a send becomes PUBLIC (loses privacy) the moment any of the funds land on a
+    // transparent t-address, because the amount is then visible on the public blockchain.
+    bool isPublicTx = false;
+
     for (int i=0; i < tx.toAddrs.size(); i++) {
         auto toAddr = tx.toAddrs[i];
+
+        if (Settings::isTAddress(toAddr.addr))
+            isPublicTx = true;
 
         // Add new Address widgets instead of the same one.
         {
@@ -643,6 +650,9 @@ bool MainWindow::confirmTx(Tx tx) {
     // No peers warning
     confirm.nopeersWarning->setVisible(Settings::getInstance()->getPeers() == 0);
 
+    // P1-3: public (de-shield) warning
+    confirm.publicWarning->setVisible(isPublicTx);
+
     // And FromAddress in the confirm dialog 
     confirm.sendFrom->setText(fnSplitAddressForWrap(tx.fromAddr));
     QString tooltip = tr("Current balance      : ") +
@@ -664,6 +674,18 @@ bool MainWindow::confirmTx(Tx tx) {
 // Send button clicked
 void MainWindow::sendButton() {
     Tx tx = createTxFromSendPage();
+
+    // Still-syncing acknowledgement gate: during sync the balance/UTXO set is
+    // incomplete, so a send can silently fail. Make the user explicitly accept
+    // that risk (default No) instead of relying only on the soft confirm label.
+    if (Settings::getInstance()->isSyncing()) {
+        auto res = QMessageBox::warning(this, tr("Wallet still syncing"),
+            tr("Your wallet is still catching up with the network, so your balance "
+               "may be incomplete and this transaction could fail.\n\nSend anyway?"),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (res != QMessageBox::Yes)
+            return;
+    }
 
     QString error = doSendTxValidations(tx);
     if (!error.isEmpty()) {
@@ -715,6 +737,25 @@ QString MainWindow::doSendTxValidations(Tx tx) {
         }
     }
 
+    // Insufficient-funds guard: catch an overspend up front with a friendly
+    // message instead of letting it fail minutes later with a cryptic node
+    // error. Only enforced when the balance is reliable (not mid-sync), and
+    // null-guarded since balances may not be loaded yet during early startup.
+    if (!Settings::getInstance()->isSyncing()) {
+        auto bals = rpc ? rpc->getAllBalances() : nullptr;
+        if (bals && bals->contains(tx.fromAddr)) {
+            double balance = bals->value(tx.fromAddr);
+            double total   = tx.fee;
+            for (auto toAddr : tx.toAddrs)
+                total += toAddr.amount;
+            if (total > balance) {
+                return tr("Not enough funds. You're trying to send %1 (including the fee), "
+                          "but this address only holds %2.")
+                       .arg(Settings::getZCLDisplayFormat(total))
+                       .arg(Settings::getZCLDisplayFormat(balance));
+            }
+        }
+    }
 
     return QString();
 }

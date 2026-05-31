@@ -46,6 +46,9 @@ public:
     bool    getSaveZtxs();
     void    setSaveZtxs(bool save);
 
+    bool    isWalletBackedUp();
+    void    setWalletBackedUp(bool backedUp);
+
     bool    getAutoShield();
     void    setAutoShield(bool allow);
 

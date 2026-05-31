@@ -173,6 +173,19 @@
     </widget>
    </item>
    <item>
+    <widget class="QLabel" name="publicWarning">
+     <property name="styleSheet">
+      <string notr="true">color: red;</string>
+     </property>
+     <property name="text">
+      <string>This transaction is PUBLIC: the amount and recipient will be permanently visible to everyone on the blockchain.</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
     <widget class="QLabel" name="warningLabel">
      <property name="styleSheet">
       <string notr="true">color: red;</string>

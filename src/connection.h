@@ -8,6 +8,7 @@
 using json = nlohmann::json;
 
 class RPC;
+class QProgressBar;
 
 enum ConnectionType {
     DetectedConfExternalZClassicD = 1,
@@ -64,8 +65,17 @@ private:
 
     void doRPCSetConnection(Connection* conn);
 
+    // P1-2 / P1-7 idiotproof-onboarding helpers
+    bool ensureEnoughDiskSpace(const QString& path);
+    void setBarPercent(int pct);
+    void offerRetry(QString explanation, std::function<void(void)> cb);
+
     QProcess*               ezclassicd  = nullptr;
     QElapsedTimer           ezWarmupTimer;   // measures embedded-node startup/warmup time
+
+    QLabel*                 ezCard      = nullptr;   // one-time onboarding explainer card
+    QProgressBar*           ezProgress  = nullptr;   // onboarding progress indicator
+    int                     ezRetryCount = 0;        // consecutive param-download retries
 
     QDialog*                d;
     Ui_ConnectionDialog*    connD;

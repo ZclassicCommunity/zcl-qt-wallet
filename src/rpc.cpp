@@ -384,6 +384,9 @@ void RPC::noConnection() {
     main->statusLabel->setToolTip("");
     main->ui->statusBar->showMessage(QObject::tr("No Connection"), 1000);
 
+    // P0-6: reflect the lost connection in the main-tab sync banner.
+    main->setSyncStatusConnecting();
+
     // Clear balances table.
     QMap<QString, double> emptyBalances;
     QList<UnspentOutput>  emptyOutputs;
@@ -624,6 +627,10 @@ void RPC::getInfoThenRefresh(bool force) {
 
             Settings::getInstance()->setSyncing(isSyncing);
             Settings::getInstance()->setBlockNumber(blockNumber);
+
+            // P0-6: update the prominent sync banner on the Balance/main tab so
+            // a non-technical user always sees Syncing %/ETA vs. "Synced — Ready".
+            main->setSyncStatus(isSyncing, blockNumber, estimatedheight, progress);
 
             // Update zclassicd tab if it exists
             if (ezclassicd) {
