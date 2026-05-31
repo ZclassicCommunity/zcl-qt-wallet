@@ -91,6 +91,13 @@ private:
     bool    backupWalletForRepair();                       // read+copy wallet.dat; never writes it
     QDir    resolveDataSubdir();                            // datadir root, or testnet3/ when it holds the chain
 
+    // Single-file release support: when no sibling daemon ships next to the GUI,
+    // the node is appended to our OWN executable (GUI | daemon | sha256 | len | magic).
+    // Extract+verify it to a per-user cache and return its absolute path; returns
+    // an empty string (-> caller falls back) when there is no embedded payload,
+    // on a hash mismatch, or on macOS (notarization forbids exec of an extracted file).
+    QString ensureDaemonExtracted();
+
     QProcess*               ezclassicd  = nullptr;
     QElapsedTimer           ezWarmupTimer;   // measures embedded-node startup/warmup time
 

@@ -11,6 +11,7 @@
 #include <QProgressBar>
 #include <QElapsedTimer>
 #include <QStringList>
+#include <QCryptographicHash>
 
 using json = nlohmann::json;
 
@@ -447,20 +448,31 @@ bool ConnectionLoader::startEmbeddedZClassicd(const QStringList& extraArgs) {
         }
     }
 
-    // Finally, start zclassicd
+    // Finally, start zclassicd. Resolution order is SIBLING-FIRST so that the
+    // dev build, the .deb and the macOS .app (all of which ship a real daemon
+    // file next to / inside the bundle) keep working exactly as before. Only the
+    // single-file release -- where no sibling exists because the daemon is
+    // appended to our own executable -- falls back to extracting it.
     QDir appPath(QCoreApplication::applicationDirPath());
+    QString zclassicdProgram;
 #ifdef Q_OS_LINUX
-    auto zclassicdProgram = appPath.absoluteFilePath("zqw-zclassicd");
-    if (!QFile(zclassicdProgram).exists()) {
+    zclassicdProgram = appPath.absoluteFilePath("zqw-zclassicd");
+    if (!QFile(zclassicdProgram).exists())
         zclassicdProgram = appPath.absoluteFilePath("zclassicd");
-    }
+    if (!QFile(zclassicdProgram).exists())
+        zclassicdProgram = ensureDaemonExtracted();
 #elif defined(Q_OS_DARWIN)
-    auto zclassicdProgram = appPath.absoluteFilePath("zclassicd");
+    // No runtime extraction on macOS: notarization / hardened runtime forbid
+    // executing a binary written at runtime, so the signed daemon ships as a
+    // sibling inside Contents/MacOS and ensureDaemonExtracted() returns empty.
+    zclassicdProgram = appPath.absoluteFilePath("zclassicd");
 #else
-    auto zclassicdProgram = appPath.absoluteFilePath("zclassicd.exe");
+    zclassicdProgram = appPath.absoluteFilePath("zclassicd.exe");
+    if (!QFile(zclassicdProgram).exists())
+        zclassicdProgram = ensureDaemonExtracted();   // absolute path under %LOCALAPPDATA%
 #endif
 
-    if (!QFile(zclassicdProgram).exists()) {
+    if (zclassicdProgram.isEmpty() || !QFile(zclassicdProgram).exists()) {
         qDebug() << "Can't find zclassicd at " << zclassicdProgram;
         main->logger->write("Can't find zclassicd at " + zclassicdProgram);
         return false;
@@ -509,12 +521,132 @@ bool ConnectionLoader::startEmbeddedZClassicd(const QStringList& extraArgs) {
 #elif defined(Q_OS_DARWIN)
     ezclassicd->start(zclassicdProgram, extraArgs);
 #else
+    // Spawn by ABSOLUTE path: in the single-file release the daemon is extracted
+    // outside appPath (under %LOCALAPPDATA%), so the old bare-name "zclassicd.exe"
+    // + working-directory spawn would not find it.
     ezclassicd->setWorkingDirectory(appPath.absolutePath());
-    ezclassicd->start("zclassicd.exe", extraArgs);
+    ezclassicd->start(zclassicdProgram, extraArgs);
 #endif // Q_OS_LINUX
 
 
     return true;
+}
+
+// Single-file release: locate the daemon payload appended to our own executable,
+// verify it, and extract it to a per-user cache. Layout at the END of the file:
+//   [ ...GUI ELF... ][ daemon bytes ][ sha256(daemon) :32 ][ daemon len :8 LE ][ magic :8 ]
+// Returns the absolute path of the verified, executable daemon, or an empty
+// string to make the caller fall back (no payload / mismatch / macOS).
+QString ConnectionLoader::ensureDaemonExtracted() {
+#ifdef Q_OS_DARWIN
+    return QString();   // never extract+exec on macOS (notarization)
+#else
+    static const QByteArray MAGIC = QByteArrayLiteral("ZQWDMON1");   // 8 bytes
+    const qint64 LEN_BYTES   = 8;
+    const qint64 HASH_BYTES  = 32;
+    const qint64 FOOTER      = MAGIC.size() + LEN_BYTES + HASH_BYTES;   // 48
+
+    QFile self(QCoreApplication::applicationFilePath());
+    if (!self.open(QIODevice::ReadOnly))
+        return QString();
+    const qint64 selfSize = self.size();
+    if (selfSize < FOOTER)
+        return QString();
+
+    // Check the trailing magic; absent on a plain (un-bundled) GUI build.
+    self.seek(selfSize - MAGIC.size());
+    if (self.read(MAGIC.size()) != MAGIC)
+        return QString();
+
+    // Read the little-endian length and the expected hash.
+    self.seek(selfSize - MAGIC.size() - LEN_BYTES);
+    QByteArray lenBytes = self.read(LEN_BYTES);
+    quint64 len = 0;
+    for (int i = 0; i < LEN_BYTES; i++)
+        len |= (quint64)(uchar)lenBytes.at(i) << (8 * i);
+
+    self.seek(selfSize - MAGIC.size() - LEN_BYTES - HASH_BYTES);
+    QByteArray wantHash = self.read(HASH_BYTES);
+
+    const qint64 payloadOffset = selfSize - FOOTER - (qint64)len;
+    if (len == 0 || payloadOffset < 0)
+        return QString();
+
+    // Content-addressed cache dir: name = first 16 hex chars of the daemon hash,
+    // so an app upgrade (new daemon) lands in a fresh dir and is re-extracted,
+    // while an unchanged daemon is reused. Other stamp dirs are pruned.
+    const QString stamp = QString::fromLatin1(wantHash.toHex().left(16));
+    QDir cacheRoot(QStandardPaths::writableLocation(QStandardPaths::CacheLocation));
+    cacheRoot.mkpath("zclassic-node");
+    QDir nodeDir(cacheRoot.filePath("zclassic-node"));
+    for (const QString& d : nodeDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+        if (d != stamp)
+            QDir(nodeDir.filePath(d)).removeRecursively();
+    }
+    nodeDir.mkpath(stamp);
+
+#ifdef Q_OS_WIN
+    const QString outName = "zqw-zclassicd.exe";
+#else
+    const QString outName = "zqw-zclassicd";
+#endif
+    const QString outPath  = QDir(nodeDir.filePath(stamp)).filePath(outName);
+    const QString partPath = outPath + ".part";
+
+    auto makeExecutable = [](const QString& p) {
+#ifndef Q_OS_WIN
+        QFile::setPermissions(p, QFile::permissions(p)
+            | QFileDevice::ExeOwner | QFileDevice::ExeUser
+            | QFileDevice::ExeGroup | QFileDevice::ExeOther);
+#else
+        Q_UNUSED(p);
+#endif
+    };
+
+    // Fast path: already extracted (content-addressed dir + size match). Avoids
+    // re-hashing ~14MB on every launch.
+    if (QFile::exists(outPath) && QFileInfo(outPath).size() == (qint64)len) {
+        makeExecutable(outPath);
+        return outPath;
+    }
+    QFile::remove(outPath);
+
+    // Extract the payload to a .part file, hashing as we go.
+    if (!self.seek(payloadOffset))
+        return QString();
+    QFile out(partPath);
+    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        return QString();
+
+    QCryptographicHash hasher(QCryptographicHash::Sha256);
+    qint64 remaining = (qint64)len;
+    const qint64 CHUNK = 1 << 20;
+    bool ok = true;
+    while (remaining > 0) {
+        QByteArray buf = self.read(qMin(CHUNK, remaining));
+        if (buf.isEmpty()) { ok = false; break; }
+        hasher.addData(buf);
+        if (out.write(buf) != buf.size()) { ok = false; break; }
+        remaining -= buf.size();
+    }
+    out.close();
+
+    if (!ok || remaining != 0 || hasher.result() != wantHash) {
+        main->logger->write("Embedded daemon payload failed verification; falling back");
+        QFile::remove(partPath);
+        return QString();
+    }
+
+    // Atomically publish, then set the exec bit.
+    QFile::remove(outPath);
+    if (!QFile::rename(partPath, outPath)) {
+        QFile::remove(partPath);
+        return QString();
+    }
+    makeExecutable(outPath);
+    main->logger->write("Extracted embedded daemon to " + outPath);
+    return outPath;
+#endif // Q_OS_DARWIN
 }
 
 // A./B. Detect-and-classify entry point. Called from doAutoConnect once the node

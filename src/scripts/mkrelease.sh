@@ -81,37 +81,56 @@ fi
 echo "[OK]"
 
 
-echo -n "Packaging.............."
-mkdir bin/zclwallet-v$APP_VERSION > /dev/null
+echo -n "Bundling..............."
 strip zclwallet
-
-cp zclwallet                  bin/zclwallet-v$APP_VERSION > /dev/null
-cp $ZCASH_DIR/artifacts/zclassicd    bin/zclwallet-v$APP_VERSION > /dev/null
-cp $ZCASH_DIR/artifacts/zclassic-cli bin/zclwallet-v$APP_VERSION > /dev/null
-cp README.md                      bin/zclwallet-v$APP_VERSION > /dev/null
-cp LICENSE                        bin/zclwallet-v$APP_VERSION > /dev/null
-
-cd bin && tar czf linux-zclwallet-v$APP_VERSION.tar.gz zclwallet-v$APP_VERSION/ > /dev/null
-cd .. 
-
-mkdir artifacts >/dev/null 2>&1
-cp bin/linux-zclwallet-v$APP_VERSION.tar.gz ./artifacts/linux-binaries-zclwallet-v$APP_VERSION.tar.gz
+mkdir -p artifacts >/dev/null 2>&1
+# Single-file release: append the daemon to the (static-Qt) GUI executable,
+# followed by a trailing footer:  [ sha256(daemon):32 | len(daemon):8 LE | magic "ZQWDMON1":8 ]
+# The ELF still runs (the loader ignores trailing bytes); on first launch the GUI
+# extracts + hash-verifies the daemon to a per-user cache (see
+# ConnectionLoader::ensureDaemonExtracted). No separate zclassicd file ships.
+SINGLE=artifacts/linux-zclwallet-v$APP_VERSION
+cp zclwallet "$SINGLE"
+python3 - "$ZCASH_DIR/artifacts/zclassicd" "$SINGLE" <<'PYEOF'
+import sys, hashlib, struct
+daemon = open(sys.argv[1], 'rb').read()
+with open(sys.argv[2], 'ab') as f:
+    f.write(daemon)                              # GUI | daemon
+    f.write(hashlib.sha256(daemon).digest())     #     | sha256 (32)
+    f.write(struct.pack('<Q', len(daemon)))      #     | len    (8, little-endian)
+    f.write(b'ZQWDMON1')                         #     | magic  (8)
+PYEOF
+chmod +x "$SINGLE"
 echo "[OK]"
 
-
-if [ -f artifacts/linux-binaries-zclwallet-v$APP_VERSION.tar.gz ] ; then
-    echo -n "Package contents......."
-    # Test if the package is built OK
-    if tar tf "artifacts/linux-binaries-zclwallet-v$APP_VERSION.tar.gz" | wc -l | grep -q "6"; then 
-        echo "[OK]"
-    else
-        echo "[ERROR]"
-        exit 1
-    fi    
+echo -n "Verifying bundle......."
+# Must still be a valid ELF AND carry our trailing magic.
+if readelf -h "$SINGLE" >/dev/null 2>&1 && [ "$(tail -c 8 "$SINGLE")" = "ZQWDMON1" ]; then
+    echo "[OK]"
 else
     echo "[ERROR]"
+    echo "Single-file bundle is not a valid ELF or is missing the daemon footer"
     exit 1
 fi
+
+echo -n "Relink objects........."
+# LGPLv3 (static Qt): publish ZclWallet's object files + a link recipe so anyone
+# can relink the app against their own build of Qt. See docs/QT-LGPL-NOTICE.md.
+{
+  echo "ZclWallet v$APP_VERSION - relink instructions (LGPLv3 / static Qt)"
+  echo
+  echo "These are ZclWallet's compiled object files (bin/*.o). To relink against"
+  echo "your own statically-built Qt 5.15, place its libraries in your qmake kit and"
+  echo "re-run the final link, e.g.:"
+  echo
+  echo "  <your-qt>/bin/qmake zcl-qt-wallet.pro -spec linux-clang CONFIG+=release"
+  echo "  make            # re-runs the final 'clang++ -o zclwallet bin/*.o ... <Qt libs>' link"
+  echo
+  echo "Full application source (MIT): https://github.com/ZclassicCommunity/zcl-qt-wallet"
+  echo "Qt 5.15 source (LGPLv3): https://download.qt.io/archive/qt/5.15/"
+} > bin/RELINK.txt
+tar czf artifacts/linux-relink-objects-v$APP_VERSION.tar.gz bin/*.o bin/RELINK.txt zcl-qt-wallet.pro docs/QT-LGPL-NOTICE.md >/dev/null 2>&1
+echo "[OK]"
 
 echo -n "Building deb..........."
 debdir=bin/deb/zclwallet-v$APP_VERSION
