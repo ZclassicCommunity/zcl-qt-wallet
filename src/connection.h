@@ -8,6 +8,7 @@
 using json = nlohmann::json;
 
 class RPC;
+class QProgressBar;
 
 enum ConnectionType {
     DetectedConfExternalZClassicD = 1,
@@ -55,7 +56,10 @@ private:
     bool verifyParams();
     void downloadParams(std::function<void(void)> cb);
     void doNextDownload(std::function<void(void)> cb);
-    bool startEmbeddedZClassicd();
+    // P2-1: optional one-shot extra args (e.g. "-reindex-chainstate") are passed
+    // ONLY to the next launch and are NOT persisted into zclassic.conf, so a
+    // repair can never loop forever.
+    bool startEmbeddedZClassicd(const QStringList& extraArgs = QStringList());
 
     void refreshZClassicdState(Connection* connection, std::function<void(void)> refused);
 
@@ -64,7 +68,35 @@ private:
 
     void doRPCSetConnection(Connection* conn);
 
+    // P1-2 / P1-7 idiotproof-onboarding helpers
+    bool ensureEnoughDiskSpace(const QString& path);
+    void setBarPercent(int pct);
+    void offerRetry(QString explanation, std::function<void(void)> cb);
+
+    // P2-1: corruption failsafe. When the embedded node dies DURING warmup
+    // (before the RPC connection is established) we classify the failure from
+    // its stderr + debug.log tail and, if it looks like a corrupt/partway block
+    // or chainstate database, offer a safe, staged repair ladder. NONE of these
+    // paths ever touch wallet.dat except to read+copy it as a backup.
+    bool        ezNodeQuitDuringStartup = false;  // node exited before RPC came up
+    bool        ezRepairOffered         = false;  // repair dialog already shown this run
+    QString     ezStdErr;                          // accumulated node stderr this run
+    QString     ezDataDir;                         // datadir holding blocks/chainstate/debug.log/wallet.dat
+
+    void    handleStartupFailure();                       // detect + classify + route
+    bool    looksLikeDbCorruption(const QString& text);   // marker scan
+    QString readDebugLogTail(int maxBytes = 16384);        // read-only tail of debug.log
+    void    offerCorruptionRepair();                       // staged repair ladder dialog
+    void    relaunchForRepair(const QStringList& extraArgs);  // backup wallet, then relaunch once
+    bool    backupWalletForRepair();                       // read+copy wallet.dat; never writes it
+    QDir    resolveDataSubdir();                            // datadir root, or testnet3/ when it holds the chain
+
     QProcess*               ezclassicd  = nullptr;
+    QElapsedTimer           ezWarmupTimer;   // measures embedded-node startup/warmup time
+
+    QLabel*                 ezCard      = nullptr;   // one-time onboarding explainer card
+    QProgressBar*           ezProgress  = nullptr;   // onboarding progress indicator
+    int                     ezRetryCount = 0;        // consecutive param-download retries
 
     QDialog*                d;
     Ui_ConnectionDialog*    connD;

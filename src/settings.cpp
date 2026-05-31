@@ -1,6 +1,138 @@
 #include "mainwindow.h"
 #include "settings.h"
 
+#include <QCryptographicHash>
+#include <QVector>
+#include <cstring>
+
+// ============================================================================
+// Address checksum validation helpers (file-local).
+//
+// The point of these is to catch TYPOS so funds are never sent to a mistyped
+// address. We verify checksum INTEGRITY only -- we deliberately do NOT
+// hardcode a version-byte whitelist, so no legitimate ZClassic address can be
+// rejected just because we didn't anticipate its prefix.
+// ============================================================================
+namespace {
+
+// ----- base58check (transparent t-addrs and Sprout zc/ztn addrs) -----------
+static const char* B58_ALPHABET =
+    "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+// Decode a base58 string into raw bytes. Returns false on any non-base58
+// character. Handles leading '1's as leading zero bytes.
+static bool base58Decode(const QString& str, QByteArray& out) {
+    // Build a big-endian byte vector by repeated base-58 -> base-256 conversion.
+    QByteArray b256; // accumulates the big number, big-endian
+    for (QChar qc : str) {
+        // Reject non-ASCII and characters outside the alphabet.
+        if (qc.unicode() > 127)
+            return false;
+        const char* p = strchr(B58_ALPHABET, qc.toLatin1());
+        if (p == nullptr || *p == '\0')   // '\0' guard: strchr matches terminator
+            return false;
+        int carry = static_cast<int>(p - B58_ALPHABET);
+
+        for (int i = b256.size() - 1; i >= 0; i--) {
+            carry += 58 * static_cast<unsigned char>(b256.at(i));
+            b256[i] = static_cast<char>(carry & 0xFF);
+            carry >>= 8;
+        }
+        while (carry > 0) {
+            b256.prepend(static_cast<char>(carry & 0xFF));
+            carry >>= 8;
+        }
+    }
+
+    // Each leading '1' in the input is a leading zero byte.
+    QByteArray leadingZeros;
+    for (QChar qc : str) {
+        if (qc == QChar('1'))
+            leadingZeros.append('\0');
+        else
+            break;
+    }
+
+    out = leadingZeros + b256;
+    return true;
+}
+
+// Verify a base58check string: last 4 bytes must equal the first 4 bytes of
+// the double-SHA256 of the preceding payload.
+static bool base58CheckValid(const QString& str) {
+    QByteArray raw;
+    if (!base58Decode(str, raw))
+        return false;
+
+    // Need at least 1 payload byte + 4 checksum bytes.
+    if (raw.size() < 5)
+        return false;
+
+    QByteArray payload  = raw.left(raw.size() - 4);
+    QByteArray checksum = raw.right(4);
+
+    QByteArray h1 = QCryptographicHash::hash(payload, QCryptographicHash::Sha256);
+    QByteArray h2 = QCryptographicHash::hash(h1,      QCryptographicHash::Sha256);
+
+    return h2.left(4) == checksum;
+}
+
+// ----- bech32 (Sapling zs / ztestsapling addrs) -----------------------------
+static const char* BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+
+static quint32 bech32Polymod(const QVector<int>& values) {
+    static const quint32 GEN[5] = {
+        0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3
+    };
+    quint32 chk = 1;
+    for (int v : values) {
+        quint32 b = chk >> 25;
+        chk = ((chk & 0x1ffffff) << 5) ^ static_cast<quint32>(v);
+        for (int i = 0; i < 5; i++) {
+            if ((b >> i) & 1)
+                chk ^= GEN[i];
+        }
+    }
+    return chk;
+}
+
+// Verify a bech32 string's checksum (the original BIP173 polymod == 1 form,
+// which is what Zcash/ZClassic Sapling addresses use).
+static bool bech32ChecksumValid(const QString& addr) {
+    // bech32 must be entirely lower-case or entirely upper-case (no mixing).
+    QString lower = addr.toLower();
+    QString upper = addr.toUpper();
+    if (addr != lower && addr != upper)
+        return false;
+    QString s = lower;
+
+    int sep = s.lastIndexOf(QChar('1'));
+    // HRP must be non-empty; data part (incl. 6-char checksum) must be present.
+    if (sep < 1 || sep + 7 > s.size())
+        return false;
+
+    QVector<int> values;
+    // Expand the human-readable part.
+    const QString hrp = s.left(sep);
+    for (QChar c : hrp)
+        values.append(c.unicode() >> 5);
+    values.append(0);
+    for (QChar c : hrp)
+        values.append(c.unicode() & 31);
+
+    // Append the data part (everything after the separator).
+    for (int i = sep + 1; i < s.size(); i++) {
+        const char* p = strchr(BECH32_CHARSET, s.at(i).toLatin1());
+        if (p == nullptr || *p == '\0')
+            return false;
+        values.append(static_cast<int>(p - BECH32_CHARSET));
+    }
+
+    return bech32Polymod(values) == 1;
+}
+
+} // anonymous namespace
+
 Settings* Settings::instance = nullptr;
 
 Settings* Settings::init() {    
@@ -133,8 +265,18 @@ void Settings::setAllowCustomFees(bool allow) {
     QSettings().setValue("options/customfees", allow);
 }
 
+bool Settings::isWalletBackedUp() {
+    // Load from the QT Settings. Defaults to false so a brand-new wallet is
+    // treated as un-backed-up until the user actually confirms a backup.
+    return QSettings().value("options/walletbackedup", false).toBool();
+}
+
+void Settings::setWalletBackedUp(bool backedUp) {
+    QSettings().setValue("options/walletbackedup", backedUp);
+}
+
 bool Settings::getSaveZtxs() {
-    // Load from the QT Settings. 
+    // Load from the QT Settings.
     return QSettings().value("options/savesenttx", true).toBool();
 }
 
@@ -295,13 +437,29 @@ QString Settings::getZboardAddr() {
 }
 
 bool Settings::isValidAddress(QString addr) {
-    QRegExp zcexp("^z[a-z0-9]{94}$",  Qt::CaseInsensitive);
-    QRegExp zsexp("^z[a-z0-9]{77}$",  Qt::CaseInsensitive);
-    QRegExp ztsexp("^ztestsapling[a-z0-9]{76}", Qt::CaseInsensitive);
-    QRegExp texp("^t[a-z0-9]{34}$", Qt::CaseInsensitive);
+    // Structural pre-filter (same shapes the wallet has always accepted). This
+    // bounds length/charset cheaply; the checksum gate below then verifies the
+    // address is actually self-consistent so typos are caught.
+    QRegExp zcexp("^z[a-z0-9]{94}$",  Qt::CaseInsensitive);   // Sprout  (zc.. / ztn..)
+    QRegExp zsexp("^z[a-z0-9]{77}$",  Qt::CaseInsensitive);   // Sapling (zs1..)
+    QRegExp ztsexp("^ztestsapling[a-z0-9]{76}", Qt::CaseInsensitive); // testnet Sapling
+    QRegExp texp("^t[a-z0-9]{34}$", Qt::CaseInsensitive);     // transparent (t1.. / t3..)
 
-    return  zcexp.exactMatch(addr)  || texp.exactMatch(addr) || 
-            ztsexp.exactMatch(addr) || zsexp.exactMatch(addr);
+    // Sapling addresses are bech32 -> verify the bech32 polymod checksum.
+    // Note: the testnet-Sapling regex is a prefix match (matches the broader
+    // Sprout shape too), so test bech32 first and fall through on failure.
+    if (addr.startsWith("zs", Qt::CaseInsensitive) || addr.startsWith("ztestsapling", Qt::CaseInsensitive)) {
+        if (zsexp.exactMatch(addr) || ztsexp.exactMatch(addr))
+            return bech32ChecksumValid(addr);
+        return false;
+    }
+
+    // Transparent and Sprout addresses are base58check -> verify the 4-byte
+    // double-SHA256 checksum.
+    if (texp.exactMatch(addr) || zcexp.exactMatch(addr))
+        return base58CheckValid(addr);
+
+    return false;
 }
 
 const QString Settings::labelRegExp("[a-zA-Z0-9\\-_]{0,40}");

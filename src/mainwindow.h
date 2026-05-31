@@ -4,6 +4,9 @@
 #include "precompiled.h"
 #include "logger.h"
 
+#include <QProgressBar>
+#include <QElapsedTimer>
+
 // Forward declare to break circular dependency.
 class RPC;
 class Settings;
@@ -64,6 +67,16 @@ public:
     QLabel*             loadingLabel;
     QWidget*            zclassicdtab;
 
+    // P0-6: prominent sync banner on the Balance/main tab. Called by rpc.cpp
+    // from the getblockchaininfo poll (setSyncStatus) and from noConnection
+    // (setSyncStatusConnecting) so a non-technical user always knows the state.
+    QWidget*            syncBanner       = nullptr;
+    QLabel*             syncStatusLabel  = nullptr;
+    QProgressBar*       syncProgressBar  = nullptr;
+
+    void setSyncStatus(bool isSyncing, int blockNumber, int estimatedHeight, double progress);
+    void setSyncStatusConnecting();
+
     Logger*      logger;
 
     void doClose();
@@ -80,6 +93,12 @@ private:
     void setupTurnstileDialog();
     void setupSettingsModal();
     void setupStatusBar();
+    void setupSyncBanner();
+
+    // P0-6: state used to estimate a sync ETA from observed block rate.
+    QElapsedTimer       syncEtaTimer;
+    bool                syncEtaStarted = false;
+    int                 syncEtaStartBlock = 0;
 
     void removeExtraAddresses();
 
@@ -114,6 +133,10 @@ private:
     void exportKeys(QString addr = "");
     void backupWalletDat();
     void exportTransactions();
+
+    // P0-2: first-run fund-safety prompt. Nags (once per launch) to back up
+    // wallet.dat until the user has backed up, then never nags again.
+    void promptWalletBackup();
 
     void doImport(QList<QString>* keys);
 
