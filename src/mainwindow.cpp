@@ -405,14 +405,9 @@ void MainWindow::setupStatusBar() {
                 QGuiApplication::clipboard()->setText(txid);
             });
             menu.addAction("View tx on block explorer", [=]() {
-                QString url;
-                if (Settings::getInstance()->isTestnet()) {
-                    url = "https://explorer.testnet.z.cash/tx/" + txid;
-                }
-                else {
-                    url = "https://explorer.zcha.in/transactions/" + txid;
-                }
-                QDesktopServices::openUrl(QUrl(url));
+                QString url = Settings::getExplorerTxURL(txid);
+                if (!url.isEmpty())
+                    QDesktopServices::openUrl(QUrl(url));
             });
         }
 
@@ -1372,13 +1367,9 @@ void MainWindow::setupBalancesTab() {
             }
 
             menu.addAction(tr("View on block explorer"), [=] () {
-                QString url;
-                if (Settings::getInstance()->isTestnet()) {
-                    url = "https://explorer.testnet.z.cash/address/" + addr;
-                } else {
-                    url = "https://explorer.zcha.in/accounts/" + addr;
-                }
-                QDesktopServices::openUrl(QUrl(url));
+                QString url = Settings::getExplorerAddressURL(addr);
+                if (!url.isEmpty())
+                    QDesktopServices::openUrl(QUrl(url));
             });
         }
 
@@ -1438,13 +1429,9 @@ void MainWindow::setupTransactionsTab() {
         }
 
         menu.addAction(tr("View on block explorer"), [=] () {
-            QString url;
-            if (Settings::getInstance()->isTestnet()) {
-                url = "https://explorer.testnet.z.cash/tx/" + txid;
-            } else {
-                url = "https://explorer.zcha.in/transactions/" + txid;
-            }
-            QDesktopServices::openUrl(QUrl(url));
+            QString url = Settings::getExplorerTxURL(txid);
+            if (!url.isEmpty())
+                QDesktopServices::openUrl(QUrl(url));
         });
 
         if (!memo.isEmpty()) {

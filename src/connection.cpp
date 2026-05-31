@@ -230,7 +230,10 @@ void ConnectionLoader::createZClassicConf() {
     QTextStream out(&file); 
     
     out << "server=1\n";
-    out << "addnode=mainnet.z.cash\n";
+    // No addnode here: mainnet.z.cash is a Zcash (ZEC) node, not a valid ZClassic
+    // peer, and the zclassicd we drive already pins its own compiled bootstrap
+    // peers / seeds as -addnode on every start. Baking a wrong peer into the
+    // user's permanent conf only causes repeated failed connections.
     out << "rpcuser=zcl-qt-wallet\n";
     out << "rpcpassword=" % randomPassword() << "\n";
     if (!datadir.isEmpty()) {

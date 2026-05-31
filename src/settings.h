@@ -82,6 +82,12 @@ public:
     static QString getTokenName();
     static QString getDonationAddr(bool sapling);
 
+    // ZClassic block-explorer URLs (single source of truth for all menu actions).
+    // Returns an empty string when no explorer is available (e.g. testnet), in
+    // which case callers should not open a link.
+    static QString getExplorerTxURL(QString txid);
+    static QString getExplorerAddressURL(QString addr);
+
     static double  getMinerFee();
     static double  getZboardAmount();
     static QString getZboardAddr();

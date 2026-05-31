@@ -344,6 +344,21 @@ QString Settings::getTokenName() {
     }
 }
 
+// ZClassic mainnet block explorer (Insight URL scheme). There is no known live
+// ZClassic testnet explorer, so testnet returns an empty string and callers skip
+// opening a link rather than sending the user to a dead/wrong page.
+QString Settings::getExplorerTxURL(QString txid) {
+    if (Settings::getInstance()->isTestnet())
+        return "";
+    return "https://explorer.zcl.zelcore.io/tx/" + txid;
+}
+
+QString Settings::getExplorerAddressURL(QString addr) {
+    if (Settings::getInstance()->isTestnet())
+        return "";
+    return "https://explorer.zcl.zelcore.io/address/" + addr;
+}
+
 QString Settings::getDonationAddr(bool sapling) {
     if (Settings::getInstance()->isTestnet()) 
         if (sapling)
