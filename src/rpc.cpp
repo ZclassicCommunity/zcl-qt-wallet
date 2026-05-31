@@ -86,7 +86,10 @@ void RPC::setConnection(Connection* c) {
     delete conn;
     this->conn = c;
 
-    ui->statusBar->showMessage("Ready!");
+    // Don't claim "Ready!" here -- we've only just connected to the node; it may
+    // still be syncing. The real status (Syncing %/Connected) is set by the
+    // getblockchaininfo poll a moment later.
+    ui->statusBar->showMessage(QObject::tr("Connected — checking blockchain…"));
 
     // See if we need to remove the reindex/rescan flags from the zclassic.conf file
     auto zclassicConfLocation = Settings::getInstance()->getZClassicdConfLocation();
@@ -599,12 +602,24 @@ void RPC::getInfoThenRefresh(bool force) {
 
         conn->doRPCIgnoreError(payload, [=](const json& reply) {
             auto progress    = reply["verificationprogress"].get<double>();
-            bool isSyncing   = progress < 0.9999; // 99.99%
             int  blockNumber = reply["blocks"].get<json::number_unsigned_t>();
 
             int estimatedheight = 0;
             if (reply.find("estimatedheight") != reply.end()) {
                 estimatedheight = reply["estimatedheight"].get<json::number_unsigned_t>();
+            }
+
+            // Prefer a block-height comparison: it is accurate and actually reaches
+            // 100% when synced (verificationprogress is a coarse tx-count heuristic
+            // that historically pinned near 96%). Fall back to verificationprogress
+            // only if the node did not report an estimated height.
+            bool isSyncing;
+            if (estimatedheight > 0) {
+                progress = (double)blockNumber / (double)estimatedheight;
+                if (progress > 1.0) progress = 1.0;
+                isSyncing = blockNumber < (estimatedheight - 2); // within 2 blocks = synced
+            } else {
+                isSyncing = progress < 0.9999;
             }
 
             Settings::getInstance()->setSyncing(isSyncing);

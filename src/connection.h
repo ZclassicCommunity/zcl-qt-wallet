@@ -65,6 +65,7 @@ private:
     void doRPCSetConnection(Connection* conn);
 
     QProcess*               ezclassicd  = nullptr;
+    QElapsedTimer           ezWarmupTimer;   // measures embedded-node startup/warmup time
 
     QDialog*                d;
     Ui_ConnectionDialog*    connD;

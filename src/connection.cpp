@@ -46,54 +46,53 @@ void ConnectionLoader::doAutoConnect(bool tryEzclassicdStart) {
         auto connection = makeConnection(config);
 
         refreshZClassicdState(connection, [=] () {
-            // Refused connection. So try and start embedded zclassicd
-            if (Settings::getInstance()->useEmbedded()) {
-                if (tryEzclassicdStart) {
-                    this->showInformation(QObject::tr("Starting embedded zclassicd"));
-                    if (this->startEmbeddedZClassicd()) {
-                        // Embedded zclassicd started up. Wait a second and then refresh the connection
-                        main->logger->write("Embedded zclassicd started up, trying autoconnect in 1 sec");
-                        QTimer::singleShot(1000, [=]() { doAutoConnect(); } );
-                    } else {
-                        if (config->zclassicDaemon) {
-                            // zclassicd is configured to run as a daemon, so we must wait for a few seconds
-                            // to let it start up. 
-                            main->logger->write("zclassicd is daemon=1. Waiting for it to start up");
-                            this->showInformation(QObject::tr("zclassicd is set to run as daemon"), QObject::tr("Waiting for zclassicd"));
-                            QTimer::singleShot(5000, [=]() { doAutoConnect(/* don't attempt to start ezclassicd */ false); });
-                        } else {
-                            // Something is wrong. 
-                            // We're going to attempt to connect to the one in the background one last time
-                            // and see if that works, else throw an error
-                            main->logger->write("Unknown problem while trying to start zclassicd");
-                            QTimer::singleShot(2000, [=]() { doAutoConnect(/* don't attempt to start ezclassicd */ false); });
-                        }
-                    }
-                } else {
-                    // We tried to start ezclassicd previously, and it didn't work. So, show the error. 
-                    main->logger->write("Couldn't start embedded zclassicd for unknown reason");
-                    QString explanation;
-                    if (config->zclassicDaemon) {
-                        explanation = QString() % QObject::tr("You have zclassicd set to start as a daemon, which can cause problems "
-                            "with ZclWallet\n\n."
-                            "Please remove the following line from your zclassic.conf and restart ZclWallet\n"
-                            "daemon=1");
-                    } else {
-                        explanation = QString() % QObject::tr("Couldn't start the embedded zclassicd.\n\n" 
-                            "Please try restarting.\n\nIf you previously started zclassicd with custom arguments, you might need to reset zclassic.conf.\n\n" 
-                            "If all else fails, please run zclassicd manually.") %  
-                            (ezclassicd ? QObject::tr("The process returned") + ":\n\n" % ezclassicd->errorString() : QString(""));
-                    }
-                    
-                    this->showError(explanation);
-                }                
-            } else {
-                // zclassic.conf exists, there's no connection, and the user asked us not to start zclassicd. Error!
+            // Connection refused: the embedded node either has not started yet, or
+            // it is alive but still warming up -- binding its RPC port can take ~1
+            // minute while it loads the block index. Be patient and reassuring;
+            // NEVER show a scary error while the node is alive or within a warmup
+            // window. (Previously a transient refused during normal warmup could
+            // fire a false "Couldn't start the embedded zclassicd" on first launch.)
+            if (!Settings::getInstance()->useEmbedded()) {
                 main->logger->write("Not using embedded and couldn't connect to zclassicd");
-                QString explanation = QString() % QObject::tr("Couldn't connect to zclassicd configured in zclassic.conf.\n\n" 
-                                      "Not starting embedded zclassicd because --no-embedded was passed");
-                this->showError(explanation);
+                this->showError(QObject::tr("Couldn't connect to the ZClassic node configured in "
+                    "zclassic.conf, and the built-in node is turned off (--no-embedded)."));
+                return;
             }
+
+            // Never started yet -> start it once.
+            if (ezclassicd == nullptr) {
+                this->showInformation(QObject::tr("Starting your ZClassic node…"));
+                if (!this->startEmbeddedZClassicd()) {
+                    main->logger->write("Could not launch the embedded zclassicd binary");
+                    this->showError(QObject::tr("ZClassic couldn't start its node.\n\n"
+                        "Please reinstall the app. If the problem continues, make sure your "
+                        "security software isn't blocking it."));
+                    return;
+                }
+                ezWarmupTimer.start();
+                QTimer::singleShot(1000, [=]() { doAutoConnect(); });
+                return;
+            }
+
+            // Started, RPC not answering yet. While the process is alive -- or within
+            // a generous warmup window after it forked into the background -- keep
+            // polling with a friendly message instead of ever showing an error.
+            if (ezclassicd->state() != QProcess::NotRunning ||
+                (ezWarmupTimer.isValid() && ezWarmupTimer.elapsed() < 120000)) {
+                this->showInformation(QObject::tr("Starting your ZClassic node…"),
+                    QObject::tr("Almost ready — preparing the blockchain (this can take a minute)…"));
+                QTimer::singleShot(1000, [=]() { doAutoConnect(); });
+                return;
+            }
+
+            // Process is genuinely dead and the warmup window elapsed -> friendly error.
+            main->logger->write("Embedded zclassicd exited and did not come online");
+            QString detail = ezclassicd ? ezclassicd->errorString() : QString();
+            this->showError(QObject::tr("ZClassic couldn't finish starting up.\n\n"
+                "This usually clears up on its own — please quit and open ZClassic again. "
+                "If it keeps happening, make sure you have enough free disk space and a working "
+                "internet connection.")
+                % (detail.isEmpty() ? QString("") : QString("\n\n(") % detail % QString(")")));
         });
     } else {
         if (Settings::getInstance()->useEmbedded()) {
@@ -471,7 +470,7 @@ void ConnectionLoader::refreshZClassicdState(Connection* connection, std::functi
                     if (dots > 3)
                         dots = 0;
                 }
-                this->showInformation(QObject::tr("Your zclassicd is starting up. Please wait."), status);
+                this->showInformation(QObject::tr("Your ZClassic node is starting up. Please wait."), status);
                 main->logger->write("Waiting for zclassicd to come online.");
                 // Refresh after one second
                 QTimer::singleShot(1000, [=]() { this->refreshZClassicdState(connection, refused); });
