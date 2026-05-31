@@ -260,7 +260,7 @@ void ConnectionLoader::downloadParams(std::function<void(void)> cb) {
 
     // P1-1: this is Step 1 of onboarding.
     this->showInformation(QObject::tr("Step 1 of 3: Getting the security files ready…"),
-                          QObject::tr("This is a one-time download of about 1.7 GB."));
+                          QObject::tr("One-time download of about 1.7 GB — on a typical home connection this takes 10–20 minutes. You only do this once."));
 
     // Add all the files to the download queue
     downloadQueue = new QQueue<QUrl>();
@@ -410,7 +410,8 @@ void ConnectionLoader::doNextDownload(std::function<void(void)> cb) {
                 QTimer::singleShot(1500, [=]() { this->doNextDownload(cb); });
             } else {
                 this->offerRetry(QObject::tr("The setup files couldn't finish downloading.\n\n"
-                    "This is almost always a temporary internet problem."), cb);
+                    "This is almost always a temporary internet problem. Check your connection "
+                    "(Wi-Fi / ethernet / phone hotspot), then tap Retry. Your progress so far is kept."), cb);
             }
             return;
         }
@@ -547,8 +548,10 @@ QString ConnectionLoader::ensureDaemonExtracted() {
     const qint64 FOOTER      = MAGIC.size() + LEN_BYTES + HASH_BYTES;   // 48
 
     QFile self(QCoreApplication::applicationFilePath());
-    if (!self.open(QIODevice::ReadOnly))
+    if (!self.open(QIODevice::ReadOnly)) {
+        main->logger->write("ensureDaemonExtracted: cannot open self for reading: " + self.errorString());
         return QString();
+    }
     const qint64 selfSize = self.size();
     if (selfSize < FOOTER)
         return QString();
@@ -569,8 +572,12 @@ QString ConnectionLoader::ensureDaemonExtracted() {
     QByteArray wantHash = self.read(HASH_BYTES);
 
     const qint64 payloadOffset = selfSize - FOOTER - (qint64)len;
-    if (len == 0 || payloadOffset < 0)
+    // Reject a zero/absurd/negative length: a corrupt or tampered 8-byte footer must
+    // not drive a multi-hour read that looks like a first-run hang. Real daemon ~13MB.
+    if (len == 0 || len > 100ull * 1024 * 1024 || payloadOffset < 0) {
+        main->logger->write("ensureDaemonExtracted: invalid embedded payload size=" + QString::number(len));
         return QString();
+    }
 
     // Content-addressed cache dir: name = first 16 hex chars of the daemon hash,
     // so an app upgrade (new daemon) lands in a fresh dir and is re-extracted,
@@ -612,11 +619,22 @@ QString ConnectionLoader::ensureDaemonExtracted() {
     QFile::remove(outPath);
 
     // Extract the payload to a .part file, hashing as we go.
-    if (!self.seek(payloadOffset))
+    if (!self.seek(payloadOffset)) {
+        main->logger->write("ensureDaemonExtracted: seek to payload offset failed");
         return QString();
+    }
+    // Refuse to start a partial extract on a near-full disk (leaves a junk .part).
+    const qint64 avail = QStorageInfo(nodeDir.filePath(stamp)).bytesAvailable();
+    if (avail >= 0 && avail < (qint64)len + (16ll << 20)) {
+        main->logger->write(QString("ensureDaemonExtracted: insufficient disk: need %1 have %2")
+                                .arg((qint64)len + (16ll << 20)).arg(avail));
+        return QString();
+    }
     QFile out(partPath);
-    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate))
+    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        main->logger->write("ensureDaemonExtracted: cannot open .part for writing: " + out.errorString());
         return QString();
+    }
 
     QCryptographicHash hasher(QCryptographicHash::Sha256);
     qint64 remaining = (qint64)len;
@@ -640,6 +658,7 @@ QString ConnectionLoader::ensureDaemonExtracted() {
     // Atomically publish, then set the exec bit.
     QFile::remove(outPath);
     if (!QFile::rename(partPath, outPath)) {
+        main->logger->write("ensureDaemonExtracted: rename .part -> final failed");
         QFile::remove(partPath);
         return QString();
     }

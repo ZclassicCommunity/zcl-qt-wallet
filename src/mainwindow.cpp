@@ -168,10 +168,10 @@ void MainWindow::restoreSavedStates() {
 
     // Paint the last-known balances immediately so the first ~1-minute node
     // warmup shows a usable view instead of a blank "0.00". The live RPC
-    // overwrites these the moment it connects. Gated on the same "keep local
-    // data" preference that governs saved shielded-tx history; the live values
-    // are authoritative, this is only a convenience cache shown while syncing.
-    if (Settings::getInstance()->getSaveZtxs() && s.contains("cache/balTotal")) {
+    // overwrites these the moment it connects. Gated on its own default-ON
+    // preference (independent of saved-tx-history) so every user gets the instant
+    // paint; the live values are authoritative, this is only a convenience cache.
+    if (Settings::getInstance()->getShowCachedBalance() && s.contains("cache/balTotal")) {
         double balT   = s.value("cache/balTransparent", 0.0).toDouble();
         double balZ   = s.value("cache/balShielded",    0.0).toDouble();
         double balTot = s.value("cache/balTotal",       0.0).toDouble();

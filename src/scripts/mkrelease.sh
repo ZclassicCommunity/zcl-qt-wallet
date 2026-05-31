@@ -17,27 +17,28 @@ if [ ! -f $ZCASH_DIR/artifacts/zclassicd ]; then
     exit 1;
 fi
 
-if [ ! -f $ZCASH_DIR/artifacts/zclassic-cli ]; then
-    echo "Couldn't find zclassic-cli in $ZCASH_DIR/artifacts/. Please build zclassicd."
-    exit 1;
-fi
-
-# Ensure that zclassicd is the right build
+# Ensure that zclassicd is a real MagicBean build. (The single-file release embeds
+# only the daemon; zclassic-cli is no longer packaged, and the Windows zclassicd.exe
+# is checked in the Windows section below so a Linux-only build can run on its own.)
 echo -n "zclassicd version........."
-if grep -q "zqwMagicBean" $ZCASH_DIR/artifacts/zclassicd && ! readelf -s $ZCASH_DIR/artifacts/zclassicd | grep -q "GLIBC_2\.25"; then 
+if grep -q "MagicBean" $ZCASH_DIR/artifacts/zclassicd; then
     echo "[OK]"
 else
     echo "[ERROR]"
-    echo "zclassicd doesn't seem to be a zqwMagicBean build or zclassicd is built with libc 2.25"
+    echo "zclassicd doesn't look like a MagicBean build"
     exit 1
 fi
 
-echo -n "zclassicd.exe version....."
-if grep -q "zqwMagicBean" $ZCASH_DIR/artifacts/zclassicd.exe; then 
-    echo "[OK]"
+# Portability gate: the embedded daemon must not require a newer glibc than our
+# old-base builder targets (Ubuntu 20.04 / glibc 2.31). Built on a newer host it
+# would silently fail to start on older distros.
+echo -n "zclassicd portability...."
+MAXGLIBC=$(objdump -T "$ZCASH_DIR/artifacts/zclassicd" 2>/dev/null | grep -oE "GLIBC_[0-9]+\.[0-9]+" | sort -V | tail -1)
+if [ -n "$MAXGLIBC" ] && [ "$(printf '%s\nGLIBC_2.31\n' "$MAXGLIBC" | sort -V | tail -1)" = "GLIBC_2.31" ]; then
+    echo "[OK] (max ${MAXGLIBC})"
 else
     echo "[ERROR]"
-    echo "zclassicd doesn't seem to be a zqwMagicBean build"
+    echo "zclassicd requires newer than glibc 2.31 (max ${MAXGLIBC:-unknown}); build it on the old-base builder."
     exit 1
 fi
 
@@ -68,7 +69,12 @@ echo -n "Building..............."
 rm -rf bin/zcl-qt-wallet* > /dev/null
 rm -rf bin/zclwallet* > /dev/null
 make clean > /dev/null
-make -j$(nproc) > /dev/null
+# Abort on a failed compile/link instead of silently shipping a stale binary.
+if ! make -j$(nproc) > /dev/null || [ ! -x zclwallet ]; then
+    echo "[ERROR]"
+    echo "GUI build failed (zclwallet not produced); see the make output above"
+    exit 1
+fi
 echo "[OK]"
 
 

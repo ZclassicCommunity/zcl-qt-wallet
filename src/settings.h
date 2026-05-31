@@ -52,6 +52,11 @@ public:
     bool    getKeepInTray();
     void    setKeepInTray(bool keep);
 
+    // Opt-out (default ON): paint last-known balance instantly on startup,
+    // independent of getSaveZtxs() so the privacy opt-out keeps the fast paint.
+    bool    getShowCachedBalance();
+    void    setShowCachedBalance(bool show);
+
     bool    isWalletBackedUp();
     void    setWalletBackedUp(bool backedUp);
 

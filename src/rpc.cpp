@@ -783,9 +783,9 @@ void RPC::refreshBalances() {
 
         // Remember the last-known balances so the next launch can paint them
         // instantly while the node warms up (see MainWindow::restoreSavedStates).
-        // Convenience cache only, stored outside wallet.dat; gated on the same
-        // "keep local data" preference as saved shielded-tx history.
-        if (Settings::getInstance()->getSaveZtxs()) {
+        // Convenience cache only, stored outside wallet.dat; gated on its own
+        // default-ON preference (independent of saved shielded-tx history).
+        if (Settings::getInstance()->getShowCachedBalance()) {
             QSettings cs;
             cs.setValue("cache/balTransparent", balT);
             cs.setValue("cache/balShielded",    balZ);
