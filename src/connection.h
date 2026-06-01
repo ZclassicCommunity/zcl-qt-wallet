@@ -88,6 +88,7 @@ private:
     QString readDebugLogTail(int maxBytes = 16384);        // read-only tail of debug.log
     void    offerCorruptionRepair();                       // staged repair ladder dialog
     void    relaunchForRepair(const QStringList& extraArgs);  // backup wallet, then relaunch once
+    void    redownloadChain();                             // set blocks/chainstate aside, fetch fresh
     bool    backupWalletForRepair();                       // read+copy wallet.dat; never writes it
     QDir    resolveDataSubdir();                            // datadir root, or testnet3/ when it holds the chain
 

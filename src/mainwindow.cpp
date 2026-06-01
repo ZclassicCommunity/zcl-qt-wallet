@@ -595,16 +595,32 @@ void MainWindow::setSyncStatus(bool isSyncing, int blockNumber, int estimatedHei
         // Fully caught up: unmistakable green "ready" state.
         syncEtaStarted = false;
         syncProgressBar->setVisible(false);
+        syncProgressBar->setRange(0, 100);   // reset in case it was indeterminate
         syncStatusLabel->setText(tr("✓ Synced — Ready to use"));
         syncBanner->setStyleSheet("QWidget { background-color: #1f7a1f; } QLabel { color: white; }");
         return;
     }
 
-    // Syncing: show a progress bar and an estimated time remaining.
-    int pct = (int) (progress * 100.0);
+    // Indeterminate: we are syncing but have no usable target yet (e.g. the node's
+    // header height isn't known on the first poll). Show a busy bar and a friendly
+    // "starting" message rather than a misleading 0%/height/ETA.
+    bool indeterminate = isSyncing && (estimatedHeight <= 0 || progress < 0.0);
+    if (indeterminate) {
+        syncEtaStarted = false;
+        syncProgressBar->setVisible(true);
+        syncProgressBar->setRange(0, 0);     // busy/indeterminate animation
+        syncStatusLabel->setText(tr("Starting your node…"));
+        syncBanner->setStyleSheet("QWidget { background-color: #d9822b; } QLabel { color: white; }");
+        return;
+    }
+
+    // Syncing: show a progress bar and an estimated time remaining. qRound (not a
+    // truncating cast) so e.g. 99.6% reads 100, not 99.
+    int pct = qRound(progress * 100.0);
     if (pct < 0)   pct = 0;
     if (pct > 100) pct = 100;
     syncProgressBar->setVisible(true);
+    syncProgressBar->setRange(0, 100);       // reset in case it was indeterminate
     syncProgressBar->setValue(pct);
 
     QString etaText;
@@ -652,6 +668,31 @@ void MainWindow::setSyncStatusConnecting() {
     syncProgressBar->setVisible(false);
     syncStatusLabel->setText(tr("Connecting to your ZClassic node…"));
     syncBanner->setStyleSheet("QWidget { background-color: #555555; } QLabel { color: white; }");
+}
+
+// C9: called from rpc.cpp when the node is "syncing" but has 0 peers. A fresh
+// install with no peers would otherwise sit on a stuck "Syncing 0%" -- this tells
+// the user the real problem (no network) instead.
+void MainWindow::setSyncStatusWaitingForPeers() {
+    if (syncBanner == nullptr) return;
+    syncEtaStarted = false;
+    syncProgressBar->setVisible(false);
+    syncProgressBar->setRange(0, 100);   // reset in case it was indeterminate
+    syncStatusLabel->setText(tr("Waiting for peers… check your internet connection"));
+    syncBanner->setStyleSheet("QWidget { background-color: #d9822b; } QLabel { color: white; }");
+}
+
+// Non-modal notification. Prefer a system-tray balloon (visible even when the main
+// window is hidden in tray-resident mode); fall back to a status-bar message when
+// there is no tray. Used by the background node-crash recovery so it never pops a
+// modal over a hidden window.
+void MainWindow::notify(const QString& title, const QString& body) {
+    if (trayIcon != nullptr && QSystemTrayIcon::isSystemTrayAvailable()) {
+        trayIcon->showMessage(title, body, QSystemTrayIcon::Information, 6000);
+    } else {
+        ui->statusBar->showMessage(title % ": " % body, 10 * 1000);
+    }
+    logger->write("notify: " % title % " — " % body);
 }
 
 void MainWindow::setupSettingsModal() {    
@@ -1013,11 +1054,6 @@ void MainWindow::balancesReady() {
         payZClassicURI(pendingURIPayment);
         pendingURIPayment = "";
     }
-
-    // P0-2: now that the wallet is live, make sure the user has a backup of
-    // wallet.dat. This is the single most important fund-safety step because
-    // the wallet is file-based and has NO seed-phrase recovery.
-    promptWalletBackup();
 }
 
 // P0-2: First-run / until-backed-up fund-safety prompt.

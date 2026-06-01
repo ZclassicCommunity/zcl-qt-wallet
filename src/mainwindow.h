@@ -77,6 +77,13 @@ public:
 
     void setSyncStatus(bool isSyncing, int blockNumber, int estimatedHeight, double progress);
     void setSyncStatusConnecting();
+    void setSyncStatusWaitingForPeers();
+
+    // Non-modal user notification: a system-tray balloon when the tray icon is
+    // available (e.g. while running hidden in the background), otherwise a status-
+    // bar message. Used so a backgrounded node-crash recovery can inform the user
+    // without popping a modal dialog over a hidden window.
+    void notify(const QString& title, const QString& body);
 
     Logger*      logger;
 

@@ -123,7 +123,8 @@ void ConnectionLoader::doAutoConnect(bool tryEzclassicdStart) {
                     return;
                 }
                 ezWarmupTimer.start();
-                QTimer::singleShot(1000, [=]() { doAutoConnect(); });
+                int probeMs = (ezWarmupTimer.isValid() && ezWarmupTimer.elapsed() < 4000) ? 250 : 1000;
+                QTimer::singleShot(probeMs, [=]() { doAutoConnect(); });
                 return;
             }
 
@@ -134,7 +135,10 @@ void ConnectionLoader::doAutoConnect(bool tryEzclassicdStart) {
                 (ezWarmupTimer.isValid() && ezWarmupTimer.elapsed() < 120000)) {
                 this->showInformation(QObject::tr("Step 2 of 3: Starting your wallet…"),
                     QObject::tr("Almost ready — getting things going (this can take a minute)…"));
-                QTimer::singleShot(1000, [=]() { doAutoConnect(); });
+                // Probe quickly during the first few seconds of warmup so warm restarts
+                // reconnect without waiting a full extra second, then settle to 1s.
+                int probeMs = (ezWarmupTimer.isValid() && ezWarmupTimer.elapsed() < 4000) ? 250 : 1000;
+                QTimer::singleShot(probeMs, [=]() { doAutoConnect(); });
                 return;
             }
 
@@ -220,11 +224,16 @@ void ConnectionLoader::createZClassicConf() {
     }
 
     main->logger->write("Creating file " + confLocation);
-    QDir().mkdir(fi.dir().absolutePath());
+    QDir().mkpath(fi.dir().absolutePath());
 
     QFile file(confLocation);
     if (!file.open(QIODevice::ReadWrite | QIODevice::Truncate)) {
         main->logger->write("Could not create zclassic.conf, returning");
+        // Don't silently strand the user on the connecting screen forever — tell
+        // them what went wrong so they can fix permissions / free disk space.
+        this->showError(QObject::tr("ZClassic couldn't save its configuration file.\n\n"
+            "Please make sure you have permission to write to your home folder and "
+            "enough free disk space, then open ZClassic again."));
         return;
     }
         
@@ -391,6 +400,16 @@ void ConnectionLoader::doNextDownload(std::function<void(void)> cb) {
         }
         currentDownload->deleteLater();
 
+        // C10: a "successful" transfer that is implausibly small is almost certainly
+        // a captive-portal/redirect HTML page or a truncated body, not a real param
+        // (all 5 real params are far larger than 1 MB). Treat it as a failed download
+        // so it falls into the same auto-retry / offerRetry path below.
+        if (!failed && currentOutput && currentOutput->size() < 1000000) {
+            main->logger->write(QString("Downloaded %1 is too small (%2 bytes); treating as failed")
+                                    .arg(filename).arg(currentOutput->size()));
+            failed = true;
+        }
+
         if (failed) {
             main->logger->write("Downloading " + filename + " failed: " + currentDownload->errorString());
             // Drop the partial file so a retry starts clean.
@@ -517,16 +536,39 @@ bool ConnectionLoader::startEmbeddedZClassicd(const QStringList& extraArgs) {
         ezStdErr.append(output);
     });
 
+    // Startup-speed defaults. -dbcache/-par/-maxsigcachesize apply on every launch.
+    // -checkblocks is added only on a NORMAL launch (gated below): the default
+    // 288-block startup re-verification (~12h of 2.5-min blocks, re-read every launch)
+    // is the bulk of the visible warmup; the chain was already validated when first
+    // connected and the corruption failsafe (handleStartupFailure) covers a damaged db
+    // separately, so capping it is safe -- but during a repair relaunch the caller's
+    // -reindex must run full validation, so we skip -checkblocks then.
+    QStringList launchArgs;
+    launchArgs << "-dbcache=450"          // bigger chainstate cache
+               << "-par=0"                // auto-detect cores: parallel script
+                                          // verification (startup verify + IBD;
+                                          // daemon default is single-threaded)
+               << "-maxsigcachesize=128"; // fewer redundant signature re-verifies
+    // -checkblocks=12 ONLY on a normal launch. During a repair relaunch the caller
+    // passes -reindex / -reindex-chainstate in extraArgs, where capping startup
+    // verification would defeat the point of a full re-validation.
+    if (extraArgs.isEmpty())
+        launchArgs << "-checkblocks=12";
+    launchArgs.append(extraArgs);
+    // NOTE: ezWarmupTimer is started by the caller (doAutoConnect / relaunchForRepair)
+    // right after this returns; do NOT restart it here or the warmup-window check and
+    // the startup-timing log would measure from the wrong instant.
+
 #ifdef Q_OS_LINUX
-    ezclassicd->start(zclassicdProgram, extraArgs);
+    ezclassicd->start(zclassicdProgram, launchArgs);
 #elif defined(Q_OS_DARWIN)
-    ezclassicd->start(zclassicdProgram, extraArgs);
+    ezclassicd->start(zclassicdProgram, launchArgs);
 #else
     // Spawn by ABSOLUTE path: in the single-file release the daemon is extracted
     // outside appPath (under %LOCALAPPDATA%), so the old bare-name "zclassicd.exe"
     // + working-directory spawn would not find it.
     ezclassicd->setWorkingDirectory(appPath.absolutePath());
-    ezclassicd->start(zclassicdProgram, extraArgs);
+    ezclassicd->start(zclassicdProgram, launchArgs);
 #endif // Q_OS_LINUX
 
 
@@ -810,7 +852,9 @@ void ConnectionLoader::offerCorruptionRepair() {
         "touch your wallet file or private keys — and ZClassic will make a backup copy "
         "of your wallet first, just to be sure.<br><br>"
         "How would you like to fix it? Start with the fast option; you can try the next "
-        "one if it doesn't work."));
+        "one if it doesn't work.<br><br>") +
+        QObject::tr("• Re-download — sets aside the local blockchain and downloads a fresh "
+            "copy (largest, slowest)."));
 
     // Least-invasive first. AcceptRole/ActionRole keep them in a predictable order.
     QPushButton* fastBtn   = box.addButton(QObject::tr("Repair (fast)"),            QMessageBox::AcceptRole);
@@ -829,15 +873,15 @@ void ConnectionLoader::offerCorruptionRepair() {
         // Step 2: rebuild the block index too (from the blk files). Slower.
         this->relaunchForRepair(QStringList() << "-reindex");
     } else if (clicked == redownBtn) {
-        // Step 3 (last resort): let the daemon's own bootstrap/backup machinery move
-        // the chain data aside and re-fetch. -reindex is a safe, non-destructive
-        // trigger that hands control to that machinery; it NEVER touches wallet.dat.
+        // Step 3 (last resort): genuinely re-fetch. redownloadChain() sets the local
+        // blocks/ and chainstate/ aside and starts the node normally, so it re-runs
+        // its automatic bootstrap-snapshot flow. It NEVER touches wallet.dat.
         auto confirm = QMessageBox::question(main, QObject::tr("Re-download the blockchain?"),
-            QObject::tr("This rebuilds the blockchain from scratch and can take a while. "
+            QObject::tr("This downloads a fresh copy of the blockchain and can take a while. "
                 "It still does not touch your wallet or private keys.\n\nContinue?"),
             QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
         if (confirm == QMessageBox::Yes)
-            this->relaunchForRepair(QStringList() << "-reindex");
+            this->redownloadChain();
     } else { // "Not now" or dialog closed
         this->showError(QObject::tr("ZClassic couldn't finish starting up.\n\n"
             "You can open ZClassic again whenever you're ready, and choose a repair "
@@ -886,6 +930,124 @@ void ConnectionLoader::relaunchForRepair(const QStringList& extraArgs) {
     // will now connect once the reindex completes (or, if it fails again, fall
     // back through handleStartupFailure() — but ezRepairOffered is already set, so
     // the user gets the plain error instead of an endless repair loop).
+    ezWarmupTimer.start();
+    QTimer::singleShot(1000, [=]() { doAutoConnect(); });
+}
+
+// A GENUINE re-download (unlike -reindex, which rebuilds from the same possibly
+// corrupt local blk files): set the local blocks/ and chainstate/ aside into ONE
+// timestamped parent dir, then start the node normally so that — seeing an empty
+// datadir — it re-runs its automatic bootstrap-snapshot flow and fetches a fresh
+// chain. (Verified: the shipped daemon auto-bootstraps on an empty/eligible datadir
+// with NO flag — -bootstrap defaults to true and -bootstrapmode defaults to
+// "anchor" — so a plain start is correct here.) The move is rollback-safe: if any
+// directory fails to move, every prior move is undone and the datadir is left
+// exactly as found. Disk growth from the set-aside copy is bounded to ONE
+// generation: a prior set-aside dir is swept before this one is created, so a
+// repeated re-download never accumulates. The single "chain-set-aside-*" parent
+// stays in the datadir (renaming within it is instant and recoverable); the user
+// can delete it later to reclaim disk space, and the next re-download sweeps it.
+//
+// This only ever runs from offerCorruptionRepair <- handleStartupFailure, i.e. the
+// node process is ALREADY DEAD, so there are no open file handles on these dirs.
+void ConnectionLoader::redownloadChain() {
+    main->logger->write("redownloadChain: wiping local chain data for fresh re-download");
+
+    // Step 0: always make a fresh wallet.dat safety backup first.
+    if (!this->backupWalletForRepair()) {
+        this->showError(QObject::tr("ZClassic couldn't make a safety backup of your wallet, "
+            "so the re-download was stopped.\n\n"
+            "Your wallet and coins have not been changed. Please make sure you have free "
+            "disk space and try again."));
+        return;
+    }
+
+    QDir dd = resolveDataSubdir();
+    QString stamp = QDateTime::currentDateTime().toString("yyyyMMdd-hhmmss");
+
+    // Bound disk growth to one generation: sweep any set-aside dirs left over from a
+    // previous re-download before creating this one. (The node is dead, so nothing
+    // holds these.) Doing this first also reclaims that space ahead of the disk check.
+    for (const QString& entry : dd.entryList(QStringList() << "chain-set-aside-*",
+                                             QDir::Dirs | QDir::NoDotAndDotDot)) {
+        QDir(dd.filePath(entry)).removeRecursively();
+    }
+
+    // A re-download fetches a FRESH full chain that must briefly coexist on disk with
+    // the set-aside old copy (the set-aside is just a rename, so it keeps occupying
+    // its original space). On the near-full disk that often CAUSED the corruption,
+    // this would fail partway and strand the user with no chain. Require a generous
+    // floor up front and bail with a clear message rather than half-finishing. The
+    // generic ensureEnoughDiskSpace() (~3 GB) is far too low for a full chain.
+    {
+        QStorageInfo storage(dd.absolutePath());
+        const qint64 needed = (qint64)15 * 1024 * 1024 * 1024;   // ~15 GB headroom for a fresh chain
+        if (storage.isValid() && storage.isReady() && storage.bytesAvailable() < needed) {
+            QString human = QString::number(storage.bytesAvailable() / 1024.0 / 1024.0 / 1024.0, 'f', 1);
+            main->logger->write(QString("redownloadChain: insufficient disk for re-download (%1 GB free)").arg(human));
+            this->showError(QObject::tr("There isn't enough free disk space to download a fresh "
+                "copy of the blockchain.\n\n"
+                "About 15 GB free is needed, but only %1 GB is available. Please free up some "
+                "space and open ZClassic again. Your wallet and coins are safe, and your existing "
+                "blockchain data has not been changed.").arg(human));
+            return;
+        }
+    }
+
+    // Set aside blocks/ and chainstate/ into ONE parent rather than deleting them, so
+    // the move is instant and fully recoverable. If any rename fails, roll back every
+    // move already done and remove the parent, leaving the datadir exactly as found.
+    QString aside = "chain-set-aside-" + stamp;
+    dd.mkpath(aside);
+
+    QStringList moved;   // names successfully moved INTO 'aside', for rollback
+    bool moveFailed = false;
+    for (const QString& name : { QStringLiteral("blocks"), QStringLiteral("chainstate") }) {
+        if (dd.exists(name)) {
+            if (!dd.rename(name, aside + "/" + name)) {
+                moveFailed = true;
+                break;
+            }
+            moved << name;
+        }
+    }
+    if (moveFailed) {
+        main->logger->write("redownloadChain: a set-aside move failed; rolling back");
+        // Undo every move already done, then drop the (now-partial) parent.
+        for (const QString& done : moved)
+            dd.rename(aside + "/" + done, done);
+        QDir(dd.filePath(aside)).removeRecursively();
+        this->showError(QObject::tr("ZClassic couldn't move the old blockchain data aside.\n\n"
+            "Please make sure you have free disk space and that no other copy of "
+            "ZClassic is running, then try again. Your wallet and coins are safe."));
+        return;
+    }
+
+    // Count this repair attempt (persisted per install), matching relaunchForRepair.
+    QSettings().setValue("repair/attempts", QSettings().value("repair/attempts", 0).toInt() + 1);
+
+    // Drop the dead QProcess so a fresh one is created with no repair flags.
+    if (ezclassicd) {
+        ezclassicd->deleteLater();
+        ezclassicd = nullptr;
+    }
+    ezNodeQuitDuringStartup = false;
+    ezStdErr.clear();
+
+    this->showInformation(QObject::tr("Re-downloading your blockchain data…"),
+        QObject::tr("This downloads a fresh copy and can take a while. Your wallet is safe."));
+
+    // Normal start (no extra args): the empty datadir triggers the daemon's own
+    // bootstrap-snapshot flow. If the relaunch fails the old chain data is still
+    // intact under the set-aside folder, so tell the user where it is.
+    if (!this->startEmbeddedZClassicd()) {
+        this->showError(QObject::tr("ZClassic couldn't start the re-download.\n\n"
+            "Please open ZClassic again — it will download a fresh copy then. "
+            "Your wallet and coins are safe, and your previous blockchain data was "
+            "kept in a folder named \"%1\" inside the data directory.").arg(aside));
+        return;
+    }
+
     ezWarmupTimer.start();
     QTimer::singleShot(1000, [=]() { doAutoConnect(); });
 }
@@ -964,6 +1126,11 @@ void ConnectionLoader::doRPCSetConnection(Connection* conn) {
     // The RPC connection is now live: the node is genuinely up, so end the warmup
     // window. After this, a QProcess 'finished' signal is a normal shutdown, not a
     // startup quit, and must NOT trigger the corruption failsafe.
+    // Startup profiling: log how long from node launch to first live RPC, so the
+    // warmup cost (block-index + chainstate load + checkblocks verify) is visible.
+    if (ezWarmupTimer.isValid())
+        main->logger->write(QString("Startup: node RPC online %1 ms after launch")
+                                .arg(ezWarmupTimer.elapsed()));
     ezWarmupTimer.invalidate();
     ezNodeQuitDuringStartup = false;
 
@@ -1046,8 +1213,9 @@ void ConnectionLoader::refreshZClassicdState(Connection* connection, std::functi
                 }
                 this->showInformation(QObject::tr("Step 2 of 3: Starting your wallet…"), status);
                 main->logger->write("Waiting for zclassicd to come online.");
-                // Refresh after one second
-                QTimer::singleShot(1000, [=]() { this->refreshZClassicdState(connection, refused); });
+                // Refresh quickly during the first few seconds of warmup, then every second.
+                int probeMs = (ezWarmupTimer.isValid() && ezWarmupTimer.elapsed() < 4000) ? 250 : 1000;
+                QTimer::singleShot(probeMs, [=]() { this->refreshZClassicdState(connection, refused); });
             }
         }
     );

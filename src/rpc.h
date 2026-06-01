@@ -108,6 +108,26 @@ private:
     void getZAddresses          (const std::function<void(json)>& cb);
     void getTAddresses          (const std::function<void(json)>& cb);
 
+    // Runtime daemon-crash recovery: catch the embedded node dying at runtime
+    // (OOM/crash) and offer to restart it instead of stranding the user in a
+    // permanent "No Connection". ezExpectedShutdown gates the normal-shutdown
+    // path; ezRestartCount caps automatic restarts.
+    void handleEZClassicdCrash(int exitCode, QProcess::ExitStatus status);
+    void restartEmbeddedZClassicd();   // relaunch the dead node, stripping repair flags
+    bool                        ezExpectedShutdown          = false;
+    bool                        ezCrashDialogOpen           = false;
+    int                         ezRestartCount              = 0;
+    QMetaObject::Connection     ezCrashConn;
+
+    // C2/F5: once we've legitimately confirmed the chain tip (blocks>=headers with
+    // peers) this latch keeps us "synced" through brief peer drops so an established
+    // wallet doesn't flicker back to "syncing".
+    bool                        ezEverSynced                = false;
+
+    // C9/F6: debounce the waiting-for-peers banner; a single connections==0 sample
+    // shouldn't flip the banner. Counts consecutive peerless polls; reset on a peer.
+    int                         ezNoPeerPolls               = 0;
+
     Connection*                 conn                        = nullptr;
     QProcess*                   ezclassicd                     = nullptr;
 
