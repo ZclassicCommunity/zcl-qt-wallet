@@ -1482,6 +1482,18 @@ void RPC::pollBootstrapSnapshotStatus() {
         });
 }
 
+void RPC::onAboutToQuit() {
+    // Runs on every quit route (see header). The macOS app-menu Quit / Cmd-Q skips
+    // MainWindow::closeEvent()->shutdownZClassicd(), so ezExpectedShutdown was never
+    // set on that path and the periodic refresh poller (RPC::refresh) could fire its
+    // generic "There was an error connecting to zclassicd" box as the node exits.
+    // Set the flag and silence the pollers here so no spurious dialog appears.
+    ezExpectedShutdown = true;
+    if (timer)      timer->stop();
+    if (txTimer)    txTimer->stop();
+    if (priceTimer) priceTimer->stop();
+}
+
 void RPC::shutdownZClassicd() {
     // Re-entrancy guard: the wait below spins a nested event loop while the main
     // window is still live, so a second Quit / window-close could otherwise re-enter
@@ -1508,7 +1520,10 @@ void RPC::shutdownZClassicd() {
         {"method", "stop"}
     };
     
-    conn->doRPCWithDefaultErrorHandling(payload, [=](auto) {});
+    // Best-effort graceful stop: ignore errors. During warmup (e.g. quitting mid
+    // snapshot-download) the daemon may refuse the connection or reply RPC_IN_WARMUP;
+    // that must not pop a "Transaction Error" box -- we fall back to terminate() below.
+    conn->doRPCIgnoreError(payload, [=](auto) {});
     conn->shutdown();
 
     // Wait for the embedded zclassicd to finish flushing its state and exit, but

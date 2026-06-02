@@ -77,6 +77,14 @@ public:
 
     void shutdownZClassicd();
 
+    // Called from QCoreApplication::aboutToQuit, i.e. on EVERY quit route -- window
+    // close, File->Exit, SIGINT, AND the macOS app-menu "Quit" / Cmd-Q, which calls
+    // QApplication::quit() directly and bypasses MainWindow::closeEvent()/
+    // shutdownZClassicd(). Marks the shutdown as expected and stops the pollers so the
+    // async RPC handlers never flash a spurious "error connecting to zclassicd" dialog
+    // while the embedded node is being torn down.
+    void onAboutToQuit();
+
     // SAFETY GATE for the manual Help -> Repair path: positively confirm the
     // RPC-owned embedded node is NOT running before any datadir mutation. Polls
     // state(); if still alive, terminate() + waitForFinished, then escalate to

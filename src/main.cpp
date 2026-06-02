@@ -314,6 +314,15 @@ public:
         // For MacOS, we have an event filter
         a.installEventFilter(w);
 
+        // Suppress the spurious "error connecting to zclassicd" box on quit. The macOS
+        // app-menu Quit / Cmd-Q calls QApplication::quit() directly, bypassing
+        // MainWindow::closeEvent()/shutdownZClassicd() where the expected-shutdown flag
+        // is normally set; aboutToQuit fires on every quit route, so mark it here.
+        QObject::connect(&a, &QCoreApplication::aboutToQuit, w, [=]() {
+            if (w && w->getRPC())
+                w->getRPC()->onAboutToQuit();
+        });
+
         // Check if starting headless
         if (parser.isSet(headlessOption)) {
             Settings::getInstance()->setHeadless(true);
