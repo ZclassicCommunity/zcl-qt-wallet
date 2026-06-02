@@ -104,7 +104,20 @@ if codesign --verify --deep --strict zclwallet.app >/dev/null 2>&1; then echo "[
 
 echo -n "Building dmg..........."
 mv zclwallet.app ZclWallet.app
-create-dmg --volname "ZclWallet-v$APP_VERSION" --volicon "res/logo.icns" --window-pos 200 120 --icon "ZclWallet.app" 200 190  --app-drop-link 600 185 --hide-extension "ZclWallet.app"  --window-size 800 400 --hdiutil-quiet --background res/dmgbg.png  artifacts/macOS-zclwallet-v$APP_VERSION.dmg ZclWallet.app >/dev/null 2>&1
+DMG="artifacts/macOS-zclwallet-v$APP_VERSION.dmg"
+rm -f "$DMG"
+# `create-dmg` drives Finder via AppleScript to lay out the decorative
+# background/icons. On a headless / CI / Automation-restricted Mac that fails with
+# "AppleEvent timed out (-1712)" and produces NO dmg. The decorative layout is
+# cosmetic, so fall back to a plain compressed dmg via hdiutil — functionally
+# identical (a signed .app the user drags out). For the polished layout, run on an
+# interactive Mac with Automation permission granted to the terminal.
+create-dmg --volname "ZclWallet-v$APP_VERSION" --volicon "res/logo.icns" --window-pos 200 120 --icon "ZclWallet.app" 200 190  --app-drop-link 600 185 --hide-extension "ZclWallet.app"  --window-size 800 400 --hdiutil-quiet --background res/dmgbg.png  "$DMG" ZclWallet.app >/dev/null 2>&1
+if [ ! -f "$DMG" ]; then
+    echo -n "[create-dmg failed → hdiutil fallback]..."
+    hdiutil create -volname "ZclWallet-v$APP_VERSION" -srcfolder ZclWallet.app -ov -format UDZO "$DMG" >/dev/null 2>&1
+fi
+[ -f "$DMG" ] && echo "[OK]" || echo "[FAIL: no dmg produced]"
 
 #mkdir bin/dmgbuild >/dev/null 2>&1
 #sed "s/RELEASE_VERSION/${APP_VERSION}/g" res/appdmg.json > bin/dmgbuild/appdmg.json
