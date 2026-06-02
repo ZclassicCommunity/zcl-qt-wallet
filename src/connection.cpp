@@ -1908,15 +1908,29 @@ void ConnectionLoader::refreshZClassicdState(Connection* connection, std::functi
                     // Rewinding, Connecting to bootstrap server…, Activating best chain)
                     // has no percent: restore the busy/indeterminate bar so a stale 100%
                     // left over from a finished download phase doesn't linger.
-                    if (ezProgress) ezProgress->setRange(0, 0);
-                    {
-                        static int dots = 0;
-                        status = status.left(status.length() - 3) + QString(".").repeated(dots);
-                        dots++;
-                        if (dots > 3)
-                            dots = 0;
+                    bool renderedBootstrapVerify = false;
+                    if (ezBootstrapVerifyPending ||
+                        ezBootstrapPhase == QStringLiteral("succeeded")) {
+                        if (ezProgress) ezProgress->setRange(0, 0);
+                        QString detail = ezBootstrapValidationState;
+                        if (detail == QStringLiteral("disabled"))
+                            detail.clear();
+                        this->showInformation(
+                            QObject::tr("Step 3 of 3: Verifying blockchain… (a few minutes)"),
+                            detail);
+                        renderedBootstrapVerify = true;
                     }
-                    this->showInformation(QObject::tr("Step 2 of 3: Starting your wallet…"), status);
+                    if (!renderedBootstrapVerify) {
+                        if (ezProgress) ezProgress->setRange(0, 0);
+                        {
+                            static int dots = 0;
+                            status = status.left(status.length() - 3) + QString(".").repeated(dots);
+                            dots++;
+                            if (dots > 3)
+                                dots = 0;
+                        }
+                        this->showInformation(QObject::tr("Step 2 of 3: Starting your wallet…"), status);
+                    }
 
                     // getbootstrapinfo enrichment: the warmup string carries no percent,
                     // but getbootstrapinfo is WARMUP-EXEMPT and answers with the live
@@ -2049,9 +2063,12 @@ void ConnectionLoader::probeBootstrapProgress(Connection* connection) {
             } else if (ezBootstrapVerifyPending ||
                        ezBootstrapPhase == QStringLiteral("succeeded")) {
                 if (ezProgress) ezProgress->setRange(0, 0);   // busy/indeterminate
+                QString detail = ezBootstrapValidationState;
+                if (detail == QStringLiteral("disabled"))
+                    detail.clear();
                 this->showInformation(
                     QObject::tr("Step 3 of 3: Verifying blockchain… (a few minutes)"),
-                    ezBootstrapValidationState);
+                    detail);
             }
             // Any other phase (idle/skipped/failed/normal_sync) -> leave the caller's
             // text in place; the daemon is past bootstrap or never used it. The getinfo
