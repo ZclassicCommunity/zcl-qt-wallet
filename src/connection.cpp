@@ -100,11 +100,21 @@ void ConnectionLoader::doAutoConnect(bool tryEzclassicdStart) {
     if (!ezAlive || !*ezAlive)
         return;
 
-    // Priority 1: Ensure all params are present.
-    if (!verifyParams()) {
-        downloadParams([=]() { this->doAutoConnect(); });
-        return;
-    }
+    // Priority 1: zk-params. We DO NOT pre-download them from z.cash here anymore.
+    // z.cash now permanently 403s the deprecated sprout-proving.key (the legacy
+    // ~910 MB Sprout proving key), which used to hang a fresh install FOREVER at
+    // "Step 1 of 3: Getting the security files ready…" with no way to cancel. The
+    // embedded daemon already fetches any missing params from a bootstrap peer over
+    // P2P, hash-verified against its compiled table (daemon init.cpp: InitSanityCheck
+    // -> FetchZcashParamsFromPeer, default -bootstrap=true). So we fall through to
+    // start the node: if params are present it starts immediately; if not, it fetches
+    // them while the splash shows "Almost ready…" (the warmup loop waits patiently as
+    // long as the process is alive), or exits with a clear error that
+    // handleStartupFailure() surfaces — never a silent hang on a dead URL. A
+    // non-embedded external daemon is the user's own responsibility to provision.
+    // (downloadParams() is retained but no longer on the startup path.)
+    if (!verifyParams())
+        main->logger->write("zk-params not all present locally; deferring to the daemon's hash-verified peer-fetch");
 
     // Priority 2: Try to connect to detect zclassic.conf and connect to it.
     auto config = autoDetectZClassicConf();
