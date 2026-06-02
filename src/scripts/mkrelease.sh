@@ -48,6 +48,14 @@ sed -i "s/${PREV_VERSION}/${APP_VERSION}/g" zcl-qt-wallet.pro > /dev/null
 
 # Also update it in the README.md
 sed -i "s/${PREV_VERSION}/${APP_VERSION}/g" README.md > /dev/null
+# CRITICAL: the version the app actually REPORTS comes from src/version.h
+# (#define APP_VERSION "..."). zcl-qt-wallet.pro and README.md carry no version
+# string, so the two seds above are cosmetic — bump version.h here too or the
+# build silently ships the OLD version while printing a green [OK].
+sed -i "s/${PREV_VERSION}/${APP_VERSION}/g" src/version.h > /dev/null
+if ! grep -q "\"${APP_VERSION}\"" src/version.h; then
+  echo "[FAIL]"; echo "FATAL: src/version.h not bumped to ${APP_VERSION} (APP_VERSION #define mismatch)"; exit 1
+fi
 echo "[OK]"
 
 echo -n "Cleaning..............."

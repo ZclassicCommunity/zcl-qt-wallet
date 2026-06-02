@@ -82,8 +82,24 @@ rm -f artifcats/zclwallet.dmg >/dev/null 2>&1
 rm -f artifacts/rw* >/dev/null 2>&1
 cp $ZCASH_DIR/src/zclassicd zclwallet.app/Contents/MacOS/
 cp $ZCASH_DIR/src/zclassic-cli zclwallet.app/Contents/MacOS/
-$QT_PATH/bin/macdeployqt zclwallet.app 
+$QT_PATH/bin/macdeployqt zclwallet.app
 echo "[OK]"
+
+# Ad-hoc codesign — MUST run AFTER macdeployqt. macdeployqt relocates/rewrites the
+# bundled Qt frameworks and invalidates their linker signatures; on Apple Silicon an
+# app with an invalid signature is SIGKILLed at launch ("code signature invalid").
+# Sign the nested executables (incl. the sibling daemon in Contents/MacOS) first,
+# then --deep the whole .app. There is no Apple Developer ID here, so this is AD-HOC
+# (-s -): it fixes the Apple-Silicon SIGKILL but does NOT notarize, so Gatekeeper
+# still flags "unidentified developer" — users right-click -> Open once, or run
+# `xattr -dr com.apple.quarantine /Applications/ZclWallet.app` (see docs/BUILDING.md
+# + release notes). With a Dev ID, replace `-` with the identity and add
+# --options runtime, then notarize + staple.
+echo -n "Ad-hoc signing........."
+codesign --force --timestamp=none --sign - zclwallet.app/Contents/MacOS/zclassic-cli >/dev/null 2>&1 || true
+codesign --force --timestamp=none --sign - zclwallet.app/Contents/MacOS/zclassicd  >/dev/null 2>&1 || true
+codesign --force --deep --timestamp=none --sign - zclwallet.app >/dev/null 2>&1
+if codesign --verify --deep --strict zclwallet.app >/dev/null 2>&1; then echo "[OK]"; else echo "[WARN: codesign verify failed — check on the Mac]"; fi
 
 
 echo -n "Building dmg..........."
