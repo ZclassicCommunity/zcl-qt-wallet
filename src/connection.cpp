@@ -652,8 +652,11 @@ QString ConnectionLoader::ensureDaemonExtracted() {
 
     const qint64 payloadOffset = selfSize - FOOTER - (qint64)len;
     // Reject a zero/absurd/negative length: a corrupt or tampered 8-byte footer must
-    // not drive a multi-hour read that looks like a first-run hang. Real daemon ~13MB.
-    if (len == 0 || len > 100ull * 1024 * 1024 || payloadOffset < 0) {
+    // not drive a multi-hour read that looks like a first-run hang. The current
+    // static-libgomp Linux daemon is ~176 MiB, so allow static release payloads
+    // while still bounding corrupted lengths well below multi-GiB reads.
+    const quint64 MAX_EMBEDDED_DAEMON_BYTES = 512ull * 1024 * 1024;
+    if (len == 0 || len > MAX_EMBEDDED_DAEMON_BYTES || payloadOffset < 0) {
         main->logger->write("ensureDaemonExtracted: invalid embedded payload size=" + QString::number(len));
         return QString();
     }
