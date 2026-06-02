@@ -11,7 +11,6 @@ CONFIG += precompile_header
 PRECOMPILED_HEADER = src/precompiled.h
 
 QT += widgets
-QT += websockets
 
 TARGET = zclwallet
 
@@ -53,8 +52,6 @@ SOURCES += \
     src/addressbook.cpp \
     src/logger.cpp \
     src/addresscombo.cpp \
-    src/websockets.cpp \
-    src/mobileappconnector.cpp \
     src/recurring.cpp
 
 HEADERS += \
@@ -76,8 +73,6 @@ HEADERS += \
     src/addressbook.h \
     src/logger.h \
     src/addresscombo.h \ 
-    src/websockets.h \
-    src/mobileappconnector.h \
     src/recurring.h
 
 FORMS += \
@@ -90,9 +85,7 @@ FORMS += \
     src/privkey.ui \
     src/memodialog.ui \ 
     src/connection.ui \
-    src/zboard.ui \
     src/addressbook.ui \
-    src/mobileappconnector.ui \
     src/createzclassicconfdialog.ui \
     src/recurringdialog.ui \
     src/newrecurring.ui
@@ -106,6 +99,17 @@ TRANSLATIONS = res/zcl_qt_wallet_es.ts \
 
 include(singleapplication/singleapplication.pri)
 DEFINES += QAPPLICATION_CLASS=QApplication
+
+# NEVER-STRAND (static build): explicitly link BOTH the xcb and offscreen QPA
+# platform plugins so the runtime platform fallback chain in main() (set via
+# QT_QPA_PLATFORM=wayland;xcb;offscreen on a no-XWayland Wayland session) always
+# has a non-aborting last resort compiled in. qmake's default static import_plugins
+# already pulls these in for this Qt config; naming them here makes the requirement
+# explicit and build-verifiable, so a future configure-flag change cannot silently
+# drop offscreen and re-introduce the hard-abort strand on Wayland-without-XWayland.
+static:unix:!macx {
+    QTPLUGIN.platforms = qxcb qoffscreen
+}
 
 QMAKE_INFO_PLIST = res/Info.plist
 

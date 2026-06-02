@@ -8,6 +8,33 @@
 
 #include "version.h"
 
+#include <QtNetwork/QTcpSocket>
+
+// ----------------------------------------------------------------------------
+// Idiot-proof launch helpers (Wayland-survive + never-spawn-a-duplicate-node).
+// ----------------------------------------------------------------------------
+
+// True iff BOTH the ZClassic RPC and P2P ports on 127.0.0.1 are currently
+// UNBOUND (connection refused/timeout). Mainnet 8023/8033, testnet 18023/18033.
+// We probe BOTH port pairs so we are conservative regardless of which network a
+// possibly-already-running primary chose: if ANY node is answering on ANY of the
+// four ports, we treat the ports as NOT free. This runs BEFORE Settings::init(),
+// so we cannot yet know testnet-vs-mainnet; checking all four is the safe choice.
+// Used only to gate the secondary->primary fall-through below: we must never
+// launch a second embedded zclassicd onto a live datadir.
+static bool nodePortsDefinitelyFree() {
+    auto portInUse = [](quint16 port) -> bool {
+        QTcpSocket probe;
+        probe.connectToHost(QStringLiteral("127.0.0.1"), port);
+        bool connected = probe.waitForConnected(200);   // refused/timeout => free
+        probe.abort();
+        return connected;
+    };
+    // ANY of these answering => a node is live => ports are NOT free.
+    return !portInUse(8023) && !portInUse(8033)
+        && !portInUse(18023) && !portInUse(18033);
+}
+
 class SignalHandler 
 {
 public:
@@ -166,17 +193,51 @@ public:
 
         // Check for a positional argument indicating a zclassic payment URI
         if (a.isSecondary()) {
-            if (parser.positionalArguments().length() > 0) {
-                a.sendMessage(parser.positionalArguments()[0].toUtf8());
-            } else {
-                // No URI: this is just the user launching the app again. Ask the
-                // already-running instance to come to the front (and un-hide from
-                // the tray, in tray-resident mode) instead of starting a second
-                // node. This is what makes a "relaunch" feel instant.
-                a.sendMessage(QByteArray("__SHOW__"));
+            // SingleApplication says a primary already exists. The normal case:
+            // forward the URI / a __SHOW__ to the live primary and exit, so we do
+            // NOT start a second embedded node onto the live datadir.
+            QByteArray payload = (parser.positionalArguments().length() > 0)
+                ? parser.positionalArguments()[0].toUtf8()
+                : QByteArray("__SHOW__");
+
+            // Give a busy-but-alive primary real time to accept. A first-sync /
+            // bootstrap primary is hammering disk and its QLocalServer accept can
+            // lag well past the default 100ms; a single short flush would spuriously
+            // report "not delivered" and (pre-fix) fall through to a DUPLICATE node
+            // on the same LevelDB/blocks dir = classic corruption. Retry with a
+            // generous timeout before concluding the primary is dead.
+            bool delivered = false;
+            for (int attempt = 0; attempt < 5 && !delivered; attempt++) {
+                delivered = a.sendMessage(payload, 3000 /* ms */);
             }
-            a.exit( 0 );
-            return 0;
+
+            if (delivered) {
+                // A genuine primary received the message: this is true
+                // single-instance behavior, identical to before. Exit cleanly.
+                a.exit(0);
+                return 0;
+            }
+
+            // Delivery FAILED after generous retries. Either there is genuinely no
+            // live primary (a stale shared-memory primary flag from a crash-killed
+            // prior run) OR a primary is alive but unreachable. We must NOT spawn a
+            // second node onto a live datadir, so before falling through to normal
+            // startup we POSITIVELY PROVE the node ports are free. If anything is
+            // still answering on the RPC/P2P ports, a node IS live -> never start a
+            // duplicate; exit (preserving today's safe single-instance outcome).
+            if (!nodePortsDefinitelyFree()) {
+                qDebug() << "Secondary: message not delivered but a node is on the "
+                            "ports; refusing to start a duplicate. Exiting.";
+                a.exit(0);
+                return 0;
+            }
+
+            // Provably no live primary AND ports are free: this is a stale-primary
+            // trap. Fall through to become the usable instance so the user gets a
+            // window + node instead of a silent no-op exit. (No other instance can
+            // be racing our datadir because nothing is listening on the ports.)
+            qDebug() << "Secondary: no live primary and node ports free; "
+                        "becoming the usable instance.";
         }
 
         QCoreApplication::setOrganizationName("zcl-qt-wallet-org");
@@ -212,8 +273,13 @@ public:
         // Set up libsodium
         if (sodium_init() < 0) {
             /* panic! the library couldn't be initialized, it is not safe to use */
-            qDebug() << "libsodium is not initialized!";
-            exit(0);
+            // Never silently exit(0) reporting success. Show a visible, actionable
+            // dialog (a QApplication exists here) and exit non-zero. No node or
+            // datadir has been touched at this point.
+            QMessageBox::critical(nullptr, QObject::tr("ZclWallet cannot start"),
+                QObject::tr("A required security library (libsodium) failed to "
+                            "initialize. Please reinstall ZclWallet."));
+            return 1;
         }
 
         // Check for embedded option
@@ -251,10 +317,23 @@ public:
         // Check if starting headless
         if (parser.isSet(headlessOption)) {
             Settings::getInstance()->setHeadless(true);
-            a.setQuitOnLastWindowClosed(false);    
+            a.setQuitOnLastWindowClosed(false);
         } else {
             Settings::getInstance()->setHeadless(false);
+            // NEVER-STRAND guarantee: disable quit-on-last-window-closed for the
+            // ENTIRE GUI lifetime. With this off, NO transient/modal dialog closing
+            // (the connect dialog, a connect-error box, the node-crash box, the
+            // foreign-stuck box) can ever end the process by itself when the main
+            // window has not yet mapped -- which is exactly bob's silent-exit class.
+            // Legitimate quits do NOT rely on this flag: the SIGINT handler and the
+            // node-crash/foreign-stuck dialogs call QApplication::quit() directly,
+            // and MainWindow::closeEvent now calls qApp->quit() unconditionally on a
+            // real (non-tray) close. applyTraySetting() no longer re-enables this
+            // flag, so a Settings-OK can no longer re-arm the trap (see mainwindow.cpp).
+            a.setQuitOnLastWindowClosed(false);
             w->show();
+            w->raise();
+            w->activateWindow();
         }
 
         return QApplication::exec();
@@ -296,8 +375,72 @@ private:
     MainWindow* w;
 };
 
+// Keep the user's terminal clean: swallow one benign Qt-internal warning that the static
+// Qt 5.15 QtNetwork stack emits while servicing HTTPS (price + update-check) requests --
+// "QBasicTimer::start: QBasicTimer can only be used with threads started with QThread".
+// It is harmless teardown noise: no application code starts a timer off-thread (the one
+// cross-thread hop, DispatchToMainThread, uses the correct moveToThread + queued-start
+// pattern), but a burst of it printed right before an unrelated exit looked like a crash.
+// Everything that is NOT this line is printed exactly as Qt would.
+static void zclMessageFilter(QtMsgType type, const QMessageLogContext&, const QString& msg)
+{
+    if (msg.contains(QLatin1String("QBasicTimer")) &&
+        msg.contains(QLatin1String("threads started with QThread")))
+        return;
+    const QByteArray line = msg.toLocal8Bit();
+    fprintf(stderr, "%s\n", line.constData());
+    if (type == QtFatalMsg)
+        abort();
+}
+
 int main(int argc, char* argv[])
 {
+    // Install the noise filter before anything can log.
+    qInstallMessageHandler(zclMessageFilter);
+#ifdef Q_OS_LINUX
+    // ROOT-CAUSE FIX for bob's silent exit on a Wayland session.
+    //
+    // The static bundle ships ONLY the xcb QPA plugin (Qt configured with -xcb;
+    // no qtwayland is built). On a Wayland session Qt's default probe selects the
+    // "wayland" plugin, fails to find it ("Could not find the Qt platform plugin
+    // \"wayland\""), and the top-level window never reliably maps -> silent exit.
+    //
+    // We force the already-linked xcb plugin, which runs transparently under
+    // XWayland. BUT: forcing xcb with NO X display would make the xcb plugin abort
+    // QApplication construction (a hard SIGABRT before any window) on the rare
+    // Wayland-without-XWayland configs. So we only force xcb when an X display is
+    // actually reachable (DISPLAY is set + non-empty). With no DISPLAY we leave
+    // Qt's own probe alone: it can still try wayland / fall back to whatever
+    // platform plugins are compiled into this static build, rather than being
+    // forced into a guaranteed abort. Only-if-unset preserves the power-user
+    // escape hatch (export QT_QPA_PLATFORM=... still wins).
+    if (!qEnvironmentVariableIsSet("QT_QPA_PLATFORM")) {
+        QByteArray display = qgetenv("DISPLAY");
+        QByteArray waylandDisplay = qgetenv("WAYLAND_DISPLAY");
+        if (!display.isEmpty()) {
+            // X11 or XWayland present: xcb is the safe, mapping-reliable choice.
+            qputenv("QT_QPA_PLATFORM", QByteArray("xcb"));
+        } else if (!waylandDisplay.isEmpty()) {
+            // Pure Wayland, no X display: the static set has no wayland plugin and
+            // forcing xcb would abort. Try a non-aborting chain instead so we never
+            // hard-crash before showing anything: prefer wayland (if a system
+            // plugin happens to be discoverable), then xcb, then offscreen. Qt
+            // walks the semicolon list until one initialises.
+            qputenv("QT_QPA_PLATFORM", QByteArray("wayland;xcb;offscreen"));
+            // Last-resort visibility: if every GUI platform fails, the user still
+            // gets a line on stderr instead of a bare prompt. qWarning() routes to
+            // stderr and needs no extra include (QtGlobal/QDebug via precompiled.h).
+            qWarning("ZclWallet: no X display found on a Wayland session. If the "
+                     "window does not appear, install XWayland (package "
+                     "'xorg-xwayland') and relaunch, or run with "
+                     "QT_QPA_PLATFORM=wayland.");
+        }
+        // else: neither DISPLAY nor WAYLAND_DISPLAY -> truly headless/no display.
+        // Leave Qt's probe alone; the offscreen fallback (if compiled in) or Qt's
+        // own error path handles it. Do not force xcb into an abort.
+    }
+#endif
+
     Application app;
     return app.main(argc, argv);
 }

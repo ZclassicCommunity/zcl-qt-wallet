@@ -39,6 +39,22 @@ public:
 
     void loadConnection();
 
+    // SELF-HEAL: manual-override entry point. Spun up fresh from MainWindow's
+    // always-reachable Help -> "Repair / Re-download blockchain…" action AFTER the
+    // running node has been stopped, so the user is never permanently stuck even
+    // once auto-heal has latched NEEDS_MANUAL. It reuses the EXACT same staged
+    // offerCorruptionRepair() ladder used by the startup classifier — there is no
+    // second ladder.
+    void startManualRepair();
+
+    // RUNTIME STUB AUTO-HEAL discriminator (primary, robust stub-vs-real test): total
+    // bytes of the on-disk blocks/ store under `datadirRoot` (root, or testnet3/ when
+    // that holds the chain — same resolution as resolveDataSubdir()). Static so the
+    // runtime sync poller in RPC can call it with just the active connection's datadir.
+    // Returns -1 when blocks/ can't be located/measured; callers MUST treat -1 as
+    // "unknown" and NEVER heal on it. A fully-synced chain is ~10 GiB; a stub is tens of MB.
+    static qint64 blocksDirSizeBytes(const QString& datadirRoot);
+
 private:
     std::shared_ptr<ConnectionConfig> autoDetectZClassicConf();
     std::shared_ptr<ConnectionConfig> loadFromSettings();
@@ -63,6 +79,35 @@ private:
 
     void refreshZClassicdState(Connection* connection, std::function<void(void)> refused);
 
+    // PRE-EXISTING / FOREIGN-DAEMON edge. Reached ONLY from the getinfo-success path
+    // when ezclassicd == nullptr (a daemon we did NOT launch is already on the RPC port).
+    // CORRECTION (blocker #1): getbootstrapinfo presence is NOT a compatibility signal —
+    // it exists only in the freshly-built bundled daemon, and every released/healthy
+    // daemon returns RPC_METHOD_NOT_FOUND for it. So this method ALWAYS ATTACHES on a
+    // getinfo success; the getbootstrapinfo probe is ADVISORY only (it refreshes
+    // heal/daemonHasBootstrapRpc for richer warmup progress on BOTH callbacks) and NEVER
+    // blocks or refuses to attach. A genuinely stuck/peerless foreign node is handled at
+    // RUNTIME by the sync poller (rpc.cpp -> MainWindow::showForeignNodeStuck()).
+    void classifyForeignDaemon(Connection* connection);
+
+    // Bob-fix: drive a MOVING bootstrap-progress sub-status off getbootstrapinfo, which
+    // is WARMUP-EXEMPT (it answers DURING the multi-GB snapshot download/verify, when
+    // plain getinfo is still blocked -28). Fires one async getbootstrapinfo on the given
+    // Connection and, when it lands, maps phase/percent/verify_pending onto the splash:
+    //   phase=="active" + percent      -> "Step 3 of 3: Downloading blockchain — X%"
+    //   verify_pending / phase succeeded -> "Step 3 of 3: Verifying blockchain… (indeterminate)
+    // Callable from BOTH polling paths (the doAutoConnect connection-refused lambda and
+    // the getinfo -28 warmup branch) so the download/verify window is never a frozen line.
+    // DEGRADES GRACEFULLY: any error (older daemon -> RPC_METHOD_NOT_FOUND) is ADVISORY —
+    // it latches the tri-state cache and silently falls back to the caller's static text,
+    // never a blocker. Non-blocking: it does NOT change polling cadence and is safe to call
+    // every poll. Captures the shared ezAlive token so a late reply can't touch a freed
+    // loader. Returns immediately; the splash is updated when the reply arrives.
+    void probeBootstrapProgress(Connection* connection);
+    // Double-launch guard. True iff BOTH the RPC port (config->port) and the matching
+    // P2P port (8033 mainnet / 18033 testnet) on 127.0.0.1 are currently unbound.
+    bool portsFree(std::shared_ptr<ConnectionConfig> config);
+
     void showError(QString explanation);
     void showInformation(QString info, QString detail = "");
 
@@ -85,12 +130,107 @@ private:
 
     void    handleStartupFailure();                       // detect + classify + route
     bool    looksLikeDbCorruption(const QString& text);   // marker scan
+    // W4: true if `text` carries ANY marker handleStartupFailure() classifies on; lets
+    // us classify on THIS run's stderr alone and skip a stale debug.log tail.
+    bool    startupDiagHasMarker(const QString& text);
     QString readDebugLogTail(int maxBytes = 16384);        // read-only tail of debug.log
     void    offerCorruptionRepair();                       // staged repair ladder dialog
     void    relaunchForRepair(const QStringList& extraArgs);  // backup wallet, then relaunch once
     void    redownloadChain();                             // set blocks/chainstate aside, fetch fresh
     bool    backupWalletForRepair();                       // read+copy wallet.dat; never writes it
+
+    // SAFETY GATE for destructive heals: positively confirm NO embedded daemon is
+    // alive before mutating the datadir (renaming blocks/chainstate, salvaging
+    // wallet.dat). Polls/terminates/kills the QProcess this loader owns; for the
+    // manual path it also re-checks the RPC-owned node (which mainwindow stopped
+    // first). Returns false if a live daemon can't be confirmed dead — the caller
+    // must then ABORT and leave the datadir untouched.
+    bool    confirmDaemonDeadForRepair();
     QDir    resolveDataSubdir();                            // datadir root, or testnet3/ when it holds the chain
+
+    // SELF-HEAL classifier additions (all hang off the EXISTING two lifecycle
+    // owners — no new controller object). These run only A-side, while this
+    // ConnectionLoader still exists; B-side runtime healing stays in RPC.
+    //
+    // bounded-retry helpers backed by a QSettings ledger (heal/attempts.*).
+    // healAttempts()/bumpHealAttempt() centralise the per-edge counters so a
+    // hard-broken bundle/anchor/disk can never spin a heavy operation. A
+    // successful getinfo (doRPCSetConnection) resets the whole ledger.
+    int     healAttempts(const QString& edge);
+    void    bumpHealAttempt(const QString& edge);
+    bool    healInProgress();                              // global serialize guard
+    void    setHealInProgress(bool on);
+    void    latchNeedsManual(const QString& reason);       // terminal: stop auto-action, keep manual button
+    static void clearHealLedger();                          // wipe heal/* on a clean getinfo
+
+    // EXTRACT_FAILED edge: single-file build couldn't extract/verify its bundled
+    // daemon. Delete the stamp dir + .part and re-extract ONCE, else NEEDS_MANUAL.
+    void    retryExtractionOnce(const QString& diag);
+
+    // WARMUP_WEDGED watchdog (A-side). Fires ONLY when the node is alive, stuck on
+    // an RPC -28 warmup string whose status + percent have not advanced for a long
+    // stretch, and NOT during an active bootstrap-snapshot download. Offers a CLEAN
+    // restart (not a heal): the daemon resumes from its persisted index.
+    void    handleWarmupWedged();
+    QString ezLastWarmupStatus;                            // last seen -28 message
+    int     ezLastWarmupPct = -1;                          // last parsed % (or -1)
+    QElapsedTimer ezWarmupNoProgress;                      // since status/% last changed
+
+    // W1: the WARMUP_WEDGED watchdog must NEVER fire while the CURRENT launch is an
+    // expected-to-be-long REPAIR relaunch (-reindex / -reindex-chainstate rebuild the
+    // chain DB; the post-redownload fresh start re-validates a freshly fetched chain).
+    // Those legitimately sit on a percent-less "Verifying blocks..." / "Activating best
+    // chain..." far past the 180s no-progress threshold, so the watchdog would KILL the
+    // very repair it just launched (then NEEDS_MANUAL). Set in relaunchForRepair()/
+    // redownloadChain(); consulted in the watchdog fire condition. Cleared on a clean
+    // RPC (doRPCSetConnection) so a later non-repair run re-arms the watchdog.
+    bool    ezRepairRelaunchActive = false;
+
+    // USER-QUIT-DURING-SPLASH guard. While the ApplicationModal connect dialog 'd'
+    // is up (slow pre-connect startup), the main window's WM-close is swallowed by
+    // the modal grab, so a genuine user dismiss of 'd' (title-bar X / Esc) is the
+    // only quit gesture available. We hook d's rejected() (loadConnection) to stop
+    // the loader-owned embedded node and qApp->quit(). This flag is set true ONLY
+    // around the single programmatic close that also reaches reject() (showError's
+    // d->close()), so that code-driven abort does NOT quit the app. done(Accepted)
+    // (success) and every d->hide() never emit rejected(), so they need no guard.
+    bool        ezProgrammaticClose = false;
+
+    // True for any warmup status that is a known long, percent-less phase during which
+    // the watchdog must stay quiet even on a NORMAL (non-repair) start.
+    static bool isLongWarmupPhase(const QString& status);
+
+    // W2: ConnectionLoader is NOT a QObject, so QPointer can't guard async callbacks.
+    // doRPCSetConnection() runs 'delete this' while a getbootstrapinfo probe may still
+    // be in flight on the Connection (which OUTLIVES the loader — it is handed to rpc).
+    // A shared 'alive' token, captured by value into the probe lambda, lets the callback
+    // detect that the loader was destroyed (use_count drops to 1 / the bool is false)
+    // and bail before touching any freed member. Reset/destroyed in the destructor.
+    std::shared_ptr<bool> ezAlive = std::make_shared<bool>(true);
+
+    // Optional getbootstrapinfo enrichment: tri-state cache so an old daemon is
+    // probed at most once. -1 unknown, 0 absent, 1 present.
+    int     ezBootstrapRpcProbed = -1;
+
+    // Edit #2 (blocker #2): bounded counter for the getinfo error handler's CATCH-ALL
+    // branch (any QNetworkReply error not otherwise handled, incl. an InternalServerError
+    // whose body did not parse). For the first kMaxUnexpectedErrPolls polls we re-schedule
+    // silently (transient/odd warmup states recover); past that we surface the actionable
+    // retry instead of dead-ending at a frozen connect dialog. Reset on any healthy getinfo.
+    int     ezUnexpectedErrPolls = 0;
+
+    // G7: cache of the most recent getbootstrapinfo poll, so the WARMUP_WEDGED
+    // watchdog can suppress itself during a multi-MINUTE post-bootstrap UTXO verify
+    // (which shows a FROZEN "Verifying blocks..." status with no percent). Relying on
+    // the "Bootstrap snapshot:" substring alone would let the watchdog kill a healthy
+    // node mid-verify. Suppress whenever phase is active/succeeded, verify_pending is
+    // true, or the validation state begins with "provisional".
+    QString ezBootstrapPhase;                              // last getbootstrapinfo "phase"
+    bool    ezBootstrapVerifyPending = false;              // last getbootstrapinfo "verify_pending"
+    QString ezBootstrapValidationState;                    // bootstrap_validation/validation "state"
+    // True iff the cached state means "the daemon is busy with bootstrap/verify and a
+    // frozen warmup string is EXPECTED" — computed where the cache is updated.
+    bool    bootstrapSuppressesWedge() const;
 
     // Single-file release support: when no sibling daemon ships next to the GUI,
     // the node is appended to our OWN executable (GUI | daemon | sha256 | len | magic).

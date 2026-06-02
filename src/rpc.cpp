@@ -5,7 +5,9 @@
 #include "senttxstore.h"
 #include "turnstile.h"
 #include "version.h"
-#include "websockets.h"
+
+#include <QEventLoop>
+#include <QElapsedTimer>
 
 using json = nlohmann::json;
 
@@ -94,8 +96,12 @@ void RPC::setEZClassicd(QProcess* p) {
     if (p != nullptr) {
         // F1: adopting/starting a node clears the deliberate-shutdown latch so a
         // later crash is actually treated as a crash (the latch is set only at the
-        // top of shutdownZClassicd()).
+        // top of shutdownZClassicd()). Also clear the shutdown re-entrancy latch:
+        // adopting a fresh live node means any prior shutdown is fully done, so a
+        // future Quit must be able to run again (the latch only serializes within
+        // one shutdown, it must NOT persist for the process lifetime).
         ezExpectedShutdown = false;
+        ezShuttingDown     = false;
         ezCrashConn = QObject::connect(p, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
                          main, [this](int code, QProcess::ExitStatus st) {
             handleEZClassicdCrash(code, st);
@@ -797,6 +803,32 @@ void RPC::getInfoThenRefresh(bool force) {
             Settings::getInstance()->setSyncing(isSyncing);
             Settings::getInstance()->setBlockNumber(blockNumber);
 
+            // G6: clear the warmup-wedge cap (heal/attempts.warmupRestart) only on
+            // SUSTAINED health, never on the first getinfo (clearHealLedger leaves it
+            // alone). Reaching getblockchaininfo here already means the node is well
+            // past warmup; require several consecutive such polls (or being fully
+            // synced) so an OSCILLATING node — one good poll then re-wedge — never
+            // resets the counter and is allowed to escalate to NEEDS_MANUAL. Clear at
+            // most once per session to avoid hammering QSettings every poll.
+            if (!ezWarmupWedgeCleared) {
+                ezHealthyPolls++;
+                if (ezHealthyPolls >= 3 || !isSyncing) {
+                    QSettings().remove("heal/attempts.warmupRestart");
+                    ezWarmupWedgeCleared = true;
+                }
+            }
+
+            // RUNTIME STUB AUTO-HEAL cooldown reset: the persisted per-install cap
+            // (rpc/stubHeal.count) only exists to stop a genuinely peerless host from
+            // looping wipe -> rebootstrap -> wipe. The moment we have ANY peers the
+            // network is reachable, so a fresh stub later is allowed to auto-heal again
+            // -- clear the cap. Guard with a once-per-session latch so we don't hammer
+            // QSettings every poll, and only when peers are present.
+            if (connections > 0 && !ezStubHealCooldownCleared) {
+                QSettings().remove("rpc/stubHeal.count");
+                ezStubHealCooldownCleared = true;
+            }
+
             // P0-6: update the prominent sync banner on the Balance/main tab so
             // a non-technical user always sees Syncing %/ETA vs. "Synced — Ready".
             // progress<0 / target==0 signals "indeterminate" to setSyncStatus.
@@ -807,10 +839,84 @@ void RPC::getInfoThenRefresh(bool force) {
             // shouldn't flip it. Require ~3 consecutive peerless polls (~15s at the
             // 5s sync cadence); a single peer resets the counter instantly.
             if (connections == 0) ezNoPeerPolls++; else ezNoPeerPolls = 0;
-            if (isSyncing && connections == 0 && ezNoPeerPolls >= 3)
-                main->setSyncStatusWaitingForPeers();
-            else
+            if (isSyncing && connections == 0 && ezNoPeerPolls >= 3) {
+                // RUNTIME STUB AUTO-HEAL: a node that STARTED FINE but loaded a tiny
+                // non-genesis "stub" chain (e.g. an aborted P2P sync left ~17MB of
+                // blocks/) and then can't find peers would otherwise sit on "waiting
+                // for peers" forever — the startup/manual heals never reach this
+                // healthy-but-stuck runtime state. Detect it here and route into the
+                // SAME redownloadChain() ladder the manual Help -> Repair uses (one
+                // destructive path). Fires ONLY when ALL of these conservative
+                // conditions hold (see maybeAutoHealStubChain): peerless for a clear
+                // margin past the banner, the on-disk blocks/ is unambiguously a stub
+                // (< 1 GiB hard floor), and we haven't already auto-healed this run /
+                // exhausted the persisted cooldown. Checked BEFORE the banner so the
+                // heal's own status takes over; if it doesn't fire, fall through to the
+                // existing waiting-for-peers banner (and the always-reachable manual
+                // Help -> Repair). It returns true ONLY when it actually launched a heal.
+                if (maybeAutoHealStubChain(connections)) {
+                    // Heal launched: it stops this node and drives a fresh loader; the
+                    // heal owns the UI now. Don't also paint the peerless banner.
+                } else
+                // EDIT #6 (bob-fix): a FOREIGN node (one we did NOT launch — ezclassicd ==
+                // nullptr, i.e. a pre-existing systemd/manual/leftover or external daemon)
+                // that has been peerless/stuck for a sustained window (the same ~3min
+                // long-stretch threshold the banner uses, so there are NO false positives
+                // during the brief startup 0-peer moment or legitimate IBD WITH peers)
+                // cannot be healed by this wallet — we only manage a node we start. Surface
+                // the actionable, persistent dialog EXACTLY ONCE (guarded) instead of a
+                // silent forever-"waiting for peers". An OWNED embedded node (ezclassicd !=
+                // nullptr — it self-heals at its own startup and has bootstrap peers, so it
+                // is not peerless) NEVER reaches this branch; a foreign node WITH peers /
+                // syncing/synced never enters this peerless block at all (case C).
+                if (ezclassicd == nullptr && ezNoPeerPolls >= 36 && !ezForeignStuckShown) {
+                    ezForeignStuckShown = true;
+                    main->logger->write("Foreign node peerless/stuck past sustained window; "
+                                        "surfacing actionable dialog (cannot heal a node we "
+                                        "did not start)");
+                    main->setSyncStatusWaitingForPeers(true);
+                    main->showForeignNodeStuck();
+                } else
+                // SELF-HEAL SYNCED-ZERO-PEERS: after a LONG peerless stretch (~3min at
+                // the sync cadence) escalate the wording to point at the network. This
+                // is NOT a wipe/re-bootstrap — the daemon owns peer discovery.
+                if (ezNoPeerPolls >= 36)
+                    main->setSyncStatusWaitingForPeers(true);
+                else
+                    main->setSyncStatusWaitingForPeers();
+            } else {
                 main->setSyncStatus(isSyncing, blockNumber, target, progress);
+            }
+
+            // SELF-HEAL runtime validation surfacing (B-side). A newer daemon reports a
+            // bootstrap_validation object once past warmup; surface it as a NON-BLOCKING
+            // banner. We NEVER force a wipe here — the daemon owns its own re-validation
+            // / background reindex. Purely additive; the headers-vs-progress sync logic
+            // above is untouched (the "stuck at 96%" invariant is preserved). Absent on
+            // an older daemon -> no banner, no behaviour change.
+            if (reply.find("bootstrap_validation") != reply.end() &&
+                reply["bootstrap_validation"].is_object()) {
+                const json& bv = reply["bootstrap_validation"];
+                QString vstate;
+                if (bv.find("state") != bv.end() && bv["state"].is_string())
+                    vstate = QString::fromStdString(bv["state"].get<std::string>());
+                if (vstate == "provisional" || vstate == "provisional_pruned") {
+                    QString msg = QObject::tr("Verifying the downloaded blockchain — please don't "
+                        "spend yet.");
+                    if (vstate == "provisional_pruned")
+                        msg = msg % " " % QObject::tr("(For a full re-check, re-download the "
+                            "blockchain from the Help menu.)");
+                    main->setBootstrapValidationBanner(msg);
+                } else if (vstate == "failed") {
+                    // Daemon self-heals on next restart; just inform, never wipe.
+                    main->setBootstrapValidationBanner(QObject::tr("A quick blockchain re-check will "
+                        "run automatically the next time you open ZClassic. Your wallet and coins "
+                        "are safe."));
+                } else {
+                    // "validated" / "disabled" / unknown: clear any prior banner.
+                    main->setBootstrapValidationBanner(QString());
+                }
+            }
 
             // Update zclassicd tab if it exists
             if (ezclassicd) {
@@ -967,8 +1073,6 @@ void RPC::refreshBalances() {
         auto balT      = QString::fromStdString(reply["transparent"]).toDouble();
         auto balZ      = QString::fromStdString(reply["private"]).toDouble();
         auto balTotal  = QString::fromStdString(reply["total"]).toDouble();
-
-        AppDataModel::getInstance()->setBalances(balT, balZ);
 
         ui->balSheilded   ->setText(Settings::getZCLDisplayFormat(balZ));
         ui->balTransparent->setText(Settings::getZCLDisplayFormat(balT));
@@ -1281,15 +1385,15 @@ void RPC::refreshZCLPrice() {
 
         try {
             if (reply->error() != QNetworkReply::NoError) {
-                auto parsed = json::parse(reply->readAll(), nullptr, false);
-                if (!parsed.is_discarded() && !parsed["error"]["message"].is_null()) {
-                    qDebug() << QString::fromStdString(parsed["error"]["message"]);    
-                } else {
-                    qDebug() << reply->errorString();
-                }
+                // Price lookup is best-effort and non-critical. The legacy public price
+                // endpoint frequently rejects unauthenticated requests (HTTP 403
+                // Forbidden); that is EXPECTED and must NOT spam the user's terminal with
+                // a scary "Error transferring ... server replied: Forbidden" line that
+                // makes a perfectly healthy wallet look broken. Silently fall back to a
+                // 0 price (the UI simply omits the fiat value).
                 Settings::getInstance()->setZCLPrice(0);
                 return;
-            } 
+            }
 
             auto all = reply->readAll();
             
@@ -1319,13 +1423,22 @@ void RPC::refreshZCLPrice() {
 }
 
 void RPC::shutdownZClassicd() {
+    // Re-entrancy guard: the wait below spins a nested event loop while the main
+    // window is still live, so a second Quit / window-close could otherwise re-enter
+    // here and stack another loop. Once we're shutting down, ignore repeats.
+    if (ezShuttingDown)
+        return;
+    ezShuttingDown = true;
+
     // Mark this as a deliberate shutdown so the finished handler treats the node
     // exiting as normal instead of offering a crash-restart.
     ezExpectedShutdown = true;
 
     // Shutdown embedded zclassicd if it was started
     if (ezclassicd == nullptr || ezclassicd->processId() == 0 || conn == nullptr) {
-        // No zclassicd running internally, just return
+        // No zclassicd running internally, just return. Clear the re-entrancy latch
+        // so this never stays armed for the process lifetime.
+        ezShuttingDown = false;
         return;
     }
 
@@ -1338,6 +1451,11 @@ void RPC::shutdownZClassicd() {
     conn->doRPCWithDefaultErrorHandling(payload, [=](auto) {});
     conn->shutdown();
 
+    // Wait for the embedded zclassicd to finish flushing its state and exit, but
+    // keep quitting snappy: poll frequently (not once a second) and don't add any
+    // artificial trailing delay. The "please wait" dialog is only surfaced if the
+    // node is actually taking a moment, so a fast shutdown feels instant instead
+    // of always costing a couple of seconds.
     QDialog d(main);
     Ui_ConnectionDialog connD;
     connD.setupUi(&d);
@@ -1345,96 +1463,173 @@ void RPC::shutdownZClassicd() {
     connD.status->setText(QObject::tr("Please wait for ZclWallet to exit"));
     connD.statusDetail->setText(QObject::tr("Waiting for zclassicd to exit"));
 
-    QTimer waiter(main);
+    QElapsedTimer elapsed;
+    elapsed.start();
 
-    // We capture by reference all the local variables because of the d.exec() 
-    // below, which blocks this function until we exit. 
-    int waitCount = 0;
-    QObject::connect(&waiter, &QTimer::timeout, [&] () {
-        waitCount++;
+    // True once the node is gone (or there's nothing for us to wait on, or we've
+    // hit the hard cap so quitting can never hang).
+    auto fnEnded = [&]() -> bool {
+        return ezclassicd->state() == QProcess::NotRunning
+            || ezclassicd->processId() == 0
+            || conn->config->zclassicDaemon       // external daemon: we don't own its lifetime
+            || elapsed.hasExpired(30000);          // hard cap (ms) so Quit never wedges
+    };
 
-        if ((ezclassicd->atEnd() && ezclassicd->processId() == 0) ||
-            waitCount > 30 || 
-            conn->config->zclassicDaemon)  {   // If zclassicd is daemon, then we don't have to do anything else
-            qDebug() << "Ended";
-            waiter.stop();
-            QTimer::singleShot(1000, [&]() { d.accept(); });
-        } else {
-            qDebug() << "Not ended, continuing to wait...";
-        }
-    });
-    waiter.start(1000);
-
-    // Wait for the zclassic process to exit.
-    if (!Settings::getInstance()->isHeadless()) {
-        d.exec(); 
-    } else {
-        while (waiter.isActive()) {
-            QCoreApplication::processEvents();
-
-            QThread::sleep(1);
-        }
+    if (fnEnded()) {
+        ezShuttingDown = false;   // release the re-entrancy latch; this shutdown is done
+        return;     // already gone -- exit immediately, no dialog, no wait loop
     }
-}
 
-
-// Fetch the Z-board topics list
-void RPC::getZboardTopics(std::function<void(QMap<QString, QString>)> cb) {
-    if (conn == nullptr)
-        return noConnection();
-
-    QUrl cmcURL("http://z-board.net/listTopics");
-
-    QNetworkRequest req;
-    req.setUrl(cmcURL);
-
-    QNetworkReply *reply = conn->restclient->get(req);
-
-    QObject::connect(reply, &QNetworkReply::finished, [=] {
-        reply->deleteLater();
-
-        try {
-            if (reply->error() != QNetworkReply::NoError) {
-                auto parsed = json::parse(reply->readAll(), nullptr, false);
-                if (!parsed.is_discarded() && !parsed["error"]["message"].is_null()) {
-                    qDebug() << QString::fromStdString(parsed["error"]["message"]);
-                }
-                else {
-                    qDebug() << reply->errorString();
-                }
-                return;
-            }
-
-            auto all = reply->readAll();
-
-            auto parsed = json::parse(all, nullptr, false);
-            if (parsed.is_discarded()) {
-                return;
-            }
-
-            QMap<QString, QString> topics;
-            for (const json& item : parsed["topics"].get<json::array_t>()) {
-                if (item.find("addr") == item.end() || item.find("topicName") == item.end())
-                    return;
-
-                QString addr  = QString::fromStdString(item["addr"].get<json::string_t>());
-                QString topic = QString::fromStdString(item["topicName"].get<json::string_t>());
-                
-                topics.insert(topic, addr);
-            }
-
-            cb(topics);
-        }
-        catch (...) {
-            // If anything at all goes wrong, just set the price to 0 and move on.
-            qDebug() << QString("Caught something nasty");
+    QEventLoop loop;
+    QTimer     waiter(main);
+    QObject::connect(&waiter, &QTimer::timeout, [&]() {
+        if (fnEnded()) {
+            waiter.stop();
+            loop.quit();
         }
     });
+    waiter.start(150);
+
+    // Only pop the wait dialog if the shutdown hasn't completed promptly, so quick
+    // exits never flash a dialog. Once shown it's modal (blocks the main window) the
+    // way the old always-modal d.exec() was.
+    QTimer::singleShot(700, &d, [&]() {
+        if (waiter.isActive() && !Settings::getInstance()->isHeadless()) {
+            d.setModal(true);
+            d.show();
+        }
+    });
+
+    if (!Settings::getInstance()->isHeadless()) {
+        loop.exec();
+    } else {
+        while (!fnEnded()) {
+            QCoreApplication::processEvents();
+            QThread::msleep(100);
+        }
+        waiter.stop();
+    }
+
+    d.hide();
+
+    // Release the re-entrancy latch now this shutdown has unwound. It serializes
+    // re-entrancy WITHIN one shutdown only; it must never latch for the process
+    // lifetime (a later restart + Quit must be able to run shutdown again).
+    ezShuttingDown = false;
 }
 
-/** 
+// SAFETY GATE for the manual Help -> Repair path. shutdownZClassicd() above is
+// allowed to return on a 30s soft cap so Quit never wedges — that means "quit
+// promptly", NOT "confirmed exited". Before any datadir mutation we must POSITIVELY
+// confirm the embedded node is gone, so terminate()/kill() it and poll its state.
+// RUNTIME STUB AUTO-HEAL evaluator. See the header for the full ALL-of trigger. Every
+// branch here is a guard that must pass; the destructive work itself is delegated to
+// MainWindow::autoHealStubChain() -> launchBlockchainRepair() -> redownloadChain(),
+// which keeps all of redownloadChain()'s existing safety guards (daemon-dead confirm,
+// wallet.dat backup, ~15 GB disk floor, reversible set-aside) and the heal ledger.
+bool RPC::maybeAutoHealStubChain(int connections) {
+    // DISABLED 2026-06-01 — superseded by the daemon-side abandoned-stub auto-recovery
+    // (zclassicd re-bootstraps a far-below-anchor stub on startup, with a churn guard and
+    // backup/restore). That path is testable headless and avoids the two HIGH hazards an
+    // adversarial review found in this runtime heuristic: (a) it actually routed to the
+    // INTERACTIVE repair dialog whose default (-reindex-chainstate) is a no-op for a stub,
+    // and (b) it could set aside a legitimately-still-syncing small chain (a fresh node at
+    // 0 peers from dead DNS seeds). We intentionally never fire here; the ordinary
+    // "waiting for peers" banner below handles this state in the GUI.
+    return false;
+    // (1) Peerless margin: require a clear stretch beyond the ~15s banner debounce —
+    // 12 polls is ~60s at the 5s syncing cadence (a syncing node uses quickUpdateSpeed).
+    if (connections != 0 || ezNoPeerPolls < 12)
+        return false;
+
+    // (3a) Once per process: never launch more than one re-download per app run.
+    if (ezStubAutoHealTried)
+        return false;
+
+    // Don't race a startup/watchdog heal that is already mid-flight (the heal ledger
+    // serialize guard). MainWindow::autoHealStubChain re-checks this too; check early
+    // so we don't even measure/log when a heal is already running.
+    if (QSettings().value("heal/inProgress", false).toBool())
+        return false;
+
+    // We must own the node we'd wipe. An external daemon (its lifetime isn't ours) or a
+    // not-yet-known connection is out of scope — only an embedded node we started.
+    if (conn == nullptr || conn->config == nullptr || conn->config->zclassicDaemon)
+        return false;
+    if (!isEmbedded())   // ezclassicd == nullptr: no embedded node we own
+        return false;
+
+    // (2) Stub discriminator (PRIMARY, robust): the on-disk blocks/ store must be
+    // unambiguously small. A fully-synced chain is ~10 GiB; an aborted-P2P stub is tens
+    // of MB. Use a hard 1 GiB floor. CRITICAL SAFETY INVARIANT: a large blocks/ means a
+    // real (possibly fully-synced) chain that is merely OFFLINE — NEVER wipe it; only
+    // the banner applies. blocksDirSizeBytes() returns -1 when it can't measure, which
+    // we treat as "unknown" and DO NOT heal on (fail safe -> keep the chain).
+    const qint64 kStubFloor = (qint64)1024 * 1024 * 1024;   // 1 GiB hard floor
+    qint64 blocksBytes = ConnectionLoader::blocksDirSizeBytes(conn->config->zclassicDir);
+    if (blocksBytes < 0) {
+        main->logger->write("stub-auto-heal: blocks/ size unknown; not healing (fail-safe)");
+        return false;
+    }
+    if (blocksBytes >= kStubFloor)
+        return false;   // real chain, just offline -> keep it, banner only
+
+    // (3b) Persisted per-install cooldown: a genuinely peerless environment (e.g. a
+    // firewalled host that can never reach the network) must not loop wipe -> rebootstrap
+    // -> stub -> wipe forever. Cap the number of auto re-downloads per install; once the
+    // cap is hit, fall back to the banner + the always-reachable Help -> Repair. Counted
+    // here BEFORE launching so a crash mid-heal still consumes one attempt. The count is
+    // reset on a clean, peered sync (clearStubHealCooldown, called once we have peers).
+    QSettings s;
+    const int kMaxAutoHeals = 2;
+    int prior = s.value("rpc/stubHeal.count", 0).toInt();
+    if (prior >= kMaxAutoHeals) {
+        main->logger->write(QString("stub-auto-heal: per-install cap reached (%1); "
+            "leaving the manual Help -> Repair as the path").arg(prior));
+        // Latch the per-process guard too so we stop re-evaluating every poll this run.
+        ezStubAutoHealTried = true;
+        return false;
+    }
+
+    // All guards passed: commit the attempt counters, then launch the SHARED heal path.
+    ezStubAutoHealTried = true;
+    s.setValue("rpc/stubHeal.count", prior + 1);
+    s.sync();
+    main->logger->write(QString("stub-auto-heal: launching re-download (blocks/=%1 MB, "
+        "noPeerPolls=%2, attempt %3/%4)")
+        .arg(blocksBytes / 1024.0 / 1024.0, 0, 'f', 1)
+        .arg(ezNoPeerPolls).arg(prior + 1).arg(kMaxAutoHeals));
+
+    main->autoHealStubChain();
+    return true;
+}
+
+bool RPC::confirmEmbeddedStopped() {
+    // No embedded node we own (e.g. an external daemon, which has ezclassicd==nullptr,
+    // or already torn down): nothing of ours can be holding the datadir open.
+    if (ezclassicd == nullptr)
+        return true;
+
+    if (ezclassicd->state() == QProcess::NotRunning || ezclassicd->processId() == 0)
+        return true;
+
+    // Still alive after the polite RPC 'stop': ask it to terminate, then escalate.
+    ezExpectedShutdown = true;   // a forced stop here is deliberate, not a crash
+    ezclassicd->terminate();
+    ezclassicd->waitForFinished(5000);
+    if (ezclassicd->state() != QProcess::NotRunning) {
+        ezclassicd->kill();
+        ezclassicd->waitForFinished(5000);
+    }
+
+    return ezclassicd->state() == QProcess::NotRunning;
+}
+
+
+
+/**
  * Get a Sapling address from the user's wallet
- */ 
+ */
 QString RPC::getDefaultSaplingAddress() {
     for (QString addr: *zaddresses) {
         if (Settings::getInstance()->isSaplingAddress(addr))
