@@ -73,6 +73,11 @@ public:
     // longStretch=true after a LONG peerless stretch (~3min): adds a stronger
     // "check your internet / try again later" hint (SELF-HEAL SYNCED-ZERO-PEERS).
     void setSyncStatusWaitingForPeers(bool longStretch = false);
+    // Bootstrap snapshot download in progress (getbootstrapinfo phase==active): show a
+    // determinate "Downloading blockchain snapshot — X%" (with GB + MB/s when known)
+    // instead of the misleading "waiting for peers" -- the node is actively
+    // downloading, not stuck (it reports 0 normal P2P peers during this phase).
+    void setSyncStatusBootstrapSnapshot(int pct, qint64 received, qint64 total, double mbps);
 
     // SELF-HEAL (B-side) runtime validation surfacing. Non-blocking informational
     // banner reusing the existing syncBanner widget; empty string clears it. Set

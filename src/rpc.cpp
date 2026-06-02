@@ -854,6 +854,20 @@ void RPC::getInfoThenRefresh(bool force) {
                 // heal's own status takes over; if it doesn't fire, fall through to the
                 // existing waiting-for-peers banner (and the always-reachable manual
                 // Help -> Repair). It returns true ONLY when it actually launched a heal.
+                // SNAPSHOT-DOWNLOAD precedence: keep the getbootstrapinfo cache fresh
+                // (async, warmup-EXEMPT) and, if the node is actively downloading the
+                // bootstrap snapshot, show REAL progress instead of "waiting for peers"
+                // -- and SKIP the stub-heal/wipe. A live snapshot download has 0 normal
+                // P2P peers and a small-but-growing blocks/ dir, which would otherwise
+                // look exactly like an abandoned stub; healing it here would wipe an
+                // in-flight 10 GB download. The cache is ~1 poll stale, which is fine:
+                // the heal only fires at ezNoPeerPolls>=12 (~60s), by which point an
+                // active download has populated it.
+                pollBootstrapSnapshotStatus();
+                if (ezBootstrapActive) {
+                    main->setSyncStatusBootstrapSnapshot(ezBootstrapPct, ezBootstrapRecv,
+                                                         ezBootstrapTotal, ezBootstrapMbps);
+                } else
                 if (maybeAutoHealStubChain(connections)) {
                     // Heal launched: it stops this node and drives a fresh loader; the
                     // heal owns the UI now. Don't also paint the peerless banner.
@@ -1420,6 +1434,52 @@ void RPC::refreshZCLPrice() {
         // If nothing, then set the price to 0;
         Settings::getInstance()->setZCLPrice(0);
     });
+}
+
+// Async getbootstrapinfo poll (warmup-EXEMPT RPC) -> refresh the ezBootstrap* cache.
+// Fired from the peerless path (connections==0) so an in-progress bootstrap-snapshot
+// download is surfaced as real progress instead of "waiting for peers", and so the
+// stub auto-heal never mistakes a live download for an abandoned stub and wipes it.
+// RPC outlives every reply (it is main->rpc for the app lifetime), so capturing `this`
+// here is safe -- no alive-token needed (unlike ConnectionLoader's pre-connect probe).
+void RPC::pollBootstrapSnapshotStatus() {
+    if (conn == nullptr) return;
+    json payload = {
+        {"jsonrpc", "1.0"},
+        {"id", "someid"},
+        {"method", "getbootstrapinfo"}
+    };
+    conn->doRPC(payload,
+        [=] (json bi) {
+            bool   active = false;
+            int    pct    = 0;
+            qint64 recv   = 0, total = 0;
+            double mbps   = 0.0;
+            if (bi.is_object() &&
+                bi.find("phase") != bi.end() && bi["phase"].is_string() &&
+                bi["phase"].get<std::string>() == "active") {
+                active = true;
+                // percent / bytes_* / mbps are present ONLY when phase=="active".
+                if (bi.find("percent") != bi.end() && bi["percent"].is_number())
+                    pct = bi["percent"].get<int>();
+                if (bi.find("bytes_received") != bi.end() && bi["bytes_received"].is_number())
+                    recv = (qint64) bi["bytes_received"].get<double>();
+                if (bi.find("bytes_total") != bi.end() && bi["bytes_total"].is_number())
+                    total = (qint64) bi["bytes_total"].get<double>();
+                if (bi.find("mbps") != bi.end() && bi["mbps"].is_number())
+                    mbps = bi["mbps"].get<double>();
+            }
+            ezBootstrapActive = active;
+            ezBootstrapPct    = pct;
+            ezBootstrapRecv   = recv;
+            ezBootstrapTotal  = total;
+            ezBootstrapMbps   = mbps;
+        },
+        [=] (auto, auto) {
+            // getbootstrapinfo absent (older daemon) or a transient error -> assume the
+            // node is NOT actively snapshotting; the existing peers/heal logic owns it.
+            ezBootstrapActive = false;
+        });
 }
 
 void RPC::shutdownZClassicd() {

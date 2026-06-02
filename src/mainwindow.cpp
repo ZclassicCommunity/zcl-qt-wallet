@@ -685,6 +685,31 @@ void MainWindow::setSyncStatusWaitingForPeers(bool longStretch) {
     syncBanner->setStyleSheet("QWidget { background-color: #d9822b; } QLabel { color: white; }");
 }
 
+// Bootstrap snapshot download in progress: show real determinate progress instead of
+// the misleading "waiting for peers". The node reports 0 normal P2P peers while it
+// downloads the snapshot, but it is actively working -- not stuck.
+void MainWindow::setSyncStatusBootstrapSnapshot(int pct, qint64 received, qint64 total, double mbps) {
+    if (syncBanner == nullptr) return;
+    syncEtaStarted = false;
+    if (pct < 0)   pct = 0;
+    if (pct > 100) pct = 100;
+    syncProgressBar->setVisible(true);
+    syncProgressBar->setRange(0, 100);
+    syncProgressBar->setValue(pct);
+
+    QString detail;
+    if (total > 0) {
+        const double gb = 1024.0 * 1024.0 * 1024.0;
+        detail = QString(" • ") % tr("%1 / %2 GB")
+            .arg(received / gb, 0, 'f', 1).arg(total / gb, 0, 'f', 1);
+    }
+    if (mbps > 0.0)
+        detail = detail % QString(" • ") % tr("%1 MB/s").arg(mbps, 0, 'f', 1);
+
+    syncStatusLabel->setText(tr("Downloading blockchain snapshot… %1%").arg(pct) % detail);
+    syncBanner->setStyleSheet("QWidget { background-color: #d9822b; } QLabel { color: white; }");
+}
+
 // SELF-HEAL (B-side): non-blocking validation banner. An empty message clears it
 // (the next sync poll repaints the normal state). A non-empty message overlays a
 // neutral-blue informational banner reusing the same syncBanner widget. It is

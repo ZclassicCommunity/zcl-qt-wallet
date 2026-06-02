@@ -51,7 +51,11 @@ if ! verify_archive; then
     exit 1
 fi
 
-if [ ! -d libsodium-1.0.16 ]; then
+# Re-extract if the source dir is absent OR a prior run left it INCOMPLETE (e.g. an
+# interrupted extraction with no ./configure). A bare `[ ! -d ... ]` check would skip
+# extraction over such a stale dir and then fail at `./configure: No such file`.
+if [ ! -x libsodium-1.0.16/configure ]; then
+    rm -rf libsodium-1.0.16
     tar xf libsodium-1.0.16.tar.gz
 fi
 

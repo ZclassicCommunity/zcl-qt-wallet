@@ -130,6 +130,12 @@ private:
     // peerless banner for this tick).
     bool maybeAutoHealStubChain(int connections);
 
+    // Async getbootstrapinfo poll (warmup-EXEMPT) that refreshes the ezBootstrap*
+    // cache; fired from the peerless path so an in-progress bootstrap-snapshot
+    // download is shown as "Downloading blockchain snapshot — X%" instead of
+    // "waiting for peers", and so the stub-heal never wipes a live download.
+    void pollBootstrapSnapshotStatus();
+
     // Once-per-process latch so the runtime stub auto-heal launches at most one
     // re-download per app run; combined with the persisted cooldown below.
     bool                        ezStubAutoHealTried         = false;
@@ -173,6 +179,18 @@ private:
     // C9/F6: debounce the waiting-for-peers banner; a single connections==0 sample
     // shouldn't flip the banner. Counts consecutive peerless polls; reset on a peer.
     int                         ezNoPeerPolls               = 0;
+
+    // Cached getbootstrapinfo snapshot-download state (post-connect). A node mid
+    // bootstrap-snapshot download reports 0 normal P2P peers + warming RPC, which the
+    // peerless banner/heal would otherwise mislabel as "waiting for peers" (and could
+    // even wipe it as an abandoned stub). pollBootstrapSnapshotStatus() refreshes this
+    // async; the peerless path reads it so an active download shows real progress and
+    // is never healed.
+    bool                        ezBootstrapActive           = false;
+    int                         ezBootstrapPct              = 0;
+    qint64                      ezBootstrapRecv             = 0;
+    qint64                      ezBootstrapTotal            = 0;
+    double                      ezBootstrapMbps             = 0.0;
 
     // Edit #6 (bob-fix): once-per-run guard for MainWindow::showForeignNodeStuck(). The
     // poller fires that actionable dialog EXACTLY ONCE when an ATTACHED FOREIGN node
