@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <cmath>
+#include <memory>
 
 #include <QtGlobal>
 
@@ -56,7 +57,18 @@
 #include <QtNetwork/QNetworkRequest>
 #include <QtNetwork/QNetworkAccessManager>
 #include <QtNetwork/QNetworkReply>
-#include <QtWebSockets/QtWebSockets>
+#include <QCommandLineParser>
+#include <QCommandLineOption>
+// These QtCore classes used to reach the code transitively via the QtWebSockets
+// umbrella header (since removed); include them explicitly so every translation
+// unit sees a complete type regardless of compile order.
+#include <QThread>
+#include <QEventLoop>
+#include <QElapsedTimer>
+#include <QTextStream>
+#include <QStorageInfo>
+#include <QCryptographicHash>
+#include <QRegularExpression>
 #include <QJsonDocument>
 #include <QJsonArray>
 #include <QJsonObject>

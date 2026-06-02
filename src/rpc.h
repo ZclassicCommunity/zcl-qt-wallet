@@ -47,7 +47,6 @@ public:
     
     void checkForUpdate(bool silent = true);
     void refreshZCLPrice();
-    void getZboardTopics(std::function<void(QMap<QString, QString>)> cb);
 
     void executeTransaction(Tx tx, 
         const std::function<void(QString opid)> submitted,
@@ -77,6 +76,24 @@ public:
     void importTPrivKey(QString addr, bool rescan, const std::function<void(json)>& cb);
 
     void shutdownZClassicd();
+
+    // Called from QCoreApplication::aboutToQuit, i.e. on EVERY quit route -- window
+    // close, File->Exit, SIGINT, AND the macOS app-menu "Quit" / Cmd-Q, which calls
+    // QApplication::quit() directly and bypasses MainWindow::closeEvent()/
+    // shutdownZClassicd(). Marks the shutdown as expected and stops the pollers so the
+    // async RPC handlers never flash a spurious "error connecting to zclassicd" dialog
+    // while the embedded node is being torn down.
+    void onAboutToQuit();
+
+    // SAFETY GATE for the manual Help -> Repair path: positively confirm the
+    // RPC-owned embedded node is NOT running before any datadir mutation. Polls
+    // state(); if still alive, terminate() + waitForFinished, then escalate to
+    // kill() + waitForFinished. Returns true only when confirmed NotRunning (or
+    // there is no embedded node / it's an external daemon we don't own). The 30s
+    // soft cap in shutdownZClassicd() means "quit promptly", NOT "confirmed
+    // exited", so the repair path must call this before touching blocks/chainstate.
+    bool confirmEmbeddedStopped();
+
     void noConnection();
     bool isEmbedded() { return ezclassicd != nullptr; }
 
@@ -100,6 +117,40 @@ private:
 
     void getInfoThenRefresh(bool force);
 
+    // RUNTIME STUB AUTO-HEAL: evaluate (conservatively) whether the live node is a
+    // healthy-but-stuck STUB — it started fine, loaded a tiny non-genesis chain from an
+    // aborted P2P sync, and now finds 0 peers — and, if so, route into the SAME
+    // redownloadChain() ladder the manual Help -> Repair uses (via
+    // MainWindow::autoHealStubChain). Called from the getblockchaininfo sync poll only
+    // when (isSyncing && connections==0 && ezNoPeerPolls>=3). Fires ONLY when ALL hold:
+    //   (1) connections == 0 sustained well past the banner (ezNoPeerPolls >= 12, ~60s
+    //       at the 5s syncing cadence);
+    //   (2) the on-disk blocks/ store is unambiguously a STUB — its total size is below
+    //       a hard 1 GiB floor (a synced chain is ~10 GiB; a stub is tens of MB),
+    //       measured via ConnectionLoader::blocksDirSizeBytes from the active datadir.
+    //       A large blocks/ (a fully-synced node that is merely OFFLINE) is NEVER
+    //       wiped — that is the dangerous lookalike;
+    //   (3) it has NOT already auto-redownloaded this run (ezStubAutoHealTried) AND the
+    //       persisted per-install cooldown (rpc/stubHeal.count, capped) is not exhausted,
+    //       so a genuinely peerless environment can't loop wipe->rebootstrap->wipe.
+    // Never fires for an external daemon we don't own, or when blocks/ can't be measured.
+    // Returns true ONLY if it actually launched a heal (the caller then suppresses the
+    // peerless banner for this tick).
+    bool maybeAutoHealStubChain(int connections);
+
+    // Async getbootstrapinfo poll (warmup-EXEMPT) that refreshes the ezBootstrap*
+    // cache; fired from the peerless path so an in-progress bootstrap-snapshot
+    // download is shown as "Downloading blockchain snapshot — X%" instead of
+    // "waiting for peers", and so the stub-heal never wipes a live download.
+    void pollBootstrapSnapshotStatus();
+
+    // Once-per-process latch so the runtime stub auto-heal launches at most one
+    // re-download per app run; combined with the persisted cooldown below.
+    bool                        ezStubAutoHealTried         = false;
+    // Once-per-session latch for clearing the persisted per-install stub-heal cap on
+    // the first peered poll (so we don't rewrite QSettings every tick).
+    bool                        ezStubHealCooldownCleared   = false;
+
     void getBalance(const std::function<void(json)>& cb);
 
     void getTransparentUnspent  (const std::function<void(json)>& cb);
@@ -107,6 +158,64 @@ private:
     void getTransactions        (const std::function<void(json)>& cb);
     void getZAddresses          (const std::function<void(json)>& cb);
     void getTAddresses          (const std::function<void(json)>& cb);
+
+    // Runtime daemon-crash recovery: catch the embedded node dying at runtime
+    // (OOM/crash) and offer to restart it instead of stranding the user in a
+    // permanent "No Connection". ezExpectedShutdown gates the normal-shutdown
+    // path; ezRestartCount caps automatic restarts.
+    void handleEZClassicdCrash(int exitCode, QProcess::ExitStatus status);
+    void restartEmbeddedZClassicd();   // relaunch the dead node, stripping repair flags
+    bool                        ezExpectedShutdown          = false;
+    bool                        ezCrashDialogOpen           = false;
+    int                         ezRestartCount              = 0;
+    QMetaObject::Connection     ezCrashConn;
+
+    // Re-entrancy guard for shutdownZClassicd(): the shutdown wait spins a nested
+    // event loop (and the "please wait" dialog is non-modal for the first 700ms),
+    // so the main window stays live. This latch makes a second Quit / window-close
+    // during that window a no-op instead of stacking a second nested loop. It
+    // serializes re-entrancy WITHIN one shutdown only: it is cleared at every exit
+    // of shutdownZClassicd() and when setEZClassicd() adopts a fresh live node, so
+    // it never latches for the process lifetime (a later restart can shut down too).
+    bool                        ezShuttingDown              = false;
+
+    // C2/F5: once we've legitimately confirmed the chain tip (blocks>=headers with
+    // peers) this latch keeps us "synced" through brief peer drops so an established
+    // wallet doesn't flicker back to "syncing".
+    bool                        ezEverSynced                = false;
+
+    // C9/F6: debounce the waiting-for-peers banner; a single connections==0 sample
+    // shouldn't flip the banner. Counts consecutive peerless polls; reset on a peer.
+    int                         ezNoPeerPolls               = 0;
+
+    // Cached getbootstrapinfo snapshot-download state (post-connect). A node mid
+    // bootstrap-snapshot download reports 0 normal P2P peers + warming RPC, which the
+    // peerless banner/heal would otherwise mislabel as "waiting for peers" (and could
+    // even wipe it as an abandoned stub). pollBootstrapSnapshotStatus() refreshes this
+    // async; the peerless path reads it so an active download shows real progress and
+    // is never healed.
+    bool                        ezBootstrapActive           = false;
+    int                         ezBootstrapPct              = 0;
+    qint64                      ezBootstrapRecv             = 0;
+    qint64                      ezBootstrapTotal            = 0;
+    double                      ezBootstrapMbps             = 0.0;
+
+    // Edit #6 (bob-fix): once-per-run guard for MainWindow::showForeignNodeStuck(). The
+    // poller fires that actionable dialog EXACTLY ONCE when an ATTACHED FOREIGN node
+    // (ezclassicd == nullptr — NOT one we launched) has been peerless/stuck for a
+    // sustained window. An OWNED embedded node (it self-heals + has bootstrap peers) and a
+    // FOREIGN node that has peers / is syncing/synced NEVER trigger it. This bool keeps it
+    // from re-showing every poll.
+    bool                        ezForeignStuckShown         = false;
+
+    // G6: the warmup-wedge cap (heal/attempts.warmupRestart) must only be cleared by
+    // SUSTAINED health, never by one getinfo — otherwise a node that answers a single
+    // getinfo and then re-wedges would reset the counter forever and never escalate
+    // to NEEDS_MANUAL. clearHealLedger() (one getinfo) intentionally leaves
+    // warmupRestart alone; we clear it here only after several consecutive healthy
+    // sync polls OR after the chain tip has demonstrably advanced past warmup.
+    int                         ezHealthyPolls              = 0;
+    bool                        ezWarmupWedgeCleared        = false;
 
     Connection*                 conn                        = nullptr;
     QProcess*                   ezclassicd                     = nullptr;

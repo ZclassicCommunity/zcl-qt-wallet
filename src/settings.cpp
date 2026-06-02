@@ -284,6 +284,26 @@ void Settings::setSaveZtxs(bool save) {
     QSettings().setValue("options/savesenttx", save);
 }
 
+bool Settings::getKeepInTray() {
+    // Default OFF: closing the window stops the node, exactly as before.
+    return QSettings().value("options/keepintray", false).toBool();
+}
+
+void Settings::setKeepInTray(bool keep) {
+    QSettings().setValue("options/keepintray", keep);
+}
+
+bool Settings::getShowCachedBalance() {
+    // Default ON: paint the last-known balance instantly on startup so users don't
+    // stare at "syncing 0%". Independent of getSaveZtxs() so the privacy opt-out
+    // (don't store tx history) does not also disable the instant-balance paint.
+    return QSettings().value("options/showcachedbalance", true).toBool();
+}
+
+void Settings::setShowCachedBalance(bool show) {
+    QSettings().setValue("options/showcachedbalance", show);
+}
+
 void Settings::setPeers(int peers) {
     _peerConnections = peers;
 }

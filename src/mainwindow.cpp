@@ -3,9 +3,7 @@
 #include "ui_mainwindow.h"
 #include <QProgressBar>
 #include <QElapsedTimer>
-#include "ui_mobileappconnector.h"
 #include "ui_addressbook.h"
-#include "ui_zboard.h"
 #include "ui_privkey.h"
 #include "ui_about.h"
 #include "ui_settings.h"
@@ -18,7 +16,10 @@
 #include "turnstile.h"
 #include "senttxstore.h"
 #include "connection.h"
-#include "websockets.h"
+
+#include <QSystemTrayIcon>
+#include <QCloseEvent>
+#include <QtNetwork/QTcpSocket>
 
 using json = nlohmann::json;
 
@@ -29,17 +30,25 @@ MainWindow::MainWindow(QWidget *parent) :
     ui->setupUi(this);
     logger = new Logger(this, QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath("zcl-qt-wallet.log"));
 
+    // SELF-HEAL: a heal/inProgress flag seen at PROCESS STARTUP is necessarily stale —
+    // it's a persisted QSettings flag that a prior session set just before a deferred
+    // relaunch, and that session (and its live ConnectionLoader) is gone. Left set, it
+    // would make every handleStartupFailure() in this run bail at the in-progress
+    // guard and strand the modal connect dialog. Clear it ONCE here, before the first
+    // ConnectionLoader is created, so a fresh run can classify+heal normally. This
+    // runs before rpc = new RPC(this) below (whose loadConnection() is deferred).
+    QSettings().setValue("heal/inProgress", false);
+
     // Status Bar
     setupStatusBar();
     
     // Settings editor 
     setupSettingsModal();
 
-    // Set up exit action
-    QObject::connect(ui->actionExit, &QAction::triggered, this, &MainWindow::close);
-
-    // Set up donate action
-    QObject::connect(ui->actionDonate, &QAction::triggered, this, &MainWindow::donate);
+    // Set up exit action. Use quitApp() (not close()) so that in tray-resident
+    // mode File -> Exit really quits and cleanly stops the node, rather than
+    // just hiding the window to the tray.
+    QObject::connect(ui->actionExit, &QAction::triggered, this, &MainWindow::quitApp);
 
     // Set up check for updates action
     QObject::connect(ui->actionCheck_for_Updates, &QAction::triggered, [=] () {
@@ -64,17 +73,6 @@ MainWindow::MainWindow(QWidget *parent) :
     // Export transactions
     QObject::connect(ui->actionExport_transactions, &QAction::triggered, this, &MainWindow::exportTransactions);
 
-    // z-Board.net
-    QObject::connect(ui->actionz_board_net, &QAction::triggered, this, &MainWindow::postToZBoard);
-
-    // Connect mobile app
-    QObject::connect(ui->actionConnect_Mobile_App, &QAction::triggered, this, [=] () {
-        if (rpc->getConnection() == nullptr)
-            return;
-
-        AppDataServer::getInstance()->connectAppDialog(this);
-    });
-
     // Address Book
     QObject::connect(ui->action_Address_Book, &QAction::triggered, this, &MainWindow::addressBook);
 
@@ -87,9 +85,35 @@ MainWindow::MainWindow(QWidget *parent) :
 
         QString version    = QString("Version ") % QString(APP_VERSION) % " (" % QString(__DATE__) % ")";
         about.versionLabel->setText(version);
-        
+
         aboutDialog.exec();
     });
+
+    // SELF-HEAL: always-reachable manual override. The .ui file is checked in and not
+    // regenerated, so the action is created in code and added to the existing Help
+    // menu. It is present even after auto-heal latches NEEDS_MANUAL, so the user is
+    // never permanently stuck. It cleanly stops the running node first, then spins up
+    // a fresh ConnectionLoader and invokes the SAME staged repair ladder used at
+    // startup (offerCorruptionRepair) — there is no second ladder.
+    {
+        auto* repairAction = new QAction(tr("Repair / Re-download blockchain…"), this);
+        ui->menuHelp->addSeparator();
+        ui->menuHelp->addAction(repairAction);
+        QObject::connect(repairAction, &QAction::triggered, [=]() {
+            auto confirm = QMessageBox::question(this, tr("Repair blockchain data"),
+                tr("This will stop your ZClassic node so its blockchain files can be repaired "
+                   "or re-downloaded.\n\n"
+                   "Your wallet and coins are safe — a backup copy of your wallet is made first, "
+                   "and none of these options touch your wallet or private keys.\n\nContinue?"),
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+            if (confirm != QMessageBox::Yes)
+                return;
+
+            // Drive the SAME stop-node + fresh-loader + staged-ladder flow the runtime
+            // stub auto-heal uses; there is exactly one launch path (launchBlockchainRepair).
+            launchBlockchainRepair();
+        });
+    }
 
     // Initialize to the balances tab
     ui->tabWidget->setCurrentIndex(0);
@@ -109,45 +133,9 @@ MainWindow::MainWindow(QWidget *parent) :
 
     restoreSavedStates();
 
-    if (AppDataServer::getInstance()->isAppConnected()) {
-        auto ads = AppDataServer::getInstance();
-
-        QString wormholecode = "";
-        if (ads->getAllowInternetConnection())
-            wormholecode = ads->getWormholeCode(ads->getSecretHex());
-
-        createWebsocket(wormholecode);
-    }
-}
- 
-void MainWindow::createWebsocket(QString wormholecode) {
-    qDebug() << "Listening for app connections on port 8237";
-    // Create the websocket server, for listening to direct connections
-    wsserver = new WSServer(8237, false, this);
-
-    if (!wormholecode.isEmpty()) {
-        // Connect to the wormhole service
-        wormhole = new WormholeClient(this, wormholecode);
-    }
-}
-
-void MainWindow::stopWebsocket() {
-    delete wsserver;
-    wsserver = nullptr;
-
-    delete wormhole;
-    wormhole = nullptr;
-
-    qDebug() << "Websockets for app connections shut down";
-}
-
-bool MainWindow::isWebsocketListening() {
-    return wsserver != nullptr;
-}
-
-void MainWindow::replaceWormholeClient(WormholeClient* newClient) {
-    delete wormhole;
-    wormhole = newClient;
+    // Opt-in tray-resident mode: set up the tray icon + app-exit semantics to
+    // match the saved preference (default OFF -> no tray, quit-on-close as before).
+    applyTraySetting(Settings::getInstance()->getKeepInTray());
 }
 
 void MainWindow::restoreSavedStates() {
@@ -156,9 +144,36 @@ void MainWindow::restoreSavedStates() {
 
     ui->balancesTable->horizontalHeader()->restoreState(s.value("baltablegeometry").toByteArray());
     ui->transactionsTable->horizontalHeader()->restoreState(s.value("tratablegeometry").toByteArray());
+
+    // Paint the last-known balances immediately so the first ~1-minute node
+    // warmup shows a usable view instead of a blank "0.00". The live RPC
+    // overwrites these the moment it connects. Gated on its own default-ON
+    // preference (independent of saved-tx-history) so every user gets the instant
+    // paint; the live values are authoritative, this is only a convenience cache.
+    if (Settings::getInstance()->getShowCachedBalance() && s.contains("cache/balTotal")) {
+        double balT   = s.value("cache/balTransparent", 0.0).toDouble();
+        double balZ   = s.value("cache/balShielded",    0.0).toDouble();
+        double balTot = s.value("cache/balTotal",       0.0).toDouble();
+
+        ui->balTransparent->setText(Settings::getZCLDisplayFormat(balT));
+        ui->balSheilded   ->setText(Settings::getZCLDisplayFormat(balZ));
+        ui->balTotal      ->setText(Settings::getZCLDisplayFormat(balTot));
+
+        qint64 epoch = s.value("cache/lastSyncEpoch", (qint64) 0).toLongLong();
+        if (epoch > 0) {
+            QString when = QDateTime::fromSecsSinceEpoch(epoch).toString("MMM d, h:mm AP");
+            QString tip  = tr("Last known balance — last updated %1 (refreshing…)").arg(when);
+            ui->balTransparent->setToolTip(tip);
+            ui->balSheilded   ->setToolTip(tip);
+            ui->balTotal      ->setToolTip(tip);
+        }
+    }
 }
 
 void MainWindow::doClose() {
+    // doClose() is the "really quit" path (e.g. an OS signal handler), so make
+    // sure closeEvent performs the real shutdown rather than hiding to the tray.
+    quitting = true;
     closeEvent(nullptr);
 }
 
@@ -171,12 +186,105 @@ void MainWindow::closeEvent(QCloseEvent* event) {
 
     s.sync();
 
-    // Let the RPC know to shut down any running service.
+    // Tray-resident mode: closing the window just hides it (the node keeps
+    // running so the next open is instant). Only an explicit Quit / File->Exit
+    // (which sets `quitting`) tears the node down. Never silently hide if the
+    // system tray is unavailable -- fall through to a real shutdown so the node
+    // is never orphaned with no way to bring the window back.
+    if (!quitting
+            && Settings::getInstance()->getKeepInTray()
+            && trayIcon != nullptr
+            && QSystemTrayIcon::isSystemTrayAvailable()) {
+        hide();
+        if (event)
+            event->ignore();
+
+        if (!trayHintShown) {
+            trayHintShown = true;
+            trayIcon->showMessage(tr("ZclWallet is still running"),
+                tr("ZclWallet keeps running in the background so it opens instantly next time. "
+                   "Right-click the tray icon (or use File > Exit) to quit completely."),
+                QSystemTrayIcon::Information, 5000);
+        }
+        return;
+    }
+
+    // Real shutdown. Let the RPC know to shut down any running service.
     rpc->shutdownZClassicd();
 
     // Bubble up
     if (event)
         QMainWindow::closeEvent(event);
+
+    // quit-on-last-window-closed is now disabled for the WHOLE GUI lifetime (set
+    // in main(); never re-enabled by applyTraySetting), so closing the window no
+    // longer ends the app by itself. We only reach here on a REAL shutdown (the
+    // tray-hide branch returned early above), i.e. the user/OS is intentionally
+    // closing the window after rpc->shutdownZClassicd() -- quitting is the correct
+    // outcome. Quit explicitly and UNCONDITIONALLY (not just in tray mode) so the
+    // window's X button, File->Exit, the reindex/rescan close, and every
+    // quitApp()-driven path still quit cleanly with the flag permanently false.
+    qApp->quit();
+}
+
+void MainWindow::showFromTray() {
+    showNormal();
+    raise();
+    activateWindow();
+}
+
+void MainWindow::quitApp() {
+    // The real, clean exit: mark quitting so closeEvent stops the node instead
+    // of hiding to the tray, then close (which triggers the shutdown sequence).
+    quitting = true;
+    close();
+}
+
+void MainWindow::setupTrayIcon() {
+    if (trayIcon != nullptr)
+        return;
+
+    trayIcon = new QSystemTrayIcon(QIcon(":/icons/res/icon.ico"), this);
+    trayIcon->setToolTip("ZclWallet");
+
+    auto trayMenu = new QMenu(this);
+    auto showAction = trayMenu->addAction(tr("Show ZclWallet"));
+    QObject::connect(showAction, &QAction::triggered, this, &MainWindow::showFromTray);
+    trayMenu->addSeparator();
+    auto quitAction = trayMenu->addAction(tr("Quit"));
+    QObject::connect(quitAction, &QAction::triggered, this, &MainWindow::quitApp);
+    trayIcon->setContextMenu(trayMenu);
+
+    // A left-click / double-click on the tray icon brings the window back.
+    QObject::connect(trayIcon, &QSystemTrayIcon::activated, this,
+        [=](QSystemTrayIcon::ActivationReason reason) {
+            if (reason == QSystemTrayIcon::Trigger || reason == QSystemTrayIcon::DoubleClick)
+                showFromTray();
+        });
+}
+
+void MainWindow::applyTraySetting(bool enabled) {
+    if (enabled && QSystemTrayIcon::isSystemTrayAvailable()) {
+        setupTrayIcon();
+        trayIcon->show();
+        // The window-close should hide to tray, not end the app.
+        qApp->setQuitOnLastWindowClosed(false);
+    } else {
+        if (trayIcon != nullptr)
+            trayIcon->hide();
+        // NEVER-STRAND invariant: do NOT re-enable quit-on-last-window-closed here.
+        // main() disables it for the whole GUI lifetime so that no orphaned modal
+        // dialog teardown (connect dialog, connect-error box, node-crash box,
+        // foreign-stuck box) can silently end the process before the main window
+        // maps -- bob's exact bug. Previously this branch flipped the flag back to
+        // true whenever keep-in-tray was OFF (the default), which RE-ARMED that
+        // trap the first time the user clicked Settings->OK. The legitimate quit on
+        // a real window close is now provided unconditionally by
+        // MainWindow::closeEvent() (qApp->quit()), so leaving the flag false costs
+        // nothing and closes the regression.
+        //
+        // Intentionally a no-op on the flag in both tray-off and headless cases.
+    }
 }
 
 void MainWindow::turnstileProgress() {
@@ -363,22 +471,21 @@ void MainWindow::turnstileDoMigration(QString fromAddr) {
             turnstile.migrateTo->currentText(),
             std::get<0>(privLevel), std::get<1>(privLevel));
 
-        QMessageBox::information(this, "Backup your wallet.dat", 
-                                    "The migration will now start. You can check progress in the File -> Sapling Turnstile menu.\n\nYOU MUST BACKUP YOUR wallet.dat NOW!\n\nNew Addresses have been added to your wallet which will be used for the migration.", 
+        QMessageBox::information(this, "Backup your wallet.dat",
+                                    "The migration will now start. You can check progress in the File -> Sapling Turnstile menu.\n\nYOU MUST BACKUP YOUR wallet.dat NOW!\n\nNew Addresses have been added to your wallet which will be used for the migration.",
                                     QMessageBox::Ok);
     }
 }
 
-void MainWindow::setupTurnstileDialog() {        
+void MainWindow::setupTurnstileDialog() {
     // Turnstile migration
     QObject::connect(ui->actionTurnstile_Migration, &QAction::triggered, [=] () {
         // If there is current migration that is present, show the progress button
         if (rpc->getTurnstile()->isMigrationPresent())
             turnstileProgress();
-        else    
-            turnstileDoMigration();        
+        else
+            turnstileDoMigration();
     });
-
 }
 
 void MainWindow::setupStatusBar() {
@@ -479,16 +586,40 @@ void MainWindow::setSyncStatus(bool isSyncing, int blockNumber, int estimatedHei
         // Fully caught up: unmistakable green "ready" state.
         syncEtaStarted = false;
         syncProgressBar->setVisible(false);
+        syncProgressBar->setRange(0, 100);   // reset in case it was indeterminate
         syncStatusLabel->setText(tr("✓ Synced — Ready to use"));
         syncBanner->setStyleSheet("QWidget { background-color: #1f7a1f; } QLabel { color: white; }");
         return;
     }
 
-    // Syncing: show a progress bar and an estimated time remaining.
-    int pct = (int) (progress * 100.0);
+    // Indeterminate: we are syncing but have no usable target yet (e.g. the node's
+    // header height isn't known on the first poll). Show a busy bar and a friendly
+    // "starting" message rather than a misleading 0%/height/ETA.
+    bool indeterminate = isSyncing && (estimatedHeight <= 0 || progress < 0.0);
+    if (indeterminate) {
+        syncEtaStarted = false;
+        syncProgressBar->setVisible(true);
+        syncProgressBar->setRange(0, 0);     // busy/indeterminate animation
+        // Include the live block height so the text VISIBLY changes as blocks arrive,
+        // rather than a frozen "Starting your node…" that reads as stuck on a slow link.
+        // When the node already has a tip (blockNumber > 0) it is finding peers / confirming
+        // the chain; before that it is genuinely still starting.
+        if (blockNumber > 0)
+            syncStatusLabel->setText(tr("Starting your node… (block %1, connecting to peers)")
+                .arg(blockNumber));
+        else
+            syncStatusLabel->setText(tr("Starting your node…"));
+        syncBanner->setStyleSheet("QWidget { background-color: #d9822b; } QLabel { color: white; }");
+        return;
+    }
+
+    // Syncing: show a progress bar and an estimated time remaining. qRound (not a
+    // truncating cast) so e.g. 99.6% reads 100, not 99.
+    int pct = qRound(progress * 100.0);
     if (pct < 0)   pct = 0;
     if (pct > 100) pct = 100;
     syncProgressBar->setVisible(true);
+    syncProgressBar->setRange(0, 100);       // reset in case it was indeterminate
     syncProgressBar->setValue(pct);
 
     QString etaText;
@@ -538,6 +669,252 @@ void MainWindow::setSyncStatusConnecting() {
     syncBanner->setStyleSheet("QWidget { background-color: #555555; } QLabel { color: white; }");
 }
 
+// C9: called from rpc.cpp when the node is "syncing" but has 0 peers. A fresh
+// install with no peers would otherwise sit on a stuck "Syncing 0%" -- this tells
+// the user the real problem (no network) instead.
+void MainWindow::setSyncStatusWaitingForPeers(bool longStretch) {
+    if (syncBanner == nullptr) return;
+    syncEtaStarted = false;
+    syncProgressBar->setVisible(false);
+    syncProgressBar->setRange(0, 100);   // reset in case it was indeterminate
+    if (longStretch)
+        syncStatusLabel->setText(tr("Still waiting for peers… please check your internet "
+            "connection and try again later"));
+    else
+        syncStatusLabel->setText(tr("Waiting for peers… check your internet connection"));
+    syncBanner->setStyleSheet("QWidget { background-color: #d9822b; } QLabel { color: white; }");
+}
+
+// Bootstrap snapshot download in progress: show real determinate progress instead of
+// the misleading "waiting for peers". The node reports 0 normal P2P peers while it
+// downloads the snapshot, but it is actively working -- not stuck.
+void MainWindow::setSyncStatusBootstrapSnapshot(int pct, qint64 received, qint64 total, double mbps) {
+    if (syncBanner == nullptr) return;
+    syncEtaStarted = false;
+    if (pct < 0)   pct = 0;
+    if (pct > 100) pct = 100;
+    syncProgressBar->setVisible(true);
+    syncProgressBar->setRange(0, 100);
+    syncProgressBar->setValue(pct);
+
+    QString detail;
+    if (total > 0) {
+        const double gb = 1024.0 * 1024.0 * 1024.0;
+        detail = QString(" • ") % tr("%1 / %2 GB")
+            .arg(received / gb, 0, 'f', 1).arg(total / gb, 0, 'f', 1);
+    }
+    if (mbps > 0.0)
+        detail = detail % QString(" • ") % tr("%1 MB/s").arg(mbps, 0, 'f', 1);
+
+    syncStatusLabel->setText(tr("Downloading blockchain snapshot… %1%").arg(pct) % detail);
+    syncBanner->setStyleSheet("QWidget { background-color: #d9822b; } QLabel { color: white; }");
+}
+
+// SELF-HEAL (B-side): non-blocking validation banner. An empty message clears it
+// (the next sync poll repaints the normal state). A non-empty message overlays a
+// neutral-blue informational banner reusing the same syncBanner widget. It is
+// called AFTER setSyncStatus on each poll, so an active validation message wins for
+// that tick without disturbing the headers-vs-progress sync logic.
+void MainWindow::setBootstrapValidationBanner(const QString& msg) {
+    if (syncBanner == nullptr) return;
+    if (msg.isEmpty())
+        return;   // nothing to show; leave whatever setSyncStatus painted this tick
+    syncProgressBar->setVisible(false);
+    syncStatusLabel->setText(msg);
+    syncBanner->setStyleSheet("QWidget { background-color: #2c5d8f; } QLabel { color: white; }");
+}
+
+// Non-modal notification. Prefer a system-tray balloon (visible even when the main
+// window is hidden in tray-resident mode); fall back to a status-bar message when
+// there is no tray. Used by the background node-crash recovery so it never pops a
+// modal over a hidden window.
+void MainWindow::notify(const QString& title, const QString& body) {
+    if (trayIcon != nullptr && QSystemTrayIcon::isSystemTrayAvailable()) {
+        trayIcon->showMessage(title, body, QSystemTrayIcon::Information, 6000);
+    } else {
+        ui->statusBar->showMessage(title % ": " % body, 10 * 1000);
+    }
+    logger->write("notify: " % title % " — " % body);
+}
+
+// SINGLE launch path for the "stop the node, then drive the staged re-download ladder"
+// flow. Both the always-reachable Help -> Repair action and the runtime stub auto-heal
+// (autoHealStubChain) call THIS — there is no second destructive path. It stops the
+// running embedded node (a no-op + bounded wait for an external daemon we don't own),
+// then spins up a fresh ConnectionLoader (the old one is deleted post-handoff) and
+// invokes startManualRepair(), which runs offerCorruptionRepair()/redownloadChain()
+// with all their existing guards (confirmDaemonDeadForRepair, wallet.dat backup, the
+// ~15 GB disk floor, reversible set-aside rename).
+void MainWindow::launchBlockchainRepair() {
+    // Stop the running embedded node so there are no open LevelDB handles before any
+    // set-aside/reindex. shutdownZClassicd() is a no-op for an external daemon (we
+    // don't own its lifetime) and waits (bounded) for exit.
+    rpc->shutdownZClassicd();
+
+    // Fresh loader: ConnectionLoader is deleted post-handoff, so we create a new one
+    // exactly like the settings-change path does, then drive the ladder.
+    auto* cl = new ConnectionLoader(this, rpc);
+    cl->startManualRepair();
+}
+
+// RUNTIME STUB AUTO-HEAL entry. Called from the post-connection sync poller (rpc.cpp)
+// ONLY when ALL of its conservative triggers hold (sustained 0 peers AND a blocks/ dir
+// far below a real chain AND not already auto-healed this run/cooldown). It is the
+// runtime analogue of the Help -> Repair action: it reuses the EXACT same launch path
+// (launchBlockchainRepair -> startManualRepair -> redownloadChain), so every existing
+// safety guard applies. It is intentionally NON-interactive (no confirm dialog) but it
+// surfaces a clear status first; the destructive work still goes through
+// redownloadChain()'s daemon-dead/backup/disk/set-aside guards. The poller owns the
+// trigger arithmetic and the per-process / per-install-cooldown guards; this method
+// just performs the heal. Returns immediately (no-op) if a heal is already in flight.
+void MainWindow::autoHealStubChain() {
+    // Serialize with the heal ledger so this can't race a startup/watchdog heal that is
+    // already mid-flight (mainwindow.cpp clears a stale heal/inProgress once at process
+    // start, so a value seen here is a LIVE in-progress heal this run).
+    if (QSettings().value("heal/inProgress", false).toBool()) {
+        logger->write("autoHealStubChain: a heal is already in progress; skipping");
+        return;
+    }
+
+    logger->write("autoHealStubChain: stub chain + sustained peerless -> re-downloading blockchain");
+
+    // Clear, visible status (never a silent wipe). The connect dialog spun up by the
+    // fresh ConnectionLoader / redownloadChain's own "Re-downloading…" information box
+    // takes over from here, but paint the banner immediately so the moment is explained.
+    if (syncStatusLabel != nullptr) {
+        syncProgressBar->setVisible(false);
+        syncStatusLabel->setText(tr("Re-downloading blockchain…"));
+        syncBanner->setStyleSheet("QWidget { background-color: #2c5d8f; } QLabel { color: white; }");
+    }
+    notify(tr("Re-downloading blockchain"),
+        tr("ZClassic couldn't find any peers and the local copy is incomplete, so it is "
+           "downloading a fresh copy. Your wallet and coins are safe."));
+
+    launchBlockchainRepair();
+}
+
+// Local double-launch / "is anything still on the node ports?" probe for the runtime
+// dialogs below (the connect-time ConnectionLoader::portsFree is private and there is no
+// live loader at runtime). True iff BOTH the RPC port and the matching P2P port on
+// 127.0.0.1 are currently UNBOUND. Mainnet 8023/8033, testnet 18023/18033; testnet is read
+// from the authoritative Settings signal (matching edit #7).
+static bool mwNodePortsFree() {
+    bool testnet  = Settings::getInstance()->isTestnet();
+    quint16 rpcPort = testnet ? 18023 : 8023;
+    quint16 p2pPort = testnet ? 18033 : 8033;
+    auto portInUse = [](quint16 port) -> bool {
+        QTcpSocket probe;
+        probe.connectToHost(QStringLiteral("127.0.0.1"), port);
+        bool connected = probe.waitForConnected(150);   // refused/timeout => free
+        probe.abort();
+        return connected;
+    };
+    return !portInUse(rpcPort) && !portInUse(p2pPort);
+}
+
+// Relaunch this application as a fresh process, then quit the current one. Used as the
+// primary "fix it" action of the runtime dialogs: after the user stops the foreign node,
+// the relaunched wallet finds the ports free and starts/heals its OWN embedded node.
+static void mwRelaunchSelf() {
+    QStringList args = QApplication::arguments();
+    if (!args.isEmpty())
+        args.removeFirst();   // drop argv[0]
+    QProcess::startDetached(QApplication::applicationFilePath(), args);
+}
+
+// RUNTIME actionable dialog for a FOREIGN node that is genuinely STUCK (attached, but
+// peerless/not syncing for a sustained window). See the header. Persistent (looping/re-
+// shown until resolved), actionable, retryable. Centred on STUCK, NOT "too old". NEVER
+// kills/mutates the foreign node; NEVER a silent hang. The caller (rpc.cpp poller) guards
+// it with a once-per-run bool so it cannot spam.
+void MainWindow::showForeignNodeStuck() {
+    logger->write("Showing foreign-node-stuck actionable dialog (attached node is peerless/not syncing)");
+
+    for (;;) {
+        QMessageBox box(this);
+        box.setWindowTitle(tr("Another ZClassic node is running"));
+        box.setIcon(QMessageBox::Warning);
+        box.setTextFormat(Qt::RichText);
+        box.setText(tr("This wallet is connected to a ZClassic node it did not start, "
+                       "and that node is not syncing."));
+        box.setInformativeText(tr(
+            "The other node cannot find any peers, so the blockchain is not progressing. "
+            "This wallet can download and repair the blockchain automatically — but only "
+            "for a node it starts itself, so it can't fix the other one.<br><br>"
+            "<b>Your wallet file and your coins are safe.</b> Nothing has been changed.<br><br>"
+            "<b>To fix this:</b> stop the other node, then reopen this wallet so it can "
+            "manage its own node.<br>"
+            "&nbsp;&nbsp;• On Linux, run: <code>systemctl --user stop zclassicd</code><br>"
+            "&nbsp;&nbsp;• Or simply close the other copy of ZClassic that is open."));
+
+        // Offer "Use the bundled node" ONLY when the ports are ACTUALLY free right now
+        // (the foreign node was already stopped) — re-checked on click below.
+        bool portsAreFree = mwNodePortsFree();
+
+        QPushButton* reopenBtn  = box.addButton(tr("Stop the other node, then reopen"),
+                                                QMessageBox::AcceptRole);
+        QPushButton* bundledBtn = portsAreFree
+            ? box.addButton(tr("Use the bundled node"), QMessageBox::ActionRole)
+            : nullptr;
+        QPushButton* quitBtn    = box.addButton(tr("Quit"), QMessageBox::RejectRole);
+        box.setDefaultButton(reopenBtn);
+
+        box.exec();
+        QAbstractButton* clicked = box.clickedButton();
+
+        if (clicked == bundledBtn) {
+            // RE-CHECK at click time: never double-launch onto a held port.
+            if (mwNodePortsFree()) {
+                logger->write("Foreign-node-stuck: ports free; relaunching to start the bundled node");
+                mwRelaunchSelf();
+                quitApp();
+                return;
+            }
+            logger->write("Foreign-node-stuck: ports still in use at click; re-showing");
+            continue;   // still held — re-explain
+        } else if (clicked == quitBtn) {
+            logger->write("Foreign-node-stuck: Quit pressed");
+            quitApp();
+            return;
+        } else {   // reopenBtn or window-chrome close: relaunch so we can manage our own node
+            logger->write("Foreign-node-stuck: relaunching app so this wallet manages its own node");
+            mwRelaunchSelf();
+            quitApp();
+            return;
+        }
+    }
+}
+
+// Sibling of the above for the connect-time CATCH-ALL (edit #2). The node has not answered
+// cleanly nor with a recognized warmup state for too long. Actionable + retryable; Retry
+// relaunches the app (a clean reconnect) instead of leaving the connect dialog frozen.
+void MainWindow::showNodeNotRespondingRetry() {
+    logger->write("Showing node-not-responding actionable retry dialog");
+
+    QMessageBox box(this);
+    box.setWindowTitle(tr("ZClassic is taking longer than expected"));
+    box.setIcon(QMessageBox::Warning);
+    box.setText(tr("The ZClassic node hasn't finished starting up."));
+    box.setInformativeText(tr(
+        "It hasn't responded normally for a while. Your wallet and coins are safe — "
+        "nothing has been changed.\n\n"
+        "Press Retry to start over, or Quit to close ZClassic."));
+    QPushButton* retryBtn = box.addButton(tr("Retry"), QMessageBox::AcceptRole);
+    QPushButton* quitBtn  = box.addButton(tr("Quit"), QMessageBox::RejectRole);
+    box.setDefaultButton(retryBtn);
+    box.exec();
+
+    if (box.clickedButton() == quitBtn) {
+        logger->write("Node-not-responding: Quit pressed");
+        quitApp();
+        return;
+    }
+    // Retry / closed: relaunch the app to re-run the whole connect flow cleanly.
+    logger->write("Node-not-responding: Retry pressed; relaunching app");
+    mwRelaunchSelf();
+    quitApp();
+}
+
 void MainWindow::setupSettingsModal() {    
     // Set up File -> Settings action
     QObject::connect(ui->actionSettings, &QAction::triggered, [=]() {
@@ -557,6 +934,8 @@ void MainWindow::setupSettingsModal() {
                 "Shielded z-Address transactions are stored locally in your wallet, outside zclassicd. You may delete this saved information safely any time for your privacy.\nDo you want to delete the saved shielded transactions now?",
                 QMessageBox::Yes, QMessageBox::Cancel)) {
                     SentTxStore::deleteHistory();
+                    // Also drop the cached last-known balances (same local data).
+                    QSettings().remove("cache");
                     // Reload after the clear button so existing txs disappear
                     rpc->refresh(true);
             }
@@ -564,6 +943,14 @@ void MainWindow::setupSettingsModal() {
 
         // Save sent transactions
         settings.chkSaveTxs->setChecked(Settings::getInstance()->getSaveZtxs());
+
+        // Keep running in the background (tray-resident). Disable + explain when
+        // there is no system tray available so the user isn't offered a no-op.
+        settings.chkKeepInTray->setChecked(Settings::getInstance()->getKeepInTray());
+        if (!QSystemTrayIcon::isSystemTrayAvailable()) {
+            settings.chkKeepInTray->setEnabled(false);
+            settings.chkKeepInTray->setToolTip(tr("Your desktop doesn't provide a system tray, so this option isn't available."));
+        }
 
         // Custom fees
         settings.chkCustomFees->setChecked(Settings::getInstance()->getAllowCustomFees());
@@ -636,6 +1023,12 @@ void MainWindow::setupSettingsModal() {
             // Auto shield
             Settings::getInstance()->setAutoShield(settings.chkAutoShield->isChecked());
 
+            // Keep running in the background (tray-resident). Apply immediately
+            // so the change takes effect this session, no restart needed.
+            bool keepInTray = settings.chkKeepInTray->isChecked();
+            Settings::getInstance()->setKeepInTray(keepInTray);
+            applyTraySetting(keepInTray);
+
             if (!isUsingTor && settings.chkTor->isChecked()) {
                 // If "use tor" was previously unchecked and now checked
                 Settings::addToZClassicConf(zclassicConfLocation, "proxy=127.0.0.1:9050");
@@ -705,138 +1098,6 @@ void MainWindow::addressBook() {
 }
 
 
-void MainWindow::donate() {
-    // Set up a donation to me :)
-    removeExtraAddresses();
-
-    ui->Address1->setText(Settings::getDonationAddr(
-                            Settings::getInstance()->isSaplingAddress(ui->inputsCombo->currentText())));
-    ui->Address1->setCursorPosition(0);
-    ui->Amount1->setText("0.01");
-    ui->MemoTxt1->setText(tr("Thanks for supporting ZclWallet!"));
-
-    ui->statusBar->showMessage(tr("Donate 0.01 ") % Settings::getTokenName() % tr(" to support ZclWallet"));
-
-    // And switch to the send tab.
-    ui->tabWidget->setCurrentIndex(1);
-}
-
-
-void MainWindow::postToZBoard() {
-    QDialog d(this);
-    Ui_zboard zb;
-    zb.setupUi(&d);
-    Settings::saveRestore(&d);
-
-    if (rpc->getConnection() == nullptr)
-        return;
-
-    // Fill the from field with sapling addresses.
-    for (auto i = rpc->getAllBalances()->keyBegin(); i != rpc->getAllBalances()->keyEnd(); i++) {
-        if (Settings::getInstance()->isSaplingAddress(*i) && rpc->getAllBalances()->value(*i) > 0) {
-            zb.fromAddr->addItem(*i);
-        }
-    }
-
-    QMap<QString, QString> topics;
-    // Insert the main topic automatically
-    topics.insert("#Main_Area", Settings::getInstance()->isTestnet() ? Settings::getDonationAddr(true) : Settings::getZboardAddr());
-    zb.topicsList->addItem(topics.firstKey());
-    // Then call the API to get topics, and if it returns successfully, then add the rest of the topics
-    rpc->getZboardTopics([&](QMap<QString, QString> topicsMap) {
-        for (auto t : topicsMap.keys()) {
-            topics.insert(t, Settings::getInstance()->isTestnet() ? Settings::getDonationAddr(true) : topicsMap[t]);
-            zb.topicsList->addItem(t);
-        }
-    });
-
-    // Testnet warning
-    if (Settings::getInstance()->isTestnet()) {
-        zb.testnetWarning->setText(tr("You are on testnet, your post won't actually appear on z-board.net"));
-    }
-    else {
-        zb.testnetWarning->setText("");
-    }
-
-    QRegExpValidator v(QRegExp("^[a-zA-Z0-9_]{3,20}$"), zb.postAs);
-    zb.postAs->setValidator(&v);
-
-    zb.feeAmount->setText(Settings::getZCLUSDDisplayFormat(Settings::getZboardAmount() + Settings::getMinerFee()));
-
-    auto fnBuildNameMemo = [=]() -> QString {
-        auto memo = zb.memoTxt->toPlainText().trimmed();
-        if (!zb.postAs->text().trimmed().isEmpty())
-            memo = zb.postAs->text().trimmed() + ":: " + memo;
-        return memo;
-    };
-
-    auto fnUpdateMemoSize = [=]() {
-        QString txt = fnBuildNameMemo();
-        zb.memoSize->setText(QString::number(txt.toUtf8().size()) + "/512");
-
-        if (txt.toUtf8().size() <= 512) {
-            // Everything is fine
-            zb.buttonBox->button(QDialogButtonBox::Ok)->setEnabled(true);
-            zb.memoSize->setStyleSheet("");
-        }
-        else {
-            // Overweight
-            zb.buttonBox->button(QDialogButtonBox::Ok)->setEnabled(false);
-            zb.memoSize->setStyleSheet("color: red;");
-        }
-
-        // Disallow blank memos
-        if (zb.memoTxt->toPlainText().trimmed().isEmpty()) {
-            zb.buttonBox->button(QDialogButtonBox::Ok)->setEnabled(false);
-        }
-        else {
-            zb.buttonBox->button(QDialogButtonBox::Ok)->setEnabled(true);
-        }
-    };
-
-    // Memo text changed
-    QObject::connect(zb.memoTxt, &QPlainTextEdit::textChanged, fnUpdateMemoSize);
-    QObject::connect(zb.postAs, &QLineEdit::textChanged, fnUpdateMemoSize);
-
-    zb.memoTxt->setFocus();
-    fnUpdateMemoSize();
-
-    if (d.exec() == QDialog::Accepted) {
-        // Create a transaction.
-        Tx tx;
-        
-        // Send from your first sapling address that has a balance.
-        tx.fromAddr = zb.fromAddr->currentText();
-        if (tx.fromAddr.isEmpty()) {
-            QMessageBox::critical(this, "Error Posting Message", tr("You need a sapling address with available balance to post"), QMessageBox::Ok);
-            return;
-        }
-
-        auto memo = zb.memoTxt->toPlainText().trimmed();
-        if (!zb.postAs->text().trimmed().isEmpty())
-            memo = zb.postAs->text().trimmed() + ":: " + memo;
-
-        auto toAddr = topics[zb.topicsList->currentText()];
-        tx.toAddrs.push_back(ToFields{ toAddr, Settings::getZboardAmount(), memo, memo.toUtf8().toHex() });
-        tx.fee = Settings::getMinerFee();
-
-        // And send the Tx
-        rpc->executeTransaction(tx, [=] (QString opid) {
-            ui->statusBar->showMessage(tr("Computing Tx: ") % opid);
-        },
-        [=] (QString /*opid*/, QString txid) { 
-            ui->statusBar->showMessage(Settings::txidStatusMessage + " " + txid);
-        },
-        [=] (QString opid, QString errStr) {
-            ui->statusBar->showMessage(QObject::tr(" Tx ") % opid % QObject::tr(" failed"), 15 * 1000);
-
-            if (!opid.isEmpty())
-                errStr = QObject::tr("The transaction with id ") % opid % QObject::tr(" failed. The error was") + ":\n\n" + errStr; 
-
-            QMessageBox::critical(this, QObject::tr("Transaction Error"), errStr, QMessageBox::Ok);            
-        });
-    }
-}
 
 void MainWindow::doImport(QList<QString>* keys) {
     if (rpc->getConnection() == nullptr) {
@@ -881,11 +1142,6 @@ void MainWindow::balancesReady() {
         payZClassicURI(pendingURIPayment);
         pendingURIPayment = "";
     }
-
-    // P0-2: now that the wallet is live, make sure the user has a backup of
-    // wallet.dat. This is the single most important fund-safety step because
-    // the wallet is file-based and has NO seed-phrase recovery.
-    promptWalletBackup();
 }
 
 // P0-2: First-run / until-backed-up fund-safety prompt.
@@ -1733,7 +1989,4 @@ MainWindow::~MainWindow()
 
     delete loadingMovie;
     delete logger;
-
-    delete wsserver;
-    delete wormhole;
 }

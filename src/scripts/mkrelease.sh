@@ -17,27 +17,28 @@ if [ ! -f $ZCASH_DIR/artifacts/zclassicd ]; then
     exit 1;
 fi
 
-if [ ! -f $ZCASH_DIR/artifacts/zclassic-cli ]; then
-    echo "Couldn't find zclassic-cli in $ZCASH_DIR/artifacts/. Please build zclassicd."
-    exit 1;
-fi
-
-# Ensure that zclassicd is the right build
+# Ensure that zclassicd is a real MagicBean build. (The single-file release embeds
+# only the daemon; zclassic-cli is no longer packaged, and the Windows zclassicd.exe
+# is checked in the Windows section below so a Linux-only build can run on its own.)
 echo -n "zclassicd version........."
-if grep -q "zqwMagicBean" $ZCASH_DIR/artifacts/zclassicd && ! readelf -s $ZCASH_DIR/artifacts/zclassicd | grep -q "GLIBC_2\.25"; then 
+if grep -q "MagicBean" $ZCASH_DIR/artifacts/zclassicd; then
     echo "[OK]"
 else
     echo "[ERROR]"
-    echo "zclassicd doesn't seem to be a zqwMagicBean build or zclassicd is built with libc 2.25"
+    echo "zclassicd doesn't look like a MagicBean build"
     exit 1
 fi
 
-echo -n "zclassicd.exe version....."
-if grep -q "zqwMagicBean" $ZCASH_DIR/artifacts/zclassicd.exe; then 
-    echo "[OK]"
+# Portability gate: the embedded daemon must not require a newer glibc than our
+# old-base builder targets (Ubuntu 20.04 / glibc 2.31). Built on a newer host it
+# would silently fail to start on older distros.
+echo -n "zclassicd portability...."
+MAXGLIBC=$(objdump -T "$ZCASH_DIR/artifacts/zclassicd" 2>/dev/null | grep -oE "GLIBC_[0-9]+\.[0-9]+" | sort -V | tail -1)
+if [ -n "$MAXGLIBC" ] && [ "$(printf '%s\nGLIBC_2.31\n' "$MAXGLIBC" | sort -V | tail -1)" = "GLIBC_2.31" ]; then
+    echo "[OK] (max ${MAXGLIBC})"
 else
     echo "[ERROR]"
-    echo "zclassicd doesn't seem to be a zqwMagicBean build"
+    echo "zclassicd requires newer than glibc 2.31 (max ${MAXGLIBC:-unknown}); build it on the old-base builder."
     exit 1
 fi
 
@@ -47,6 +48,14 @@ sed -i "s/${PREV_VERSION}/${APP_VERSION}/g" zcl-qt-wallet.pro > /dev/null
 
 # Also update it in the README.md
 sed -i "s/${PREV_VERSION}/${APP_VERSION}/g" README.md > /dev/null
+# CRITICAL: the version the app actually REPORTS comes from src/version.h
+# (#define APP_VERSION "..."). zcl-qt-wallet.pro and README.md carry no version
+# string, so the two seds above are cosmetic — bump version.h here too or the
+# build silently ships the OLD version while printing a green [OK].
+sed -i "s/${PREV_VERSION}/${APP_VERSION}/g" src/version.h > /dev/null
+if ! grep -q "\"${APP_VERSION}\"" src/version.h; then
+  echo "[FAIL]"; echo "FATAL: src/version.h not bumped to ${APP_VERSION} (APP_VERSION #define mismatch)"; exit 1
+fi
 echo "[OK]"
 
 echo -n "Cleaning..............."
@@ -68,7 +77,12 @@ echo -n "Building..............."
 rm -rf bin/zcl-qt-wallet* > /dev/null
 rm -rf bin/zclwallet* > /dev/null
 make clean > /dev/null
-make -j$(nproc) > /dev/null
+# Abort on a failed compile/link instead of silently shipping a stale binary.
+if ! make -j$(nproc) > /dev/null || [ ! -x zclwallet ]; then
+    echo "[ERROR]"
+    echo "GUI build failed (zclwallet not produced); see the make output above"
+    exit 1
+fi
 echo "[OK]"
 
 
@@ -81,37 +95,56 @@ fi
 echo "[OK]"
 
 
-echo -n "Packaging.............."
-mkdir bin/zclwallet-v$APP_VERSION > /dev/null
+echo -n "Bundling..............."
 strip zclwallet
-
-cp zclwallet                  bin/zclwallet-v$APP_VERSION > /dev/null
-cp $ZCASH_DIR/artifacts/zclassicd    bin/zclwallet-v$APP_VERSION > /dev/null
-cp $ZCASH_DIR/artifacts/zclassic-cli bin/zclwallet-v$APP_VERSION > /dev/null
-cp README.md                      bin/zclwallet-v$APP_VERSION > /dev/null
-cp LICENSE                        bin/zclwallet-v$APP_VERSION > /dev/null
-
-cd bin && tar czf linux-zclwallet-v$APP_VERSION.tar.gz zclwallet-v$APP_VERSION/ > /dev/null
-cd .. 
-
-mkdir artifacts >/dev/null 2>&1
-cp bin/linux-zclwallet-v$APP_VERSION.tar.gz ./artifacts/linux-binaries-zclwallet-v$APP_VERSION.tar.gz
+mkdir -p artifacts >/dev/null 2>&1
+# Single-file release: append the daemon to the (static-Qt) GUI executable,
+# followed by a trailing footer:  [ sha256(daemon):32 | len(daemon):8 LE | magic "ZQWDMON1":8 ]
+# The ELF still runs (the loader ignores trailing bytes); on first launch the GUI
+# extracts + hash-verifies the daemon to a per-user cache (see
+# ConnectionLoader::ensureDaemonExtracted). No separate zclassicd file ships.
+SINGLE=artifacts/linux-zclwallet-v$APP_VERSION
+cp zclwallet "$SINGLE"
+python3 - "$ZCASH_DIR/artifacts/zclassicd" "$SINGLE" <<'PYEOF'
+import sys, hashlib, struct
+daemon = open(sys.argv[1], 'rb').read()
+with open(sys.argv[2], 'ab') as f:
+    f.write(daemon)                              # GUI | daemon
+    f.write(hashlib.sha256(daemon).digest())     #     | sha256 (32)
+    f.write(struct.pack('<Q', len(daemon)))      #     | len    (8, little-endian)
+    f.write(b'ZQWDMON1')                         #     | magic  (8)
+PYEOF
+chmod +x "$SINGLE"
 echo "[OK]"
 
-
-if [ -f artifacts/linux-binaries-zclwallet-v$APP_VERSION.tar.gz ] ; then
-    echo -n "Package contents......."
-    # Test if the package is built OK
-    if tar tf "artifacts/linux-binaries-zclwallet-v$APP_VERSION.tar.gz" | wc -l | grep -q "6"; then 
-        echo "[OK]"
-    else
-        echo "[ERROR]"
-        exit 1
-    fi    
+echo -n "Verifying bundle......."
+# Must still be a valid ELF AND carry our trailing magic.
+if readelf -h "$SINGLE" >/dev/null 2>&1 && [ "$(tail -c 8 "$SINGLE")" = "ZQWDMON1" ]; then
+    echo "[OK]"
 else
     echo "[ERROR]"
+    echo "Single-file bundle is not a valid ELF or is missing the daemon footer"
     exit 1
 fi
+
+echo -n "Relink objects........."
+# LGPLv3 (static Qt): publish ZclWallet's object files + a link recipe so anyone
+# can relink the app against their own build of Qt. See docs/QT-LGPL-NOTICE.md.
+{
+  echo "ZclWallet v$APP_VERSION - relink instructions (LGPLv3 / static Qt)"
+  echo
+  echo "These are ZclWallet's compiled object files (bin/*.o). To relink against"
+  echo "your own statically-built Qt 5.15, place its libraries in your qmake kit and"
+  echo "re-run the final link, e.g.:"
+  echo
+  echo "  <your-qt>/bin/qmake zcl-qt-wallet.pro -spec linux-clang CONFIG+=release"
+  echo "  make            # re-runs the final 'clang++ -o zclwallet bin/*.o ... <Qt libs>' link"
+  echo
+  echo "Full application source (MIT): https://github.com/ZclassicCommunity/zcl-qt-wallet"
+  echo "Qt 5.15 source (LGPLv3): https://download.qt.io/archive/qt/5.15/"
+} > bin/RELINK.txt
+tar czf artifacts/linux-relink-objects-v$APP_VERSION.tar.gz bin/*.o bin/RELINK.txt zcl-qt-wallet.pro docs/QT-LGPL-NOTICE.md >/dev/null 2>&1
+echo "[OK]"
 
 echo -n "Building deb..........."
 debdir=bin/deb/zclwallet-v$APP_VERSION
