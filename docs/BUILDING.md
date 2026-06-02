@@ -459,34 +459,44 @@ src/scripts/mkmacdmg.sh -q /path/to/static/Qt -z /path/to/zclassic -v 2.1.2-beta
 - **`cp $ZCASH_DIR/src/zclassicd` and `zclassic-cli` into
   `zclwallet.app/Contents/MacOS/`** *before* `macdeployqt` (lines 83-84) so
   macdeployqt fixes up the rpaths and a later signature covers them
-- `$QT_PATH/bin/macdeployqt zclwallet.app` (line 85)
-- `mv zclwallet.app ZclWallet.app`, then `create-dmg … artifacts/macOS-zclwallet-v$APP_VERSION.dmg` (lines 90-91)
+- `$QT_PATH/bin/macdeployqt zclwallet.app`
+- **ad-hoc codesign** (now automated in the script — see 8c)
+- `mv zclwallet.app ZclWallet.app`, then `create-dmg …` with an **`hdiutil` fallback** (see 8d)
 
 `res/Info.plist` (`zcl-qt-wallet.pro:114`) sets `CFBundleExecutable=zclwallet`,
 `CFBundleIdentifier=org.zclassic.zclwallet`, and `LSMinimumSystemVersion=11.0`
 (macOS Big Sur floor).
 
-### 8c. Ad-hoc codesign — **ORDER IS LOAD-BEARING**
+### 8c. Ad-hoc codesign — **ORDER IS LOAD-BEARING** (now automated)
 
-The codesign step is **not** in `mkmacdmg.sh` and must run **AFTER `macdeployqt`**
-and **BEFORE `create-dmg`** (i.e. after `mkmacdmg.sh` line 85 (macdeployqt), before
-line 91 (create-dmg); the intervening `mv zclwallet.app ZclWallet.app` is line 90).
-`macdeployqt` rewrites/copies the Qt frameworks and **invalidates any earlier
-signature** — signing before it means the app launches on Intel but is **instantly
-SIGKILLed on Apple Silicon**.
+`mkmacdmg.sh` now ad-hoc-signs automatically: it signs the nested
+`Contents/MacOS/zclassic{,-cli}` then `--deep` the `.app`, **immediately AFTER
+`macdeployqt` and BEFORE the dmg step**. `macdeployqt` rewrites/copies the Qt
+frameworks and **invalidates any earlier signature** — signing before it means the
+app launches on Intel but is **instantly SIGKILLed on Apple Silicon**. There is no
+Apple Developer ID here, so the sign is **ad-hoc** (`-s -`): it fixes the SIGKILL
+but does **not** notarize, so Gatekeeper still flags "unidentified developer" — users
+right-click → **Open** once, or `xattr -dr com.apple.quarantine /Applications/ZclWallet.app`.
+With a Dev ID, replace `-` with the identity, add `--options runtime`, then notarize + staple.
 
-The cleanest fix is to edit `mkmacdmg.sh` to insert the sign step between
-`macdeployqt` and the `mv … create-dmg`. Until that edit is committed, run it
-manually on the `.app` produced before the dmg step, or split the script:
+Verify: `codesign --verify --deep --strict ZclWallet.app && spctl -a -vv ZclWallet.app`.
+
+### 8d. `create-dmg` needs Finder automation — `hdiutil` fallback
+
+`create-dmg` drives **Finder via AppleScript** to lay out the decorative background
++ icon positions. On a **headless / CI / Automation-restricted Mac** that fails with
+`AppleEvent timed out (-1712)` and produces **no dmg at all**. The decorative layout
+is cosmetic, so `mkmacdmg.sh` now falls back to a plain compressed dmg via `hdiutil`
+when `create-dmg` produces no file:
 
 ```bash
-# After macdeployqt has run on zclwallet.app, BEFORE create-dmg:
-codesign --force --deep -s - zclwallet.app          # ad-hoc sign ("-s -")
-
-# Verify:
-codesign --verify --deep --strict zclwallet.app
-spctl -a -vv zclwallet.app
+hdiutil create -volname "ZclWallet-v$APP_VERSION" -srcfolder ZclWallet.app -ov -format UDZO "$DMG"
 ```
+
+This is functionally identical (a signed `.app` the user drags out) — just without the
+custom background. For the polished `create-dmg` layout, run on an **interactive Mac
+session** with Automation permission granted to the terminal (System Settings →
+Privacy & Security → Automation).
 
 > If you intend to **notarize** (vs ad-hoc) you need a Developer ID identity and
 > `xcrun notarytool` / stapling — that is beyond this doc and is done by the mac
