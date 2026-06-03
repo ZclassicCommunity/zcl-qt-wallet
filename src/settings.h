@@ -93,6 +93,9 @@ public:
     static bool    isTAddress(QString addr);
 
     static QString getDecimalString(double amt);
+    // Thousands-separated integer for block heights, e.g. 1700000 -> "1,700,000".
+    // Single source of truth so every "block N" string reads the same.
+    static QString getHeightString(qint64 height);
     static QString getUSDFormat(double bal);
     static QString getZCLDisplayFormat(double bal);
     static QString getZCLUSDDisplayFormat(double bal);

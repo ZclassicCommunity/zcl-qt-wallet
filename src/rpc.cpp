@@ -1093,11 +1093,15 @@ void RPC::getInfoThenRefresh(bool force) {
 
             // Update the status bar. Only show a percent when the target is known;
             // a peerless/just-started sync has no meaningful % yet.
+            // P2-4: at rest, show a thousands-separated height ("Connected (1,700,000)")
+            // for readability; the syncing branch keeps its raw block/percent format.
+            QString heightStr = isSyncing ? QString::number(blockNumber)
+                                          : Settings::getHeightString(blockNumber);
             QString statusText = QString() %
                 (isSyncing ? QObject::tr("Syncing") : QObject::tr("Connected")) %
                 " (" %
                 (Settings::getInstance()->isTestnet() ? QObject::tr("testnet:") : "") %
-                QString::number(blockNumber) %
+                heightStr %
                 (isSyncing && targetKnown ? ("/" % QString::number(progress*100, 'f', 2) % "%") : QString()) %
                 ")";
             if (isSyncing && !targetKnown)

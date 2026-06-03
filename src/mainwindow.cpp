@@ -1156,7 +1156,17 @@ void MainWindow::setSyncStatus(bool isSyncing, int blockNumber, int estimatedHei
         syncProgressBar->setVisible(false);
         syncProgressBar->setRange(0, 100);   // reset in case it was indeterminate
         syncStatusLabel->setVisible(false);
-        if (syncQuietPill) syncQuietPill->setVisible(true);
+        if (syncQuietPill) {
+            // P2-4: the quiet pill is the ONLY at-rest indicator. Read it as a clean
+            // "Synced · block N" with thousands-separated height (single source =
+            // Settings::getHeightString). No "checking blockchain…" once caught up.
+            QString pill = tr("<span style=\"color:#34c759;\">●</span>&nbsp;&nbsp;Synced");
+            if (blockNumber > 0)
+                pill = pill % "&nbsp;&nbsp;·&nbsp;&nbsp;" %
+                    tr("block %1").arg(Settings::getHeightString(blockNumber));
+            syncQuietPill->setText(pill);
+            syncQuietPill->setVisible(true);
+        }
         syncBanner->setStyleSheet("QWidget { background-color: transparent; }");
         return;
     }
@@ -2597,10 +2607,12 @@ void MainWindow::setupReceivePrivacyDisclosure() {
     // ---- 1) Green PRIVATE indicator (the resting-state affordance) ----------
     lblReceivePrivate = new QLabel(ui->groupBox_6);
     lblReceivePrivate->setObjectName("lblReceivePrivate");   // qss hook (green badge)
-    lblReceivePrivate->setText(tr("●  Private — shielded (z) address"));
+    // P2-8: lead the caption with "Private"; the "shielded (z)" technical detail
+    // lives in the tooltip only, so the standalone label stays in plain user words.
+    lblReceivePrivate->setText(tr("●  Private address"));
     lblReceivePrivate->setTextFormat(Qt::PlainText);
     lblReceivePrivate->setToolTip(tr(
-        "This is a shielded Sapling address. The amount, sender and recipient are "
+        "This is a shielded (z) Sapling address. The amount, sender and recipient are "
         "encrypted on the blockchain — private by default."));
 
     // ---- 2) Advanced disclosure toggle --------------------------------------

@@ -359,6 +359,12 @@ QString Settings::getDecimalString(double amt) {
     return f;
 }
 
+QString Settings::getHeightString(qint64 height) {
+    // Locale-aware grouping so the height reads naturally for the user's region
+    // (e.g. "1,700,000" or "1.700.000"). Negative/unknown heights pass through.
+    return QLocale::system().toString((qlonglong) height);
+}
+
 QString Settings::getZCLDisplayFormat(double bal) {
     // This is idiotic. Why doesn't QString have a way to do this?
     return getDecimalString(bal) % " " % Settings::getTokenName();

@@ -56,7 +56,7 @@ QGroupBox::title {
     subcontrol-position: top left;
     left: 14px; top: 2px;
     color: #e6e6e6;                       /* section titles never sub-body dim */
-    font-size: 12pt;
+    font-size: 14pt;                      /* P2-2: section title >= 13pt body, not under it */
     font-weight: 700;
 }
 
