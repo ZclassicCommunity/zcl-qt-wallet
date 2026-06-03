@@ -99,6 +99,14 @@ public:
     // reversible set-aside) applies. Non-interactive but surfaces a clear status.
     void autoHealStubChain();
 
+    // P0-2 FUND-SAFETY: prompt the user (once per run) to back up wallet.dat. There
+    // is no seed phrase for this wallet, so an un-backed-up wallet.dat is permanent,
+    // unrecoverable loss. Invoked from rpc.cpp's balance refresh on the first fully-
+    // synced poll with a positive balance (a per-run one-shot there avoids re-firing
+    // on every poll). Permanently silenced after a successful backup via the
+    // persisted options/walletbackedup flag. Public so the RPC poller can call it.
+    void promptWalletBackup();
+
     // RUNTIME actionable dialog (edit #5). Reached from the sync poller (rpc.cpp) when an
     // ATTACHED FOREIGN node (one this wallet did NOT start: rpc->isEmbedded()==false) has
     // been peerless/stuck for a sustained window. The wallet can only download/repair the
@@ -189,10 +197,6 @@ private:
     void exportKeys(QString addr = "");
     void backupWalletDat();
     void exportTransactions();
-
-    // P0-2: first-run fund-safety prompt. Nags (once per launch) to back up
-    // wallet.dat until the user has backed up, then never nags again.
-    void promptWalletBackup();
 
     void doImport(QList<QString>* keys);
 

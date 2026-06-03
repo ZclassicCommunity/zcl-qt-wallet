@@ -366,12 +366,35 @@ void MainWindow::memoButtonClicked(int number, bool includeReplyTo) {
         dialog.setGeometry(dialog.geometry().adjusted(0,0,0,-1));
     };
 
-    // Insert From Address button
-    QObject::connect(memoDialog.btnInsertFrom, &QPushButton::clicked, fnAddReplyTo);
+    // Insert From Address button. Including a reply address writes the sender's OWN
+    // z-address into the encrypted memo -- only the recipient can read it, but it
+    // de-anonymizes the sender to that recipient and links the payment to their
+    // shielded address. Educate always (tooltip) and require explicit one-time
+    // consent on the FIRST manual click (persisted, never nags again).
+    memoDialog.btnInsertFrom->setToolTip(tr(
+        "Writes your z-address into the encrypted memo so the recipient can reply.\n"
+        "This reveals your identity to that recipient and links this payment to\n"
+        "your shielded address."));
+    QObject::connect(memoDialog.btnInsertFrom, &QPushButton::clicked, [=, &dialog]() {
+        if (!QSettings().value("memo/replyToWarned", false).toBool()) {
+            auto proceed = QMessageBox::question(&dialog, tr("Reveal your address to the recipient?"),
+                tr("Including a reply address writes <b>your own z-address</b> into the "
+                   "encrypted memo. Only the recipient can read it, but it reveals your "
+                   "identity to them and lets them link this payment to your shielded "
+                   "address.<br><br>Include your reply address anyway?"),
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+            if (proceed != QMessageBox::Yes)
+                return;
+            QSettings().setValue("memo/replyToWarned", true);
+        }
+        fnAddReplyTo();
+    });
 
     memoDialog.memoTxt->setPlainText(currentMemo);
     memoDialog.memoTxt->setFocus();
 
+    // Programmatic reply-to (e.g. recurring/scheduled sends): never block on a dialog
+    // -- the persistent tooltip + one-time manual consent cover the interactive case.
     if (includeReplyTo)
         fnAddReplyTo();
 

@@ -1039,11 +1039,17 @@ void RPC::refreshAddresses() {
                 taddresses->push_back(addr);
         }
 
-        // If there are no t Addresses, create one
-        newTaddr([=] (json reply) {
-            // What if taddress gets deleted before this executes?
-            taddresses->append(QString::fromStdString(reply.get<json::string_t>()));
-        });
+        // If there are no t Addresses, create one. This callback runs on every
+        // block-height change (and again from addNewZaddr), so without the
+        // isEmpty() guard we minted a fresh transparent key roughly every block --
+        // silently bloating wallet.dat and the user's public on-chain footprint.
+        // Guarded to fire once, exactly as the comment always intended.
+        if (taddresses->isEmpty()) {
+            newTaddr([=] (json reply) {
+                // What if taddress gets deleted before this executes?
+                taddresses->append(QString::fromStdString(reply.get<json::string_t>()));
+            });
+        }
     });
 }
 
@@ -1106,6 +1112,21 @@ void RPC::refreshBalances() {
             cs.setValue("cache/balShielded",    balZ);
             cs.setValue("cache/balTotal",       balTotal);
             cs.setValue("cache/lastSyncEpoch",  QDateTime::currentSecsSinceEpoch());
+        }
+
+        // FUND-SAFETY: this wallet has no seed phrase, so an un-backed-up wallet.dat
+        // is permanent, unrecoverable loss. Once we are fully synced AND the user
+        // actually holds a balance, prompt them to back up -- exactly ONCE per run.
+        // promptWalletBackup() is itself permanently silenced after a successful
+        // backup (options/walletbackedup), and the session one-shot here guarantees
+        // we never re-pop the dialog on subsequent balance polls (privacy-without-
+        // annoyance: it fires on the synced edge, not every refresh).
+        static bool backupPromptShownThisSession = false;
+        if (!backupPromptShownThisSession &&
+            !Settings::getInstance()->isSyncing() &&
+            balTotal > 0) {
+            backupPromptShownThisSession = true;
+            main->promptWalletBackup();
         }
     });
 

@@ -1793,13 +1793,24 @@ void MainWindow::setupRecieveTab() {
     };
 
     // Connect t-addr radio button
-    QObject::connect(ui->rdioTAddr, &QRadioButton::toggled, [=] (bool checked) { 
+    QObject::connect(ui->rdioTAddr, &QRadioButton::toggled, [=] (bool checked) {
         // Whenever the t-address is selected, we generate a new address, because we don't
         // want to reuse t-addrs
-        if (checked && this->rpc->getUTXOs() != nullptr) { 
+        if (checked && this->rpc->getUTXOs() != nullptr) {
             updateTAddrCombo(checked);
             addNewTAddr();
-        } 
+        }
+        if (checked) {
+            // Transparent addresses are PUBLIC -- make that impossible to miss.
+            // Reuses the existing red warning label (the Sapling/Sprout branches set
+            // their own text/visibility), so no new widget is needed.
+            ui->lblSproutWarning->setText(tr(
+                "<html><head/><body><p><b>Transparent address.</b> This address and any "
+                "balance it holds are <b>PUBLIC</b> and permanently visible to everyone "
+                "on the blockchain. For privacy, receive to a shielded (z) address "
+                "instead.</p></body></html>"));
+            ui->lblSproutWarning->setVisible(true);
+        }
     });
 
     // Sprout Warning is hidden by default
@@ -1817,27 +1828,41 @@ void MainWindow::setupRecieveTab() {
         
         addZAddrsToComboList(false)(checked);
 
+        // Legacy Sprout deprecation warning (only on the pre-2.0.4 daemon). Set the
+        // text explicitly here because the t-Addr branch reuses this same label for
+        // its PUBLIC warning, so we must restore the Sprout message when re-showing.
         bool showWarning = checked && Settings::getInstance()->getZClassicdVersion() < 2000425;
+        if (showWarning) {
+            ui->lblSproutWarning->setText(tr(
+                "<html><head/><body><p>You should suspend trust in the receipt of funds "
+                "to Sprout z-addresses until you upgrade to zclassicd v2.0.4. See "
+                "<a href=\"https://z.cash/support/security/announcements/security-announcement-2019-03-19/\">"
+                "<span style=\" text-decoration: underline; color:#0000ff;\">Security Announcement</span></a>."
+                "</p></body></html>"));
+        }
         ui->lblSproutWarning->setVisible(showWarning);
     });
 
-    QObject::connect(ui->rdioZSAddr, &QRadioButton::toggled, addZAddrsToComboList(true));
+    QObject::connect(ui->rdioZSAddr, &QRadioButton::toggled, [=] (bool checked) {
+        addZAddrsToComboList(true)(checked);
+        // Sapling is shielded/private: clear any transparent-or-Sprout warning text
+        // the other radios may have left visible.
+        if (checked)
+            ui->lblSproutWarning->setVisible(false);
+    });
 
     // Explicitly get new address button.
     QObject::connect(ui->btnRecieveNewAddr, &QPushButton::clicked, [=] () {
         if (!rpc->getConnection())
             return;
 
-        if (ui->rdioZAddr->isChecked()) {
-            QString syncMsg = !Settings::getInstance()->isSaplingActive() ? "Please wait for your node to finish syncing to create Sapling addresses.\n\n" : "";
-            auto confirm = QMessageBox::question(this, "Sprout Address",
-                syncMsg + "Sprout addresses are inefficient, and will be deprecated in the future in favour of Sapling addresses.\n"
-                "Are you sure you want to create a new Sprout address?", QMessageBox::Yes, QMessageBox::No);
-            if (confirm != QMessageBox::Yes)
-                return;
-            
-            addNewZaddr(false); 
-        } else if (ui->rdioZSAddr->isChecked()) {
+        // New-address creation is shielded Sapling or transparent only. Creating NEW
+        // legacy Sprout addresses is removed (Sprout is deprecated); rdioZAddr remains
+        // purely a read/select view of any EXISTING Sprout funds -- spending them is
+        // unaffected. Under rdioZAddr the button is already disabled (toggle handler),
+        // so dropping this branch is also a belt-and-suspenders guard against a
+        // user ever minting a fresh deprecated Sprout address.
+        if (ui->rdioZSAddr->isChecked()) {
             addNewZaddr(true);
         } else if (ui->rdioTAddr->isChecked()) {
             addNewTAddr();

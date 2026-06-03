@@ -70,6 +70,11 @@ void SentTxStore::addToSentTx(Tx tx, QString txid) {
 
         QFile newFile(writeableFile());
         newFile.open(QFile::WriteOnly);
+        // 0600: this file records every outgoing shielded send (recipient addresses
+        // + amounts) as plaintext JSON. Restrict it to the owner so other local
+        // users/processes cannot harvest the user's private send history. (On
+        // Windows the POSIX bits map weakly; this mainly hardens Linux/macOS.)
+        newFile.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
         newFile.write(jsonDoc.toJson());
         newFile.close();
     } else {
@@ -109,7 +114,9 @@ void SentTxStore::addToSentTx(Tx tx, QString txid) {
 
     QFile writer(writeableFile());
     if (writer.open(QFile::WriteOnly | QFile::Truncate)) {
+        // 0600 owner-only (see above): this is the plaintext shielded send history.
+        writer.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
         writer.write(jsonDoc.toJson());
-    } 
+    }
     writer.close();
 }
