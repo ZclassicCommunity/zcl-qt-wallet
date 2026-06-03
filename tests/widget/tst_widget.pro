@@ -21,7 +21,7 @@ TARGET   = tst_widget
 CONFIG  += c++14 console precompile_header
 CONFIG  -= app_bundle
 
-QT      += core gui network widgets testlib
+QT      += core gui network widgets testlib svg
 
 PRECOMPILED_HEADER = ../../src/precompiled.h
 
@@ -50,6 +50,7 @@ SOURCES += \
     ../../src/mainwindow.cpp \
     ../../src/rpc.cpp \
     ../../src/balancestablemodel.cpp \
+    ../../src/privacybadgedelegate.cpp \
     ../../src/3rdparty/qrcode/BitBuffer.cpp \
     ../../src/3rdparty/qrcode/QrCode.cpp \
     ../../src/3rdparty/qrcode/QrSegment.cpp \
@@ -71,6 +72,7 @@ SOURCES += \
 # Q_OBJECT, plus singleapplication).
 HEADERS += \
     ../../src/mainwindow.h \
+    ../../src/privacybadgedelegate.h \
     ../../src/qrcodelabel.h \
     ../../src/fillediconlabel.h \
     ../../src/addresscombo.h \

@@ -11,6 +11,7 @@
 #include "ui_turnstileprogress.h"
 #include "rpc.h"
 #include "balancestablemodel.h"
+#include "privacybadgedelegate.h"
 #include "settings.h"
 #include "version.h"
 #include "turnstile.h"
@@ -1553,6 +1554,17 @@ void MainWindow::setupBalancesTab() {
     // P0-6: build the prominent sync banner that sits above the balances.
     setupSyncBanner();
 
+    // Phase-2 redesign (privacy badges): install the PrivacyBadgeDelegate on the
+    // balances table WITHOUT any .ui change. BalancesTableModel column layout
+    // (balancestablemodel.cpp headerData/data): col 0 = Address, col 1 = Amount.
+    // The address column gets the privacy pill; the amount column gets the
+    // monospace/tabular/sign-tinted render. (setItemDelegateForColumn works
+    // before or after the model is set in RPC::RPC.)
+    ui->balancesTable->setItemDelegateForColumn(
+        0, new PrivacyBadgeDelegate(PrivacyBadgeDelegate::Mode::Address, ui->balancesTable));
+    ui->balancesTable->setItemDelegateForColumn(
+        1, new PrivacyBadgeDelegate(PrivacyBadgeDelegate::Mode::Amount, ui->balancesTable));
+
     // Double click on balances table
     auto fnDoSendFrom = [=](const QString& addr, const QString& to = QString(), bool sendMax = false) {
         // Find the inputs combo
@@ -1644,6 +1656,18 @@ void MainWindow::setupZClassicdTab() {
 }
 
 void MainWindow::setupTransactionsTab() {
+    // Phase-2 redesign (privacy badges): install the PrivacyBadgeDelegate on the
+    // transactions table WITHOUT any .ui change. TxTableModel column layout
+    // (txtablemodel.cpp ctor/data): col 0 = Type, col 1 = Address, col 2 =
+    // Date/Time, col 3 = Amount. The address column gets the privacy pill (and,
+    // for a send to a transparent recipient, the red De-shield variant — the
+    // delegate reads the sibling Type cell); the amount column gets the
+    // monospace/tabular/sign-tinted render.
+    ui->transactionsTable->setItemDelegateForColumn(
+        1, new PrivacyBadgeDelegate(PrivacyBadgeDelegate::Mode::Address, ui->transactionsTable));
+    ui->transactionsTable->setItemDelegateForColumn(
+        3, new PrivacyBadgeDelegate(PrivacyBadgeDelegate::Mode::Amount, ui->transactionsTable));
+
     // Double click opens up memo if one exists
     QObject::connect(ui->transactionsTable, &QTableView::doubleClicked, [=] (auto index) {
         auto txModel = dynamic_cast<TxTableModel *>(ui->transactionsTable->model());

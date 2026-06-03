@@ -6,6 +6,13 @@
 
 QT       += core gui network
 
+# Phase-2 redesign: QtSvg powers the privacy-badge icon set (PrivacyBadgeDelegate
+# renders the bundled monochrome SVGs as tinted, cached pixmaps). Declaring the
+# module here makes qmake auto-import the static svg image-format plugin into the
+# single-file bundle (it is built but NOT auto-imported otherwise), so the badges
+# render identically on the static Linux/Windows builds and the test harness.
+QT += svg
+
 CONFIG += precompile_header
 
 PRECOMPILED_HEADER = src/precompiled.h
@@ -38,6 +45,7 @@ SOURCES += \
     src/mainwindow.cpp \
     src/rpc.cpp \
     src/balancestablemodel.cpp \
+    src/privacybadgedelegate.cpp \
     src/3rdparty/qrcode/BitBuffer.cpp \
     src/3rdparty/qrcode/QrCode.cpp \
     src/3rdparty/qrcode/QrSegment.cpp \
@@ -59,6 +67,7 @@ HEADERS += \
     src/precompiled.h \
     src/rpc.h \
     src/balancestablemodel.h \
+    src/privacybadgedelegate.h \
     src/3rdparty/qrcode/BitBuffer.hpp \
     src/3rdparty/qrcode/QrCode.hpp \
     src/3rdparty/qrcode/QrSegment.hpp \
