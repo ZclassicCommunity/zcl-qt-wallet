@@ -2500,7 +2500,7 @@ void MainWindow::setupReceivePrivacyDisclosure() {
     // ---- 2) Advanced disclosure toggle --------------------------------------
     btnReceiveAdvanced = new QToolButton(ui->groupBox_6);
     btnReceiveAdvanced->setObjectName("btnReceiveAdvanced");   // qss hook
-    btnReceiveAdvanced->setText(tr("Other address types (advanced)"));
+    btnReceiveAdvanced->setText(tr("Public (transparent) address — balance visible to everyone"));
     btnReceiveAdvanced->setCheckable(true);
     btnReceiveAdvanced->setChecked(false);
     btnReceiveAdvanced->setCursor(Qt::PointingHandCursor);
@@ -2519,8 +2519,10 @@ void MainWindow::setupReceivePrivacyDisclosure() {
     advCaption->setObjectName("lblReceiveAdvancedCaption");
     advCaption->setWordWrap(true);
     advCaption->setText(tr(
-        "Most people never need these. Transparent (t) addresses are PUBLIC; "
-        "legacy Sprout is shown only for funds you already hold."));
+        "⚠  Transparent (t) addresses are PUBLIC: the address and any balance it "
+        "holds are permanently visible to everyone on the blockchain. For privacy, "
+        "receive to a shielded (z) address instead. Legacy Sprout is shown only for "
+        "funds you already hold."));
 
     auto* radiosRow = new QHBoxLayout();
     radiosRow->setContentsMargins(0, 0, 0, 0);

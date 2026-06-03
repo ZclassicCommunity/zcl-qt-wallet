@@ -270,6 +270,11 @@ void RPC::setConnection(Connection* c) {
     delete conn;
     this->conn = c;
 
+    // W1-6: a new connection may be a different node/chain, so drop the sent-z
+    // confirmation cache; we must never carry stale deep-conf counts across a reconnect.
+    sentZConfCache.clear();
+    sentZConfCacheHeight = 0;
+
     // Don't claim "Ready!" here -- we've only just connected to the node; it may
     // still be syncing. The real status (Syncing %/Connected) is set by the
     // getblockchaininfo poll a moment later.
@@ -280,13 +285,22 @@ void RPC::setConnection(Connection* c) {
     Settings::removeFromZClassicConf(zclassicConfLocation, "rescan");
     Settings::removeFromZClassicConf(zclassicConfLocation, "reindex");
 
-    // Refresh the UI
-    refreshZCLPrice();    
-    checkForUpdate();
-
-    // Force update, because this might be coming from a settings update
-    // where we need to immediately refresh
+    // W1-3: get the wallet UI onto the screen FIRST. The forced refresh (balances/
+    // transactions) is the critical path the user is waiting on after connect; do it
+    // immediately. This might also be coming from a settings update where we need to
+    // immediately refresh.
     refresh(true);
+
+    // The price ticker and the GitHub update check are NOT on the connect critical
+    // path — they hit the network and (the update check) can pop a modal. Defer them a
+    // few seconds so they never stall the freshly-connected UI. 'main' is the context
+    // object (RPC is not a QObject); since `delete rpc` runs inside ~MainWindow, if the
+    // window is torn down before this fires Qt auto-cancels the singleShot so the
+    // lambda never runs against a freed RPC (UAF-safety, per the line-31 idiom).
+    QTimer::singleShot(4000, main, [this]() {
+        refreshZCLPrice();
+        checkForUpdate();
+    });
 }
 
 void RPC::getTAddresses(const std::function<void(json)>& cb) {
@@ -310,7 +324,7 @@ void RPC::getZAddresses(const std::function<void(json)>& cb) {
     conn->doRPCWithDefaultErrorHandling(payload, cb);
 }
 
-void RPC::getTransparentUnspent(const std::function<void(json)>& cb) {
+void RPC::getTransparentUnspent(const std::function<void(json)>& cb, const std::function<void(void)>& err) {
     json payload = {
         {"jsonrpc", "1.0"},
         {"id", "someid"},
@@ -318,10 +332,14 @@ void RPC::getTransparentUnspent(const std::function<void(json)>& cb) {
         {"params", {0}}             // Get UTXOs with 0 confirmations as well.
     };
 
-    conn->doRPCWithDefaultErrorHandling(payload, cb);
+    // W1-5: use the error-AWARE doRPC (not the default dialog handler) so a failed
+    // unspent query still notifies the caller — otherwise the count==2 join latch in
+    // refreshBalances would hang forever. We swallow the dialog here (no popup during
+    // warmup) and let the caller settle the join; the next refresh retries.
+    conn->doRPC(payload, cb, [=] (QNetworkReply*, const json&) { err(); });
 }
 
-void RPC::getZUnspent(const std::function<void(json)>& cb) {
+void RPC::getZUnspent(const std::function<void(json)>& cb, const std::function<void(void)>& err) {
     json payload = {
         {"jsonrpc", "1.0"},
         {"id", "someid"},
@@ -329,7 +347,7 @@ void RPC::getZUnspent(const std::function<void(json)>& cb) {
         {"params", {0}}             // Get UTXOs with 0 confirmations as well.
     };
 
-    conn->doRPCWithDefaultErrorHandling(payload, cb);
+    conn->doRPC(payload, cb, [=] (QNetworkReply*, const json&) { err(); });
 }
 
 void RPC::newZaddr(bool sapling, const std::function<void(json)>& cb) {
@@ -1271,29 +1289,67 @@ void RPC::refreshBalances() {
     });
 
     // 2. Get the UTXOs
-    // First, create a new UTXO list. It will be replacing the existing list when everything is processed.
-    auto newUtxos = new QList<UnspentOutput>();
-    auto newBalances = new QMap<QString, double>();
+    // W1-5: fire the transparent and z unspent APIs CONCURRENTLY (they were nested/
+    // serialized) and join once BOTH have returned. To avoid any shared-write race,
+    // each completion writes into its OWN temporary (t* / z*); we merge them into the
+    // final balances/utxos ONLY in the join, after both have landed. T-addr and z-addr
+    // keys are disjoint, so the merged result is identical to the old serial fill —
+    // semantics are preserved exactly, only the two round-trips now overlap.
+    struct UnspentJoin {
+        int pending = 2;
+        bool failed = false;
+        QList<UnspentOutput> tUtxos;     QMap<QString, double> tBalances;     bool tUnconfirmed = false;
+        QList<UnspentOutput> zUtxos;     QMap<QString, double> zBalances;     bool zUnconfirmed = false;
+    };
+    auto st = std::make_shared<UnspentJoin>();
 
-    // Call the Transparent and Z unspent APIs serially and then, once they're done, update the UI
+    auto finish = [=]() {
+        if (--st->pending != 0)
+            return;   // wait for the other stream
+
+        // W1-5: if either stream errored, do NOT publish a partial (wrong, too-low)
+        // balance — keep the last-known values and let the next refresh retry. The join
+        // still settles here, so it never hangs.
+        if (st->failed)
+            return;
+
+        // Both streams are in. Merge the two temporaries into the fresh containers
+        // that will replace the live ones.
+        auto newUtxos    = new QList<UnspentOutput>(st->tUtxos);
+        auto newBalances = new QMap<QString, double>(st->tBalances);
+        *newUtxos += st->zUtxos;
+        for (auto it = st->zBalances.constBegin(); it != st->zBalances.constEnd(); ++it)
+            (*newBalances)[it.key()] = (*newBalances)[it.key()] + it.value();
+
+        // Swap out the balances and UTXOs
+        delete allBalances;
+        delete utxos;
+
+        allBalances = newBalances;
+        utxos       = newUtxos;
+
+        updateUI(st->tUnconfirmed || st->zUnconfirmed);
+
+        main->balancesReady();
+    };
+
+    // W1-5 blocker fix: on RPC error, mark the join failed and STILL settle the latch
+    // so it can never hang. doRPC fires exactly one of {cb, err} per stream, so pending
+    // still reaches 0 and finish() runs exactly once.
+    auto fail = [=]() {
+        st->failed = true;
+        finish();
+    };
+
     getTransparentUnspent([=] (json reply) {
-        auto anyTUnconfirmed = processUnspent(reply, newBalances, newUtxos);
+        st->tUnconfirmed = processUnspent(reply, &st->tBalances, &st->tUtxos);
+        finish();
+    }, fail);
 
-        getZUnspent([=] (json reply) {
-            auto anyZUnconfirmed = processUnspent(reply, newBalances, newUtxos);
-
-            // Swap out the balances and UTXOs
-            delete allBalances;
-            delete utxos;
-
-            allBalances = newBalances;
-            utxos       = newUtxos;
-
-            updateUI(anyTUnconfirmed || anyZUnconfirmed);
-
-            main->balancesReady();
-        });        
-    });
+    getZUnspent([=] (json reply) {
+        st->zUnconfirmed = processUnspent(reply, &st->zBalances, &st->zUtxos);
+        finish();
+    }, fail);
 }
 
 void RPC::refreshTransactions() {    
@@ -1335,48 +1391,88 @@ void RPC::refreshSentZTrans() {
     if  (conn == nullptr) 
         return noConnection();
 
+    // W1-6 reorg safety: the deep-confirmed entries below stop being re-queried, so a
+    // reorg would otherwise freeze their now-wrong counts. If the chain height moved
+    // BACKWARD since the cache was last filled, a reorg happened — drop the whole cache
+    // so every tx is re-queried fresh (reorgs are rare, so a full re-query is fine).
+    int curHeight = Settings::getInstance()->getBlockNumber();
+    if (curHeight < sentZConfCacheHeight)
+        sentZConfCache.clear();
+    sentZConfCacheHeight = curHeight;
+
     auto sentZTxs = SentTxStore::readSentTxFile();
 
-    // If there are no sent z txs, then empty the table. 
+    // If there are no sent z txs, then empty the table.
     // This happens when you clear history.
     if (sentZTxs.isEmpty()) {
+        sentZConfCache.clear();   // history cleared — drop orphaned cache entries
         transactionsTableModel->addZSentData(sentZTxs);
         return;
     }
 
-    QList<QString> txids;
-
-    for (auto sentTx: sentZTxs) {
-        txids.push_back(sentTx.txid);
+    // W1-6: throttle the per-block gettransaction storm. A sent z-tx that is already
+    // DEEPLY confirmed (>= kDeepConfirmations) will never meaningfully change, so we
+    // stop re-querying it: its last (>= kDeepConfirmations) count is served straight
+    // from sentZConfCache. Only the SHALLOW/unconfirmed subset (and any txid we've
+    // never seen) is re-batched. This keeps the confirmation display correct —
+    // deeply-confirmed rows stay shown with their cached deep count — while collapsing
+    // the batch on an established wallet to just the few young transactions.
+    QList<QString> shallowTxids;
+    for (auto& sentTx : sentZTxs) {
+        auto cached = sentZConfCache.find(sentTx.txid);
+        if (cached != sentZConfCache.end() && cached.value() >= kDeepConfirmations)
+            continue;   // deeply confirmed -> served from cache, no re-query
+        shallowTxids.push_back(sentTx.txid);
     }
 
-    // Look up all the txids to get the confirmation count for them. 
-    conn->doBatchRPC<QString>(txids,
+    // Apply any cached counts (deep or shallow) so the rendered list reflects what we
+    // already know; the batch below refreshes only the shallow subset on top of this.
+    auto applyCache = [this](QList<TransactionItem>& list) {
+        for (TransactionItem& sentTx : list) {
+            auto cached = sentZConfCache.find(sentTx.txid);
+            if (cached != sentZConfCache.end())
+                sentTx.confirmations = (unsigned long)cached.value();
+        }
+    };
+
+    // Everything is deeply confirmed -> nothing to query. Render from cache and return.
+    if (shallowTxids.isEmpty()) {
+        auto newSentZTxs = sentZTxs;
+        applyCache(newSentZTxs);
+        transactionsTableModel->addZSentData(newSentZTxs);
+        return;
+    }
+
+    // Look up only the shallow/unconfirmed txids to refresh their confirmation count.
+    conn->doBatchRPC<QString>(shallowTxids,
         [=] (QString txid) {
             json payload = {
                 {"jsonrpc", "1.0"},
                 {"id", "senttxid"},
                 {"method", "gettransaction"},
-                {"params", {txid.toStdString()}} 
+                {"params", {txid.toStdString()}}
             };
 
             return payload;
-        },          
+        },
         [=] (QMap<QString, json>* txidList) {
             auto newSentZTxs = sentZTxs;
-            // Update the original sent list with the confirmation count
-            // TODO: This whole thing is kinda inefficient. We should probably just update the file
-            // with the confirmed block number, so we don't have to keep calling gettransaction for the
-            // sent items.
+            // Seed every row from the cache first (so deeply-confirmed rows we did NOT
+            // re-query keep their last known count), then overlay the fresh shallow
+            // results and update the cache.
+            applyCache(newSentZTxs);
             for (TransactionItem& sentTx: newSentZTxs) {
                 auto j = txidList->value(sentTx.txid);
                 if (j.is_null())
                     continue;
                 auto error = j["confirmations"].is_null();
-                if (!error)
-                    sentTx.confirmations = j["confirmations"].get<json::number_unsigned_t>();
+                if (!error) {
+                    auto confs = j["confirmations"].get<json::number_unsigned_t>();
+                    sentTx.confirmations = confs;
+                    sentZConfCache[sentTx.txid] = (long)confs;   // remember; deep ones stop re-querying
+                }
             }
-            
+
             transactionsTableModel->addZSentData(newSentZTxs);
             delete txidList;
         }
@@ -1473,8 +1569,19 @@ void RPC::watchTxStatus() {
 }
 
 void RPC::checkForUpdate(bool silent) {
-    if  (conn == nullptr) 
+    if  (conn == nullptr)
         return noConnection();
+
+    // W1-3: the very FIRST automatic (silent) update check after launch must not pop
+    // the "Update Available" modal on top of the just-opened window — it stalls the
+    // perceived startup. Suppress the modal for that first auto check ONLY; we do NOT
+    // mark the version as hidden, so a LATER automatic re-check (the periodic one)
+    // still surfaces it, and a user-initiated (non-silent) Help->Check always shows it.
+    bool suppressFirstModal = false;
+    if (silent && !firstUpdateCheckDone) {
+        firstUpdateCheckDone = true;
+        suppressFirstModal   = true;
+    }
 
     QUrl cmcURL("https://api.github.com/repos/ZClassicFoundation/zcl-qt-wallet/releases");
 
@@ -1515,7 +1622,7 @@ void RPC::checkForUpdate(bool silent) {
 
                 qDebug() << "Version check: Current " << currentVersion << ", Available " << maxVersion;
 
-                if (maxVersion > currentVersion && (!silent || maxVersion > maxHiddenVersion)) {
+                if (maxVersion > currentVersion && !suppressFirstModal && (!silent || maxVersion > maxHiddenVersion)) {
                     auto ans = QMessageBox::information(main, QObject::tr("Update Available"), 
                         QObject::tr("A new release v%1 is available! You have v%2.\n\nWould you like to visit the releases page?")
                             .arg(maxVersion.toString())

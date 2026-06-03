@@ -229,8 +229,8 @@ private:
 
     void getBalance(const std::function<void(json)>& cb);
 
-    void getTransparentUnspent  (const std::function<void(json)>& cb);
-    void getZUnspent            (const std::function<void(json)>& cb);
+    void getTransparentUnspent  (const std::function<void(json)>& cb, const std::function<void(void)>& err);
+    void getZUnspent            (const std::function<void(json)>& cb, const std::function<void(void)>& err);
     void getTransactions        (const std::function<void(json)>& cb);
     void getZAddresses          (const std::function<void(json)>& cb);
     void getTAddresses          (const std::function<void(json)>& cb);
@@ -329,6 +329,24 @@ private:
 
     // Current balance in the UI. If this number updates, then refresh the UI
     QString                     currentBalance;
+
+    // W1-3: defer the price/update fetch out of the connect critical path. The
+    // first checkForUpdate() after launch must NOT pop the update-available modal
+    // on top of the freshly-opened window (it stalls perceived startup). The modal
+    // is suppressed exactly once — the version is recorded so a LATER check still
+    // surfaces it (and a non-silent, user-initiated Help->Check still always shows).
+    bool                        firstUpdateCheckDone        = false;
+
+    // W1-6: throttle the sent-z confirmation refresh. Cache the last-seen
+    // confirmation count per sent-z txid; once a tx is deeply confirmed
+    // (>= kDeepConfirmations) we stop re-querying gettransaction for it and reuse
+    // the cached deep count, re-batching only the shallow/unconfirmed subset.
+    QMap<QString, long>         sentZConfCache;
+    static constexpr long       kDeepConfirmations          = 10;
+    // W1-6 reorg safety: the chain height the cache reflects. A backward move => reorg
+    // => drop the cache so a deep-confirmed row can't keep showing a stale (too-high)
+    // confirmation count after the chain rewinds.
+    int                         sentZConfCacheHeight        = 0;
 
 #ifdef ZCL_WIDGET_TEST
     // MAJOR-3 test seam backing store: the address the next newZaddr(true) returns
