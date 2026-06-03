@@ -445,6 +445,37 @@ void RPC::getBalance(const std::function<void(json)>& cb) {
     conn->doRPCWithDefaultErrorHandling(payload, cb);
 }
 
+// INSTANT-BALANCE fast path. getwalletsummary returns the wallet's transparent and
+// private (shielded) totals in ONE round-trip from the daemon's cached note-value
+// accessors (no per-note re-decrypt, no per-address listunspent join), so the hero
+// balance paints instantly on connect — this REPLACES the slow z_gettotalbalance
+// hero query when the daemon supports it (see refreshBalances).
+//
+// MONEY-CORRECTNESS: we pass minconf=0 to match getBalance()'s z_gettotalbalance {0}
+// to the satoshi — daemon-side getwalletsummary(0).transparent == getBalanceTaddr("",0)
+// (the very call z_gettotalbalance uses) and .private == cached Sprout+Sapling at
+// minconf 0 (proven equal to the slow scan), so .total == z_gettotalbalance(0).total.
+// minconf=0 includes 0-conf funds, exactly as the legacy hero did, so the two paths
+// can never disagree and switching daemons never changes the displayed number.
+//
+// Amounts are FormatMoney decimal strings (identical representation to
+// z_gettotalbalance). We use the error-AWARE doRPC (not the default dialog handler)
+// and forward the parsed JSON-RPC body to the err cb so the caller can detect -32601
+// ("Method not found") on an OLD daemon and latch the capability off — no warmup/
+// transient error pops a dialog here. KEY-1: reads ONLY balance numbers; no key
+// material involved.
+void RPC::getWalletSummary(const std::function<void(json)>& cb,
+                           const std::function<void(const json&)>& err) {
+    json payload = {
+        {"jsonrpc", "1.0"},
+        {"id", "someid"},
+        {"method", "getwalletsummary"},
+        {"params", {0}}             // minconf=0: match z_gettotalbalance {0} exactly.
+    };
+
+    conn->doRPC(payload, cb, [=] (QNetworkReply*, const json& parsed) { err(parsed); });
+}
+
 void RPC::getTransactions(const std::function<void(json)>& cb) {
     json payload = {
         {"jsonrpc", "1.0"},
@@ -1253,12 +1284,31 @@ bool RPC::processUnspent(const json& reply, QMap<QString, double>* balancesMap, 
     return anyUnconfirmed;
 };
 
-void RPC::refreshBalances() {    
-    if  (conn == nullptr) 
+void RPC::refreshBalances() {
+    if  (conn == nullptr)
         return noConnection();
 
-    // 1. Get the Balances
-    getBalance([=] (json reply) {    
+    // 1. Get the Balances — the hero numbers (transparent / shielded / total).
+    //
+    // SINGLE WRITER, two interchangeable sources. getwalletsummary {0} and
+    // z_gettotalbalance {0} return the SAME three FormatMoney fields and (proven) the
+    // SAME satoshi totals, so we pick exactly ONE per cycle and feed it through a
+    // shared paint routine — never both concurrently. That removes any last-writer
+    // race over the hero labels/cache.
+    //   * New daemon (summaryCapable): getwalletsummary is the SOLE hero source. It
+    //     reads the daemon's cached note values in one round-trip (no per-note
+    //     re-decrypt), so the hero is fast in ALL cases, not just the first paint. We
+    //     SKIP the slow z_gettotalbalance entirely on this path.
+    //   * Old daemon: the FIRST summary call returns JSON-RPC -32601 ("Method not
+    //     found"); we latch summaryCapable=false (never call it again this session)
+    //     and fall back to z_gettotalbalance — identical to the legacy behavior.
+    //   * Any transient summary error (warmup -28, network) does NOT latch; we just
+    //     fall back to z_gettotalbalance for THIS cycle so the hero still updates, and
+    //     retry the summary on the next poll.
+    // The per-address listunspent join (step 2 below) ALWAYS runs and remains the sole
+    // owner of the per-address balances model / UTXO set; it does not touch the hero.
+    auto paintHero = std::function<void(json)>([=] (json reply) {
+        // Amounts are FormatMoney decimal STRINGS from either source.
         auto balT      = QString::fromStdString(reply["transparent"]).toDouble();
         auto balZ      = QString::fromStdString(reply["private"]).toDouble();
         auto balTotal  = QString::fromStdString(reply["total"]).toDouble();
@@ -1275,6 +1325,7 @@ void RPC::refreshBalances() {
         // fix-it card from these same freshly-set balances. We pass the transparent
         // amount we already have (balT) rather than re-querying; the hero reads the
         // labels just set above. The card shows only when balT > 0, hides at 0.
+        // updateHomeFixIt() emits heroBalancesPainted() at its end.
         main->updateHomeFixIt(balT);
 
         // Remember the last-known balances so the next launch can paint them
@@ -1306,6 +1357,42 @@ void RPC::refreshBalances() {
             main->showBackupNag();
         }
     });
+
+    if (summaryCapable) {
+        getWalletSummary([=] (json reply) {
+            // Well-formed summary => it is the sole hero source this cycle. Require all
+            // three fields to be present AND strings (a forked/buggy daemon returning a
+            // numeric or partial object falls back rather than throwing or painting
+            // garbage).
+            if (reply.is_null() ||
+                reply.find("transparent") == reply.end() || !reply["transparent"].is_string() ||
+                reply.find("private")     == reply.end() || !reply["private"].is_string()     ||
+                reply.find("total")       == reply.end() || !reply["total"].is_string()) {
+                getBalance(paintHero);   // defensive: authoritative slow path this cycle
+                return;
+            }
+            paintHero(reply);
+        },
+        [=] (const json& parsed) {
+            // -32601 "Method not found" => OLD daemon: latch the capability off so we
+            // never call getwalletsummary again this session and log ONE diagnostic.
+            // Any OTHER error (warmup -28, transient network) does NOT latch.
+            if (!parsed.is_discarded() &&
+                parsed.find("error") != parsed.end() && parsed["error"].is_object() &&
+                parsed["error"].find("code") != parsed["error"].end() &&
+                parsed["error"]["code"].is_number_integer() &&
+                parsed["error"]["code"].get<int>() == -32601) {
+                summaryCapable = false;
+                main->logger->write("Daemon lacks getwalletsummary (-32601); "
+                                    "using z_gettotalbalance for balances this session");
+            }
+            // Either way, paint the hero from the authoritative slow path THIS cycle so
+            // a summary failure never leaves the hero stale.
+            getBalance(paintHero);
+        });
+    } else {
+        getBalance(paintHero);
+    }
 
     // 2. Get the UTXOs
     // W1-5: fire the transparent and z unspent APIs CONCURRENTLY (they were nested/

@@ -229,6 +229,16 @@ private:
 
     void getBalance(const std::function<void(json)>& cb);
 
+    // INSTANT-BALANCE fast path: one getwalletsummary call returns the wallet's
+    // transparent + private (shielded) totals in a single round-trip (no per-address
+    // listunspent join), letting the hero balance paint instantly on connect. The
+    // success cb receives the raw summary json; the err cb receives the parsed
+    // JSON-RPC body so the caller can detect -32601 ("Method not found") on an OLD
+    // daemon that lacks the method and latch summaryCapable=false. KEY-1: this reads
+    // ONLY balance numbers — no key material is ever returned, serialized, or logged.
+    void getWalletSummary(const std::function<void(json)>& cb,
+                          const std::function<void(const json&)>& err);
+
     void getTransparentUnspent  (const std::function<void(json)>& cb, const std::function<void(void)>& err);
     void getZUnspent            (const std::function<void(json)>& cb, const std::function<void(void)>& err);
     void getTransactions        (const std::function<void(json)>& cb);
@@ -301,6 +311,22 @@ private:
     // sync polls OR after the chain tip has demonstrably advanced past warmup.
     int                         ezHealthyPolls              = 0;
     bool                        ezWarmupWedgeCleared        = false;
+
+    // INSTANT-BALANCE daemon-capability gate. We assume the connected daemon supports
+    // getwalletsummary — the single-round-trip total (read from the daemon's cached
+    // note values, no per-note re-decrypt) used to paint the hero balance fast on
+    // every refresh. When true, getwalletsummary {0} is the SOLE hero source and the
+    // slow z_gettotalbalance is skipped; when false z_gettotalbalance is the SOLE
+    // source instead. The FIRST refreshBalances() this session doubles as the version
+    // probe: if getwalletsummary returns JSON-RPC -32601 ("Method not found") — i.e.
+    // an OLD daemon — this latches to false and we NEVER call it again this session,
+    // falling back EXACTLY to the legacy z_gettotalbalance path. Any OTHER (transient)
+    // summary error does NOT latch; that cycle paints from z_gettotalbalance and the
+    // next poll retries the summary. getwalletsummary {0} and z_gettotalbalance {0}
+    // return the same satoshi totals, so the displayed number is identical regardless
+    // of source. The per-address listunspent join remains the sole owner of the
+    // per-address balances model / UTXO set and never touches the hero labels.
+    bool                        summaryCapable              = true;
 
     Connection*                 conn                        = nullptr;
     QProcess*                   ezclassicd                     = nullptr;
