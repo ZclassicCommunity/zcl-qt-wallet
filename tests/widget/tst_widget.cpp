@@ -980,6 +980,150 @@ private slots:
                  "stop() must remove the token file");
     }
 
+    // ====================================================================
+    // NOTIFY-SRV push WIRING (STEP 1.2c / 1.3). The launch-arg + poll-interval
+    // decisions are factored into pure static helpers (RPC::buildNotifyArgs /
+    // RPC::desiredPollMs) so they are asserted here with NO daemon; the debounce
+    // is pinned at the QTimer-semantics level (the full RPC->refresh round trip
+    // needs a live daemon and is covered by the L2 E2E).
+    // ====================================================================
+
+    // The -walletnotify/-blocknotify args wire the daemon to OUR `--notify %s`
+    // connector and MUST NOT leak the token onto the command line (it lives only in
+    // the 0600 token file). Assert: exactly one of each arg, each ends with
+    // "--notify %s", each quotes the (possibly spaced) exe path, and NEITHER carries a
+    // 64-hex token.
+    void n10_notifyArgsShapeAndNoToken() {
+        const QString exe = "/path with spaces/ZclWallet";
+        const QStringList args = RPC::buildNotifyArgs(exe);
+
+        int wallet = 0, block = 0;
+        for (const QString& a : args) {
+            if (a.startsWith("-walletnotify=")) ++wallet;
+            if (a.startsWith("-blocknotify="))  ++block;
+        }
+        QCOMPARE(args.size(), 2);
+        QCOMPARE(wallet, 1);
+        QCOMPARE(block, 1);
+
+        QRegularExpression tokenRe("[0-9a-f]{64}");
+        for (const QString& a : args) {
+            // Connector form: "<exe>" --notify %s  (token NEVER on the arg).
+            QVERIFY2(a.endsWith("--notify %s"), qPrintable("arg must end with --notify %s: " + a));
+            QVERIFY2(a.contains("\"" + exe + "\""),
+                     qPrintable("exe path must be quoted (may contain spaces): " + a));
+            QVERIFY2(!tokenRe.match(a).hasMatch(),
+                     qPrintable("notify arg must NOT carry a 64-hex token: " + a));
+        }
+    }
+
+    // The poll-interval picker: while syncing -> always quick (lively banner); synced +
+    // a healthy push channel -> heartbeat only (push drives updates); synced + stale/no
+    // push (foreign/headless/quiet) -> the normal 20s fallback poll.
+    void n11_desiredPollMs() {
+        // synced + healthy push -> heartbeat
+        QCOMPARE(RPC::desiredPollMs(false, true),  RPC::kHeartbeatPollMs);
+        QCOMPARE(RPC::desiredPollMs(false, true),  120 * 1000);
+        // synced + stale / no push -> normal poll fallback (PERF-5 / PERF-24)
+        QCOMPARE(RPC::desiredPollMs(false, false), Settings::updateSpeed);
+        // syncing always polls fast, regardless of push health
+        QCOMPARE(RPC::desiredPollMs(true,  false), Settings::quickUpdateSpeed);
+        QCOMPARE(RPC::desiredPollMs(true,  true),  Settings::quickUpdateSpeed);
+    }
+
+    // Debounce semantics: the production debounce window is the single-shot
+    // kNotifyDebounceMs, and a burst of pushes inside one window must coalesce to ONE
+    // fire after the quiet point. Pin the constant + the single-shot coalescing here at
+    // the QTimer level (the production timer in RPC uses exactly this shape).
+    void n12_debounceCoalescesBurst() {
+        QCOMPARE(RPC::kNotifyDebounceMs, 200);
+
+        int fired = 0;
+        QTimer debounce;
+        debounce.setSingleShot(true);
+        QObject::connect(&debounce, &QTimer::timeout, [&]() { ++fired; });
+
+        // A burst of 5 pushes each (re)starts the single-shot timer; only the last
+        // restart's window elapses -> exactly one fire.
+        for (int i = 0; i < 5; ++i) {
+            debounce.start(RPC::kNotifyDebounceMs);   // mirrors RPC::onNotifyPush()
+            QTest::qWait(20);                          // well inside the 200ms window
+        }
+        QCOMPARE(fired, 0);                            // still coalescing, not yet fired
+        QTest::qWait(RPC::kNotifyDebounceMs + 200);    // let the quiet window elapse
+        QCOMPARE(fired, 1);                            // burst coalesced to a single fire
+
+        // A second, separate push after the quiet window fires again (one more).
+        debounce.start(RPC::kNotifyDebounceMs);
+        QTest::qWait(RPC::kNotifyDebounceMs + 200);
+        QCOMPARE(fired, 2);
+    }
+
+    // A NotifyServer::notified BURST (the real signal, driven over the socket) coalesces
+    // to a single downstream refresh when fed through the same single-shot debounce
+    // RPC wires in onNotifyPush(). This exercises the real signal -> debounce seam
+    // (without needing a live RPC/daemon): N validated notifies -> 1 refresh.
+    void n13_notifiedBurstCoalescesToOneRefresh() {
+        NotifyServer srv;
+        const QString p = notifySockPath("n13");
+        QVERIFY(srv.start(p));
+
+        int refreshes = 0;
+        QTimer debounce;                               // stand-in for RPC::notifyDebounce
+        debounce.setSingleShot(true);
+        QObject::connect(&debounce, &QTimer::timeout, [&]() { ++refreshes; });
+        // Same wiring RPC::setEZClassicd() installs: notified -> (re)start the debounce.
+        QObject::connect(&srv, &NotifyServer::notified, [&](const QString&) {
+            debounce.start(RPC::kNotifyDebounceMs);
+        });
+
+        const QByteArray tok = srv.token().toLatin1();
+        const QByteArray id(64, 'a');
+        // Fire a burst of validated notifies tightly together (block + its wallet txns).
+        for (int i = 0; i < 4; ++i) {
+            QLocalSocket* c = notifySendLine(p, tok + " " + id + "\n");
+            QVERIFY(c);
+            QTest::qWait(15);                          // inside the debounce window
+            c->disconnectFromServer(); c->deleteLater();
+        }
+        QTest::qWait(RPC::kNotifyDebounceMs + 300);    // quiet window elapses
+        QCOMPARE(refreshes, 1);                        // 4 notifies -> 1 refresh
+    }
+
+    // n14 — REAL production seam (not a stand-in): a non-headless RPC must construct
+    // its NotifyServer (1.2c ctor gate), and the ACTUAL RPC::onNotifyPush() must arm
+    // the ACTUAL single-shot RPC::notifyDebounce (1.3). Catches a regression that the
+    // mirror-based n12/n13 cannot (e.g. ctor gate removed, debounce not (re)started).
+    // makeWindow() forces headless=true (notifyServer is null there), so this builds a
+    // non-headless window directly. refresh(true) on the eventual fire safely no-ops
+    // (getInfoThenRefresh early-returns on conn==nullptr).
+    void n14_realRpcNotifyWiring() {
+        auto* S = Settings::getInstance();
+        const bool savedHeadless = S->isHeadless();
+        S->setUseEmbedded(false);
+        S->setHeadless(false);             // non-headless -> RPC ctor builds notifyServer
+        S->setSyncing(false);
+        S->setPeers(8);
+        S->setZClassicdVersion(2001250);
+        MainWindow* w = new MainWindow(nullptr);
+        w->show();
+        RPC* rpc = w->getRPC();
+
+        QVERIFY2(rpc->getNotifyServer() != nullptr,
+                 "non-headless RPC must construct a NotifyServer (1.2c ctor gate)");
+
+        // Drive the REAL onNotifyPush -> REAL notifyDebounce (single-shot, 200ms).
+        rpc->testFireNotifyPush();
+        QVERIFY2(rpc->testNotifyDebounceActive(),
+                 "onNotifyPush() must arm the real notifyDebounce");
+        QTest::qWait(RPC::kNotifyDebounceMs + 200);
+        QVERIFY2(!rpc->testNotifyDebounceActive(),
+                 "the debounce must be single-shot (fired once, now inactive)");
+
+        settleAndDelete(w);
+        S->setHeadless(savedHeadless);
+    }
+
     // ---- POLISH: production-dark-theme page screenshots -------------------------
     // VISUAL POLISH pass evidence. Loads the SHIPPED res/styles/dark.qss (so the
     // shots show the PRODUCTION dark theme, not the default light Fusion look),

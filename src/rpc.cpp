@@ -62,7 +62,29 @@ RPC::RPC(MainWindow* main) {
         watchTxStatus();
     });
     // Start at every 10s. When an operation is pending, this will change to every second
-    txTimer->start(Settings::updateSpeed);  
+    txTimer->start(Settings::updateSpeed);
+
+    // NOTIFY-SRV debounce: single-shot, coalesces a push BURST (a block + its wallet
+    // txns) into one refresh. Same ownership/cleanup pattern as timer/txTimer (parented
+    // to main, deleted in ~RPC, stopped in onAboutToQuit). The timeout runs
+    // refresh(TRUE) -- see onNotifyPush()/the comment below for why force is mandatory.
+    notifyDebounce = new QTimer(main);
+    notifyDebounce->setSingleShot(true);
+    QObject::connect(notifyDebounce, &QTimer::timeout, [=]() {
+        // CRITICAL: force=TRUE. A -walletnotify fires on mempool/unconfirmed wallet
+        // events where the block HEIGHT is unchanged; the height-gate (PERF-20) would
+        // skip refresh(false), so an incoming unconfirmed payment would never repaint.
+        // A validated notify is positive evidence of a change, so force past the gate.
+        refresh(true);
+    });
+
+    // NOTIFY-SRV: mint the per-session push trigger, but ONLY for a non-headless
+    // (GUI) session. Headless/CLI keeps the timer poll and never stands up a socket.
+    // This only constructs the object + mints the token; the socket is started (and
+    // notified() wired) later, ONLY on the owned-daemon launch path. Parented to main
+    // (a QObject) like the timers; ~RPC stops + deletes it explicitly.
+    if (!Settings::getInstance()->isHeadless())
+        notifyServer = new NotifyServer(main);
 
     usedAddresses = new QMap<QString, bool>();
 }
@@ -70,6 +92,7 @@ RPC::RPC(MainWindow* main) {
 RPC::~RPC() {
     delete timer;
     delete txTimer;
+    delete notifyDebounce;
 
     delete transactionsTableModel;
     delete balancesTableModel;
@@ -80,6 +103,14 @@ RPC::~RPC() {
     delete usedAddresses;
     delete zaddresses;
     delete taddresses;
+
+    // NOTIFY-SRV: stop() (removes the socket + the 0600 token file) BEFORE delete so
+    // the on-disk token is invalidated even on this teardown path.
+    if (notifyServer) {
+        notifyServer->stop();
+        delete notifyServer;
+        notifyServer = nullptr;
+    }
 
     delete conn;
 }
@@ -117,6 +148,18 @@ void RPC::setEZClassicd(QProcess* p) {
                          main, [this](int code, QProcess::ExitStatus st) {
             handleEZClassicdCrash(code, st);
         });
+
+        // NOTIFY-SRV: wire the push channel to the debounced refresh, but ONLY when the
+        // socket is actually listening. The socket is started exclusively on the
+        // owned-daemon launch path (startEmbeddedZClassicd); a FOREIGN/systemd daemon we
+        // merely attach to never starts it (isListening() is false), so it stays on the
+        // timer poll and is never wired here. Drop any prior binding first so a
+        // crash-restart re-adopt doesn't stack a second connection.
+        if (notifyServer && notifyServer->isListening()) {
+            QObject::disconnect(notifyServer, &NotifyServer::notified, nullptr, nullptr);
+            QObject::connect(notifyServer, &NotifyServer::notified,
+                             main, [this](const QString&) { onNotifyPush(); });
+        }
     }
 }
 
@@ -684,10 +727,39 @@ void RPC::refreshReceivedZTrans(QList<QString> zaddrs) {
 
 /// This will refresh all the balance data from zclassicd
 void RPC::refresh(bool force) {
-    if  (conn == nullptr) 
+    if  (conn == nullptr)
         return noConnection();
 
     getInfoThenRefresh(force);
+}
+
+// NOTIFY-SRV pure helper: the two daemon args that wire -walletnotify / -blocknotify to
+// THIS exe's `--notify %s` connector. exePath is quoted (may contain spaces); %s sits
+// OUTSIDE the quotes so zclassicd substitutes the txid/blockhash. No token rides here.
+QStringList RPC::buildNotifyArgs(const QString& exePath) {
+    const QString notifyCmd = QStringLiteral("\"%1\" --notify %s").arg(exePath);
+    QStringList args;
+    args << ("-walletnotify=" + notifyCmd) << ("-blocknotify=" + notifyCmd);
+    return args;
+}
+
+// NOTIFY-SRV pure helper: pick the refresh poll interval. While syncing we always
+// poll fast (quickUpdateSpeed) for a lively banner. When synced: a healthy push channel
+// means events are pushed, so we only heartbeat-poll (kHeartbeatPollMs); otherwise keep
+// the normal 20s poll (updateSpeed) -- the fallback for foreign/headless/stale-push.
+int RPC::desiredPollMs(bool isSyncing, bool pushHealthy) {
+    if (isSyncing)
+        return Settings::quickUpdateSpeed;
+    return pushHealthy ? kHeartbeatPollMs : Settings::updateSpeed;
+}
+
+// NOTIFY-SRV: a validated push arrived. Record the epoch (so getInfoThenRefresh sees the
+// channel as healthy and heartbeat-polls) and (re)start the single-shot debounce so a
+// burst of notifies (a block + its wallet txns) coalesces into one refresh.
+void RPC::onNotifyPush() {
+    lastNotifyEpoch = QDateTime::currentSecsSinceEpoch();
+    if (notifyDebounce)
+        notifyDebounce->start(kNotifyDebounceMs);
 }
 
 
@@ -1018,7 +1090,18 @@ void RPC::getInfoThenRefresh(bool force) {
             // lively, and back off to the normal cadence once synced. QTimer::start()
             // restarts with the new interval; only call it when the interval actually
             // changes so we don't reset the period on every tick.
-            int desired = isSyncing ? Settings::quickUpdateSpeed : Settings::updateSpeed;
+            //
+            // NOTIFY-SRV: when a HEALTHY push channel is delivering events (owned daemon
+            // only -- the socket is listening AND a validated notify arrived within the
+            // health window), back the poll WAY off to a heartbeat: pushes drive the
+            // updates, the poll is just a sanity net. If push is stale (channel went
+            // quiet, PERF-5) or absent (foreign/headless -- notifyServer null,
+            // PERF-24), keep the existing 20s/5s poll unchanged.
+            const qint64 now = QDateTime::currentSecsSinceEpoch();
+            const bool pushHealthy = notifyServer && notifyServer->isListening()
+                                     && lastNotifyEpoch != 0
+                                     && (now - lastNotifyEpoch) < kPushHealthyWindowSecs;
+            int desired = desiredPollMs(isSyncing, pushHealthy);
             if (timer && timer->interval() != desired)
                 timer->start(desired);
         });
@@ -1554,9 +1637,10 @@ void RPC::onAboutToQuit() {
     // generic "There was an error connecting to zclassicd" box as the node exits.
     // Set the flag and silence the pollers here so no spurious dialog appears.
     ezExpectedShutdown = true;
-    if (timer)      timer->stop();
-    if (txTimer)    txTimer->stop();
-    if (priceTimer) priceTimer->stop();
+    if (timer)          timer->stop();
+    if (txTimer)        txTimer->stop();
+    if (priceTimer)     priceTimer->stop();
+    if (notifyDebounce) notifyDebounce->stop();
 }
 
 void RPC::shutdownZClassicd() {
@@ -1651,6 +1735,12 @@ void RPC::shutdownZClassicd() {
     }
 
     d.hide();
+
+    // NOTIFY-SRV: the daemon we launched is gone, so tear down the push socket and
+    // remove the 0600 token file. (A fresh restart re-starts it in
+    // startEmbeddedZClassicd before the daemon launches.)
+    if (notifyServer)
+        notifyServer->stop();
 
     // Release the re-entrancy latch now this shutdown has unwound. It serializes
     // re-entrancy WITHIN one shutdown only; it must never latch for the process

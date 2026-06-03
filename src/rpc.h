@@ -8,6 +8,7 @@
 #include "ui_mainwindow.h"
 #include "mainwindow.h"
 #include "connection.h"
+#include "notifyserver.h"
 
 using json = nlohmann::json;
 
@@ -40,6 +41,13 @@ public:
     void setConnection(Connection* c);
     void setEZClassicd(QProcess* p);
     const QProcess* getEZClassicD() { return ezclassicd; }
+
+    // The localhost-only, token-gated push trigger (NOTIFY-SRV). Constructed (and the
+    // per-session token minted) ONLY for a non-headless session; null in headless/CLI.
+    // The socket is started, and notified() wired, ONLY for the node WE launch (the
+    // owned-daemon path) — a foreign/systemd daemon never reaches that wiring, so it
+    // keeps the timer poll. See startEmbeddedZClassicd()/setEZClassicd().
+    NotifyServer* getNotifyServer() { return notifyServer; }
 
     void refresh(bool force = false);
 
@@ -90,6 +98,10 @@ public:
     // installed Connection is never actually USED on these paths (the seeded
     // Sapling address resolves first), only its non-null-ness is checked.
     void testSetConnection(Connection* c) { conn = c; }
+    // NOTIFY-SRV (1.3) real-seam: drive the ACTUAL onNotifyPush()/notifyDebounce
+    // (not a stand-in) so a regression in the production wiring is caught.
+    void testFireNotifyPush() { onNotifyPush(); }
+    bool testNotifyDebounceActive() const { return notifyDebounce && notifyDebounce->isActive(); }
 #endif
 
     void newZaddr(bool sapling, const std::function<void(json)>& cb);
@@ -122,6 +134,30 @@ public:
     void noConnection();
     bool isEmbedded() { return ezclassicd != nullptr; }
 
+    // ---- NOTIFY-SRV push-wiring pure helpers (used by prod + asserted by L1) ----
+    // Build the two daemon notify args (-walletnotify / -blocknotify) that invoke THIS
+    // exe's `--notify %s` connector. The exe path is QUOTED (it may contain spaces);
+    // `%s` is OUTSIDE the quotes so the daemon substitutes the txid/blockhash. NO token
+    // ever rides the command line (it lives in a 0600 file) -- the L1 test asserts the
+    // args carry no 64-hex token. Static + pure so a test can assert it without a daemon.
+    static QStringList buildNotifyArgs(const QString& exePath);
+
+    // Decide the refresh poll interval. While a healthy push channel is delivering
+    // notifies we back the timer WAY off (heartbeat only); when push is stale/absent
+    // (foreign/headless or the channel went quiet) we keep the existing 20s/5s poll.
+    // Static + pure so the decision is unit-tested without an RPC/timer/daemon.
+    static int desiredPollMs(bool isSyncing, bool pushHealthy);
+
+    // Push-channel tuning. kHeartbeatPollMs: the slow poll used while push is healthy
+    // (a sanity heartbeat, not the primary update path). kPushHealthyWindowSecs: how
+    // recent the last validated notify must be for the channel to count as "healthy"
+    // (PERF-5: auto-resume the 20s poll when the channel goes stale).
+    static constexpr int   kHeartbeatPollMs       = 120 * 1000;   // 120 sec
+    static constexpr qint64 kPushHealthyWindowSecs = 180;          // 3 min
+    // Debounce window: coalesce a notify BURST (a block + its wallet txns all fire at
+    // once) into a single refresh shortly after the quiet point.
+    static constexpr int   kNotifyDebounceMs      = 200;
+
     QString getDefaultSaplingAddress();
     QString getDefaultTAddress();
 
@@ -141,6 +177,11 @@ private:
     void updateUI           (bool anyUnconfirmed);
 
     void getInfoThenRefresh(bool force);
+
+    // NOTIFY-SRV: handle a validated push (NotifyServer::notified). Records the epoch
+    // (so getInfoThenRefresh's interval picker sees the channel as healthy) and
+    // (re)starts the single-shot debounce; the debounce timeout runs refresh(TRUE).
+    void onNotifyPush();
 
     // RUNTIME STUB AUTO-HEAL: evaluate (conservatively) whether the live node is a
     // healthy-but-stuck STUB — it started fine, loaded a tiny non-genesis chain from an
@@ -245,6 +286,14 @@ private:
     Connection*                 conn                        = nullptr;
     QProcess*                   ezclassicd                     = nullptr;
 
+    // NOTIFY-SRV push trigger. Owned by RPC (constructed in the ctor for a non-headless
+    // session; stopped in shutdownZClassicd()/onAboutToQuit and stop()+delete in ~RPC).
+    // Null in headless/CLI and never started/wired for a foreign daemon.
+    NotifyServer*               notifyServer                = nullptr;
+    // Epoch (secs) of the last validated push; 0 = none this session. Drives the
+    // push-healthy window in getInfoThenRefresh()'s interval picker.
+    qint64                      lastNotifyEpoch             = 0;
+
     QList<UnspentOutput>*       utxos                       = nullptr;
     QMap<QString, double>*      allBalances                 = nullptr;
     QMap<QString, bool>*        usedAddresses               = nullptr;
@@ -259,6 +308,10 @@ private:
     QTimer*                     timer;
     QTimer*                     txTimer;
     QTimer*                     priceTimer;
+    // Single-shot debounce for NOTIFY-SRV pushes (kNotifyDebounceMs). Same
+    // ownership/cleanup pattern as timer/txTimer (parented to main, deleted in ~RPC,
+    // stopped in onAboutToQuit).
+    QTimer*                     notifyDebounce;
 
     Ui::MainWindow*             ui;
     MainWindow*                 main;

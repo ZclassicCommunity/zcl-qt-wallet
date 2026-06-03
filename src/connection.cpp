@@ -578,6 +578,21 @@ bool ConnectionLoader::startEmbeddedZClassicd(const QStringList& extraArgs) {
         //qDebug() << "zclassicd started";
     });
 
+    // NOTIFY-SRV: stand up the push socket + write the 0600 token file BEFORE launching
+    // the daemon, so the socket is already listening when the node first fires a
+    // -walletnotify/-blocknotify. ONLY on this OWNED-daemon path (rpc->getNotifyServer()
+    // is non-null only for a non-headless session). A foreign/systemd daemon never
+    // reaches here, so its socket is never started and it stays on the timer poll.
+    if (rpc && rpc->getNotifyServer()) {
+        NotifyServer* ns = rpc->getNotifyServer();
+        // Both fail SAFE (a missing socket/token just degrades to the timer poll), but
+        // log a one-line diagnostic so a silent provisioning failure isn't invisible.
+        if (!ns->start(NotifyServer::defaultSocketPath()))
+            main->logger->write("NOTIFY-SRV: socket listen failed; falling back to poll");
+        else if (!ns->writeTokenFile())
+            main->logger->write("NOTIFY-SRV: token file write failed; falling back to poll");
+    }
+
     // A. DETECT: if the node EXITS before the RPC connection is established (i.e.
     // while ezWarmupTimer is still inside its window), record that it quit during
     // startup. doRPCSetConnection() clears ezWarmupTimer when RPC succeeds, so a
@@ -625,6 +640,12 @@ bool ConnectionLoader::startEmbeddedZClassicd(const QStringList& extraArgs) {
     // verification would defeat the point of a full re-validation.
     if (extraArgs.isEmpty())
         launchArgs << "-checkblocks=12";
+    // NOTIFY-SRV: wire the daemon's -walletnotify/-blocknotify to our `--notify %s`
+    // connector so wallet/block events PUSH a refresh instead of waiting for the poll.
+    // ONLY on the owned-daemon path (notifyServer non-null). The arg carries NO token
+    // (the connector reads it from the 0600 file); %s is substituted by the daemon.
+    if (rpc && rpc->getNotifyServer())
+        launchArgs.append(RPC::buildNotifyArgs(QCoreApplication::applicationFilePath()));
     launchArgs.append(extraArgs);
     // NOTE: ezWarmupTimer is started by the caller (doAutoConnect / relaunchForRepair)
     // right after this returns; do NOT restart it here or the warmup-window check and
