@@ -1,0 +1,647 @@
+// ============================================================================
+// tst_logic — L0 unit suite for the ZClassic Qt5 GUI wallet
+//
+// Links ONLY the wallet's pure-logic translation units (settings.cpp,
+// senttxstore.cpp, addresscombo.cpp) plus test shims. NO daemon, NO libsodium,
+// NO product-code modifications: the shims (tests/shim/) shadow the heavy
+// headers purely via INCLUDEPATH ordering in tests.pro.
+//
+// Covers checklist items from docs/TESTING.md:
+//   C3  USD tooltip/format gating (price>0 && !testnet)
+//   C5  getDecimalString edges
+//   C6  token name ZCL/ZCT by net
+//   D6  addressFromAddressLabel + paren-strip via AddressCombo
+//   E7  field-validation pieces needing no RPC (amount/decimal formatting)
+//   G1  getSaveZtxs() + non-z from-addr gating suppresses SentTxStore write
+//   G4  SentTxStore written 0600 owner-only, testnet-prefixed name
+//   H1  db-corruption / startup-marker / long-warmup classifiers (mirrored)
+//   H2  blocksDirSizeBytes byte total over a temp dir (mirrored algorithm)
+//   + exhaustive Settings address classifiers
+//       (isTAddress/isZAddress/isSaplingAddress/isSproutAddress)
+//   + formatters (getDecimalString/getZCLDisplayFormat/getUSDFormat/token name)
+// ============================================================================
+#include <QtTest/QtTest>
+#include <QtGlobal>
+
+#include "settings.h"
+#include "senttxstore.h"
+#include "mainwindow.h"        // shim: ToFields / Tx
+#include "rpc.h"               // shim: TransactionItem
+#include "addresscombo.h"
+#include "addressbook.h"       // shim
+
+// ---------------------------------------------------------------------------
+// Real valid ZClassic addresses, lifted from src/settings.cpp (donation/zboard).
+// These pass the checksum gate in Settings::isValidAddress, so the classifiers
+// run their full real path (regex + checksum) rather than the early-out.
+// ---------------------------------------------------------------------------
+namespace addr {
+// mainnet
+static const QString ZS_SAPLING   = "zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u";
+static const QString ZS_ZBOARD    = "zs10m00rvkhfm4f7n23e4sxsx275r7ptnggx39ygl0vy46j9mdll5c97gl6dxgpk0njuptg2mn9w5s";
+static const QString ZC_SPROUT    = "zcEgrceTwvoiFdEvPWcsJHAMrpLsprMF6aRJiQa3fan5ZphyXLPuHghnEPrEPRoEVzUy65GnMVyCTRdkT6BYBepnXh6NBYs";
+// testnet
+static const QString ZTS_SAPLING  = "ztestsapling1wn6889vznyu42wzmkakl2effhllhpe4azhu696edg2x6me4kfsnmqwpglaxzs7tmqsq7kudemp5";
+static const QString ZTN_SPROUT   = "ztn6fYKBii4Fp4vbGhkPgrtLU4XjXp4ZBMZgShtopmDGbn1L2JLTYbBp2b7SSkNr9F3rQeNZ9idmoR7s4JCVUZ7iiM5byhF";
+}
+
+// Flip one character of a valid address to break its checksum (typo negative).
+// Picks a body char and rotates it within the address's own charset family so
+// the structural regex still matches but the checksum must reject it.
+static QString corrupt(const QString& a) {
+    QString s = a;
+    int i = s.length() / 2;          // middle-ish, safely past the HRP/prefix
+    QChar c = s.at(i);
+    // rotate within base58/bech32-ish alnum; avoid producing the same char
+    QChar repl = (c == QChar('q')) ? QChar('p') : QChar('q');
+    if (s.startsWith("zc") || s.startsWith("ztn") || s.startsWith("t"))
+        repl = (c == QChar('A')) ? QChar('B') : QChar('A');  // base58 keeps it in-alphabet
+    s[i] = repl;
+    return s;
+}
+
+// =====================================================================
+// Mirror of the H1/H2 pure classifiers from src/connection.cpp.
+//
+// These four predicates are non-static members of the widget-entangled
+// ConnectionLoader (connection.cpp pulls ui_*.h + RPC + the daemon launcher),
+// so they cannot be linked at L0 and the no-src-modification constraint
+// forbids extracting them. The bodies below are copied VERBATIM from
+// connection.cpp at the cited line numbers and must stay in sync; the tests
+// then exercise this exact classification logic and (for H2) real filesystem
+// traversal over a temp dir. See tests/README.md "H1/H2 mirror" note.
+// =====================================================================
+namespace cxmirror {
+
+// src/connection.cpp:995-1015  ConnectionLoader::looksLikeDbCorruption
+static bool looksLikeDbCorruption(const QString& text) {
+    if (text.isEmpty()) return false;
+    static const char* markers[] = {
+        "Corrupted block database detected",
+        "Error opening block database",
+        "Error loading block database",
+        "Error initializing block database",
+        "Aborted block database rebuild",
+        "Failed to read block",
+        "System error while flushing",
+        "Do you want to rebuild the block database now"
+    };
+    for (auto m : markers)
+        if (text.contains(QString::fromLatin1(m), Qt::CaseInsensitive)) return true;
+    return false;
+}
+
+// src/connection.cpp:965-991  ConnectionLoader::startupDiagHasMarker
+static bool startupDiagHasMarker(const QString& text) {
+    if (text.isEmpty()) return false;
+    static const char* markers[] = {
+        "Disk space is low",
+        "probably already running",
+        "Cannot obtain a lock",
+        "payload failed verification",
+        "invalid embedded payload",
+        "Can't find zclassicd",
+        "requires newer version",
+        "Wallet corrupted",
+        "salvage failed",
+        "bootstrap snapshot verification failed",
+    };
+    for (auto m : markers)
+        if (text.contains(QString::fromLatin1(m), Qt::CaseInsensitive)) return true;
+    return looksLikeDbCorruption(text);
+}
+
+// src/connection.cpp:1502-1518  ConnectionLoader::isLongWarmupPhase
+static bool isLongWarmupPhase(const QString& status) {
+    static const char* kPhases[] = {
+        "Verifying blocks", "Activating best chain", "Rewinding",
+        "Loading block index", "Pruning blockstore", "Rescanning",
+        "Zapping", "Upgrading",
+    };
+    for (const char* p : kPhases)
+        if (status.contains(QLatin1String(p), Qt::CaseInsensitive)) return true;
+    return false;
+}
+
+// src/connection.cpp:1041-1067  ConnectionLoader::blocksDirSizeBytes
+// (root-or-testnet3 resolution + recursive Files sum; -1 == "can't measure")
+static qint64 blocksDirSizeBytes(const QString& datadirRoot) {
+    if (datadirRoot.isEmpty()) return -1;
+    QDir base(datadirRoot);
+    QDir testnet(QDir(datadirRoot).filePath("testnet3"));
+    if (testnet.exists() &&
+        (QFile::exists(testnet.filePath("wallet.dat")) ||
+         QFile::exists(testnet.filePath("debug.log")) ||
+         QDir(testnet.filePath("blocks")).exists()))
+        base = testnet;
+    QDir blocks(base.filePath("blocks"));
+    if (!blocks.exists()) return -1;
+    qint64 total = 0;
+    QDirIterator it(blocks.absolutePath(), QDir::Files | QDir::NoSymLinks,
+                    QDirIterator::Subdirectories);
+    while (it.hasNext()) { it.next(); total += it.fileInfo().size(); }
+    return total;
+}
+
+} // namespace cxmirror
+
+
+class TestLogic : public QObject {
+    Q_OBJECT
+
+private slots:
+    void initTestCase();
+    void cleanupTestCase();
+
+    // --- Settings address classifiers (exhaustive) ---
+    void classifiers_data();
+    void classifiers();
+
+    void invalidAddressesRejected_data();
+    void invalidAddressesRejected();
+
+    // --- formatters ---
+    void getDecimalString_data();   // C5
+    void getDecimalString();
+    void zclDisplayFormat_data();
+    void zclDisplayFormat();
+    void usdFormat_data();          // C3
+    void usdFormat();
+    void tokenName();               // C6
+    void e7FieldFormatting_data();  // E7 (no-RPC field pieces)
+    void e7FieldFormatting();
+
+    // --- AddressCombo / addressbook parsing ---  D6
+    void addressFromLabel_data();
+    void addressFromLabel();
+    void addressComboParenStrip();
+
+    // --- SentTxStore at-rest ---  G1 / G4
+    void sentTxStore_perms_and_testnetName();   // G4
+    void sentTxStore_gating();                  // G1
+    void sentTxStore_roundTrip();
+
+    // --- H1 / H2 classifiers (mirrored) ---
+    void dbCorruptionMarkers_data();   // H1
+    void dbCorruptionMarkers();
+    void startupMarkers_data();        // H1
+    void startupMarkers();
+    void longWarmupPhase_data();       // H1
+    void longWarmupPhase();
+    void blocksDirSizeBytes();         // H2
+
+private:
+    QString sandboxAppData() const {
+        return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    }
+};
+
+// ---------------------------------------------------------------------------
+void TestLogic::initTestCase() {
+    // Sandbox: route QSettings + QStandardPaths::AppDataLocation into a throwaway
+    // location so we NEVER touch the user's real profile or ~/.zclassic.
+    QStandardPaths::setTestModeEnabled(true);
+    QCoreApplication::setOrganizationName("ZClassicTest");
+    QCoreApplication::setOrganizationDomain("test.zclassic.invalid");
+    QCoreApplication::setApplicationName("tst_logic");
+
+    // Settings is a singleton accessed via getInstance(); init it once.
+    Settings::init();
+    QVERIFY(Settings::getInstance() != nullptr);
+
+    // Start from a clean QSettings each run.
+    QSettings().clear();
+    QSettings().sync();
+}
+
+void TestLogic::cleanupTestCase() {
+    QSettings().clear();
+    QSettings().sync();
+}
+
+// =====================================================================
+// Address classifiers (exhaustive truth table)
+// =====================================================================
+void TestLogic::classifiers_data() {
+    QTest::addColumn<QString>("address");
+    QTest::addColumn<bool>("testnet");
+    QTest::addColumn<bool>("isT");
+    QTest::addColumn<bool>("isZ");
+    QTest::addColumn<bool>("isSapling");
+    QTest::addColumn<bool>("isSprout");
+
+    //                              addr                 net=t  isT    isZ    isSap  isSpr
+    QTest::newRow("mainnet sapling zs")  << addr::ZS_SAPLING  << false << false << true  << true  << false;
+    QTest::newRow("mainnet zboard zs")   << addr::ZS_ZBOARD   << false << false << true  << true  << false;
+    QTest::newRow("mainnet sprout zc")   << addr::ZC_SPROUT   << false << false << true  << false << true;
+    QTest::newRow("testnet sapling zts") << addr::ZTS_SAPLING << true  << false << true  << true  << false;
+    QTest::newRow("testnet sprout ztn")  << addr::ZTN_SPROUT  << true  << false << true  << false << true;
+
+    // On the WRONG network, a Sapling addr is not recognized as Sapling
+    // (isSaplingAddress is net-aware), so it classifies as Sprout (z && !sapling).
+    QTest::newRow("zs on testnet -> sprout") << addr::ZS_SAPLING  << true  << false << true  << false << true;
+    QTest::newRow("zts on mainnet -> sprout")<< addr::ZTS_SAPLING << false << false << true  << false << true;
+}
+
+void TestLogic::classifiers() {
+    QFETCH(QString, address);
+    QFETCH(bool, testnet);
+    QFETCH(bool, isT);
+    QFETCH(bool, isZ);
+    QFETCH(bool, isSapling);
+    QFETCH(bool, isSprout);
+
+    Settings::getInstance()->setTestnet(testnet);
+
+    QCOMPARE(Settings::isTAddress(address), isT);
+    QCOMPARE(Settings::isZAddress(address), isZ);
+    QCOMPARE(Settings::getInstance()->isSaplingAddress(address), isSapling);
+    QCOMPARE(Settings::getInstance()->isSproutAddress(address), isSprout);
+
+    Settings::getInstance()->setTestnet(false);  // restore default
+}
+
+void TestLogic::invalidAddressesRejected_data() {
+    QTest::addColumn<QString>("address");
+
+    QTest::newRow("empty")              << QString("");
+    QTest::newRow("garbage")            << QString("not-an-address");
+    QTest::newRow("too short t")        << QString("t1abc");
+    QTest::newRow("bad checksum zs")    << corrupt(addr::ZS_SAPLING);
+    QTest::newRow("bad checksum zc")    << corrupt(addr::ZC_SPROUT);
+    QTest::newRow("bad checksum zts")   << corrupt(addr::ZTS_SAPLING);
+    QTest::newRow("bad checksum ztn")   << corrupt(addr::ZTN_SPROUT);
+    QTest::newRow("only prefix z")      << QString("z");
+    QTest::newRow("only prefix t")      << QString("t");
+}
+
+void TestLogic::invalidAddressesRejected() {
+    QFETCH(QString, address);
+    // Every classifier early-outs to false on a non-valid address, regardless of net.
+    QVERIFY(!Settings::isValidAddress(address));
+    QVERIFY(!Settings::isTAddress(address));
+    QVERIFY(!Settings::isZAddress(address));
+    QVERIFY(!Settings::getInstance()->isSaplingAddress(address));
+    QVERIFY(!Settings::getInstance()->isSproutAddress(address));
+}
+
+// =====================================================================
+// C5 — getDecimalString edges
+// =====================================================================
+void TestLogic::getDecimalString_data() {
+    QTest::addColumn<double>("amt");
+    QTest::addColumn<QString>("expected");
+
+    QTest::newRow("1.5")        << 1.5              << QString("1.5");
+    QTest::newRow("5")          << 5.0              << QString("5");
+    QTest::newRow("neg zero")   << -0.0             << QString("0");
+    QTest::newRow("dust")       << 0.00000001       << QString("0.00000001");
+    QTest::newRow("-1.5")       << -1.5             << QString("-1.5");
+    QTest::newRow("zero")       << 0.0              << QString("0");
+    QTest::newRow("trailing 0s")<< 2.50000000       << QString("2.5");
+    QTest::newRow("whole 100")  << 100.0            << QString("100");
+}
+
+void TestLogic::getDecimalString() {
+    QFETCH(double, amt);
+    QFETCH(QString, expected);
+    QCOMPARE(Settings::getDecimalString(amt), expected);
+}
+
+// =====================================================================
+// getZCLDisplayFormat  (decimal + token, net-aware token)
+// =====================================================================
+void TestLogic::zclDisplayFormat_data() {
+    QTest::addColumn<double>("amt");
+    QTest::addColumn<bool>("testnet");
+    QTest::addColumn<QString>("expected");
+
+    QTest::newRow("mainnet 1.5")  << 1.5  << false << QString("1.5 ZCL");
+    QTest::newRow("mainnet 5")    << 5.0  << false << QString("5 ZCL");
+    QTest::newRow("testnet 1.5")  << 1.5  << true  << QString("1.5 ZCT");
+    QTest::newRow("mainnet dust") << 0.00000001 << false << QString("0.00000001 ZCL");
+}
+
+void TestLogic::zclDisplayFormat() {
+    QFETCH(double, amt);
+    QFETCH(bool, testnet);
+    QFETCH(QString, expected);
+    Settings::getInstance()->setTestnet(testnet);
+    QCOMPARE(Settings::getZCLDisplayFormat(amt), expected);
+    Settings::getInstance()->setTestnet(false);
+}
+
+// =====================================================================
+// C3 — getUSDFormat: only when price>0 && !testnet
+// =====================================================================
+void TestLogic::usdFormat_data() {
+    QTest::addColumn<double>("price");
+    QTest::addColumn<bool>("testnet");
+    QTest::addColumn<double>("bal");
+    QTest::addColumn<QString>("expected");   // "" means: empty string expected
+
+    QTest::newRow("mainnet priced")     << 2.0   << false << 3.0  << QString("$6.00");
+    QTest::newRow("mainnet zero price") << 0.0   << false << 3.0  << QString("");
+    QTest::newRow("testnet priced")     << 2.0   << true  << 3.0  << QString("");
+    QTest::newRow("testnet zero price") << 0.0   << true  << 3.0  << QString("");
+    QTest::newRow("mainnet neg price")  << -1.0  << false << 3.0  << QString("");
+}
+
+void TestLogic::usdFormat() {
+    QFETCH(double, price);
+    QFETCH(bool, testnet);
+    QFETCH(double, bal);
+    QFETCH(QString, expected);
+
+    Settings::getInstance()->setTestnet(testnet);
+    Settings::getInstance()->setZCLPrice(price);
+
+    QString got = Settings::getUSDFormat(bal);
+    if (expected.isEmpty())
+        QVERIFY2(got.isEmpty(), qPrintable(QString("expected empty, got '%1'").arg(got)));
+    else
+        QCOMPARE(got, expected);
+
+    Settings::getInstance()->setTestnet(false);
+    Settings::getInstance()->setZCLPrice(0.0);
+}
+
+// =====================================================================
+// C6 — token name ZCL (mainnet) / ZCT (testnet)
+// =====================================================================
+void TestLogic::tokenName() {
+    Settings::getInstance()->setTestnet(false);
+    QCOMPARE(Settings::getTokenName(), QString("ZCL"));
+    Settings::getInstance()->setTestnet(true);
+    QCOMPARE(Settings::getTokenName(), QString("ZCT"));
+    Settings::getInstance()->setTestnet(false);
+}
+
+// =====================================================================
+// E7 — field-validation pieces that need no RPC: amount/decimal formatting
+// round-trips that the Send-tab validation relies on.
+// =====================================================================
+void TestLogic::e7FieldFormatting_data() {
+    QTest::addColumn<double>("amt");
+    QTest::addColumn<QString>("decimal");
+
+    // doSendTxValidations formats amounts through getDecimalString before display;
+    // these assert the boundary amounts a recipient field must round-trip exactly.
+    QTest::newRow("miner fee")   << Settings::getMinerFee()    << QString("0.0001");
+    QTest::newRow("zboard amt")  << Settings::getZboardAmount()<< QString("0.0001");
+    QTest::newRow("8dp boundary")<< 0.12345678                 << QString("0.12345678");
+    QTest::newRow("negative")    << -2.0                       << QString("-2");
+}
+
+void TestLogic::e7FieldFormatting() {
+    QFETCH(double, amt);
+    QFETCH(QString, decimal);
+    QCOMPARE(Settings::getDecimalString(amt), decimal);
+}
+
+// =====================================================================
+// D6 — addressFromAddressLabel + AddressCombo paren-strip
+// =====================================================================
+void TestLogic::addressFromLabel_data() {
+    QTest::addColumn<QString>("input");
+    QTest::addColumn<QString>("expected");
+
+    QTest::newRow("plain addr")        << addr::ZS_SAPLING << addr::ZS_SAPLING;
+    QTest::newRow("label/addr")        << QString("mylabel/") + addr::ZS_SAPLING << addr::ZS_SAPLING;
+    QTest::newRow("leading space")     << QString("  trim/") + addr::ZC_SPROUT << addr::ZC_SPROUT;
+    QTest::newRow("multi-slash takes last") << QString("a/b/") + addr::ZTS_SAPLING << addr::ZTS_SAPLING;
+    QTest::newRow("no slash trims")    << QString("   ") + addr::ZTN_SPROUT + QString("  ") << addr::ZTN_SPROUT;
+}
+
+void TestLogic::addressFromLabel() {
+    QFETCH(QString, input);
+    QFETCH(QString, expected);
+    QCOMPARE(AddressBook::addressFromAddressLabel(input), expected);
+}
+
+// AddressCombo::itemText/currentText strip "(amount)" then label, matching
+// docs D6: `label/zaddr(1.5 ZCL)` -> `zaddr`.
+void TestLogic::addressComboParenStrip() {
+    AddressCombo combo;
+    // Seed a label so addLabelToAddress produces "label/addr".
+    AddressBook::getInstance()->addAddressLabel("donations", addr::ZS_SAPLING);
+
+    // addItem(addr, bal>0) stores "label/addr(<bal> ZCL)" — exercise the strip.
+    Settings::getInstance()->setTestnet(false);
+    combo.addItem(addr::ZS_SAPLING, 1.5);
+    QCOMPARE(combo.count(), 1);
+    // itemText must return JUST the bare address (parens + label removed).
+    QCOMPARE(combo.itemText(0), addr::ZS_SAPLING);
+    QCOMPARE(combo.currentText(), addr::ZS_SAPLING);
+
+    // An item with zero balance has no parens; still returns the bare addr.
+    combo.addItem(addr::ZC_SPROUT, 0.0);
+    QCOMPARE(combo.itemText(1), addr::ZC_SPROUT);
+}
+
+// =====================================================================
+// G4 — SentTxStore file is 0600 owner-only, testnet-prefixed name
+// =====================================================================
+void TestLogic::sentTxStore_perms_and_testnetName() {
+    Settings::getInstance()->setTestnet(true);
+    QSettings().setValue("options/savesenttx", true);
+    QSettings().sync();
+
+    // clean slate
+    SentTxStore::deleteHistory();
+
+    Tx tx;
+    tx.fromAddr = addr::ZTS_SAPLING;   // z-addr so the write is NOT gated out
+    tx.fee = 0.0001;
+    ToFields f; f.addr = addr::ZTN_SPROUT; f.amount = 1.25;
+    tx.toAddrs.append(f);
+
+    SentTxStore::addToSentTx(tx, "deadbeefcafetxid");
+
+    // The file must exist under a "testnet-"-prefixed name in AppDataLocation.
+    QString expected = QDir(sandboxAppData()).filePath("testnet-senttxstore.dat");
+    QVERIFY2(QFile::exists(expected), qPrintable("missing: " + expected));
+
+    // Permissions must be owner-read + owner-write only (0600), no group/other.
+    QFile::Permissions p = QFile::permissions(expected);
+    QVERIFY(p.testFlag(QFileDevice::ReadOwner));
+    QVERIFY(p.testFlag(QFileDevice::WriteOwner));
+    QVERIFY(!p.testFlag(QFileDevice::ReadGroup));
+    QVERIFY(!p.testFlag(QFileDevice::WriteGroup));
+    QVERIFY(!p.testFlag(QFileDevice::ReadOther));
+    QVERIFY(!p.testFlag(QFileDevice::WriteOther));
+    QVERIFY(!p.testFlag(QFileDevice::ExeOwner));
+
+    SentTxStore::deleteHistory();
+    Settings::getInstance()->setTestnet(false);
+}
+
+// =====================================================================
+// G1 — write gated by getSaveZtxs() AND by z-prefixed from-addr
+// =====================================================================
+void TestLogic::sentTxStore_gating() {
+    Settings::getInstance()->setTestnet(false);
+    QString file = QDir(sandboxAppData()).filePath("senttxstore.dat");
+
+    auto mkTx = [](const QString& from) {
+        Tx tx; tx.fromAddr = from; tx.fee = 0.0001;
+        ToFields f; f.addr = addr::ZS_SAPLING; f.amount = 2.0;
+        tx.toAddrs.append(f);
+        return tx;
+    };
+
+    // (a) savesenttx OFF -> no write, even with a z from-addr.
+    SentTxStore::deleteHistory();
+    QSettings().setValue("options/savesenttx", false);
+    QSettings().sync();
+    SentTxStore::addToSentTx(mkTx(addr::ZS_SAPLING), "txid_a");
+    QVERIFY2(!QFile::exists(file), "savesenttx=false must suppress the write");
+
+    // (b) savesenttx ON but from-addr is a t-addr -> still no write (G1 gate).
+    QSettings().setValue("options/savesenttx", true);
+    QSettings().sync();
+    SentTxStore::deleteHistory();
+    QString tAddr = "t1KsZQNTM8N5gxRoyfcHrDrwLgxffzPpTLg";  // shape doesn't need a real checksum: addToSentTx only checks startsWith("z")
+    SentTxStore::addToSentTx(mkTx(tAddr), "txid_b");
+    QVERIFY2(!QFile::exists(file), "non-z from-addr must suppress the write");
+
+    // (c) savesenttx ON + z from-addr -> write happens.
+    SentTxStore::deleteHistory();
+    SentTxStore::addToSentTx(mkTx(addr::ZS_SAPLING), "txid_c");
+    QVERIFY2(QFile::exists(file), "z from-addr with savesenttx=true must write");
+
+    SentTxStore::deleteHistory();
+}
+
+// Round-trip: write then read back gives one item with the aggregated amount.
+void TestLogic::sentTxStore_roundTrip() {
+    Settings::getInstance()->setTestnet(false);
+    QSettings().setValue("options/savesenttx", true);
+    QSettings().sync();
+    SentTxStore::deleteHistory();
+
+    Tx tx; tx.fromAddr = addr::ZS_SAPLING; tx.fee = 0.0001;
+    ToFields f1; f1.addr = addr::ZS_ZBOARD; f1.amount = 1.0; tx.toAddrs.append(f1);
+    ToFields f2; f2.addr = addr::ZC_SPROUT; f2.amount = 0.5; tx.toAddrs.append(f2);
+
+    SentTxStore::addToSentTx(tx, "rt_txid");
+
+    QList<TransactionItem> items = SentTxStore::readSentTxFile();
+    QCOMPARE(items.size(), 1);
+    QCOMPARE(items[0].txid, QString("rt_txid"));
+    // amount stored = -(sum) ; read-back = amount + fee = -(1.5) + (-0.0001)
+    QVERIFY(items[0].amount < 0);
+    QCOMPARE(items[0].fromAddr, addr::ZS_SAPLING);
+
+    SentTxStore::deleteHistory();
+}
+
+// =====================================================================
+// H1 — db-corruption / startup-marker / long-warmup classifiers (mirror)
+// =====================================================================
+void TestLogic::dbCorruptionMarkers_data() {
+    QTest::addColumn<QString>("text");
+    QTest::addColumn<bool>("hit");
+
+    QTest::newRow("empty")            << QString("")                                   << false;
+    QTest::newRow("clean log")        << QString("UpdateTip: new best=abc height=100") << false;
+    QTest::newRow("corrupted block")  << QString("Corrupted block database detected")  << true;
+    QTest::newRow("case-insensitive") << QString("CORRUPTED BLOCK DATABASE DETECTED")  << true;
+    QTest::newRow("error opening")    << QString("...\nError opening block database\n")<< true;
+    QTest::newRow("failed to read")   << QString("Failed to read block")               << true;
+    QTest::newRow("rebuild prompt")   << QString("Do you want to rebuild the block database now") << true;
+}
+
+void TestLogic::dbCorruptionMarkers() {
+    QFETCH(QString, text);
+    QFETCH(bool, hit);
+    QCOMPARE(cxmirror::looksLikeDbCorruption(text), hit);
+}
+
+void TestLogic::startupMarkers_data() {
+    QTest::addColumn<QString>("text");
+    QTest::addColumn<bool>("hit");
+
+    QTest::newRow("empty")          << QString("")                                  << false;
+    QTest::newRow("benign")         << QString("zclassicd starting up nicely")      << false;
+    QTest::newRow("lock")           << QString("Cannot obtain a lock on data dir")  << true;
+    QTest::newRow("already running")<< QString("zclassicd is probably already running") << true;
+    QTest::newRow("disk low")       << QString("Error: Disk space is low!")         << true;
+    QTest::newRow("db newer")       << QString("requires newer version of ...")     << true;
+    QTest::newRow("wallet corrupt") << QString("Wallet corrupted")                  << true;
+    QTest::newRow("anchor reject")  << QString("bootstrap snapshot verification failed") << true;
+    QTest::newRow("delegates to db")<< QString("Corrupted block database detected") << true;
+}
+
+void TestLogic::startupMarkers() {
+    QFETCH(QString, text);
+    QFETCH(bool, hit);
+    QCOMPARE(cxmirror::startupDiagHasMarker(text), hit);
+}
+
+void TestLogic::longWarmupPhase_data() {
+    QTest::addColumn<QString>("status");
+    QTest::addColumn<bool>("hit");
+
+    QTest::newRow("empty")           << QString("")                       << false;
+    QTest::newRow("idle")            << QString("Done loading")           << false;
+    QTest::newRow("verifying")       << QString("Verifying blocks 3 of 6")<< true;
+    QTest::newRow("best chain")      << QString("Activating best chain...")<< true;
+    QTest::newRow("loading index")   << QString("Loading block index...") << true;
+    QTest::newRow("rescanning")      << QString("Rescanning... 42%")      << true;
+    QTest::newRow("upgrading")       << QString("Upgrading database")     << true;
+    QTest::newRow("case insens")     << QString("REWINDING blocks")       << true;
+}
+
+void TestLogic::longWarmupPhase() {
+    QFETCH(QString, status);
+    QFETCH(bool, hit);
+    QCOMPARE(cxmirror::isLongWarmupPhase(status), hit);
+}
+
+// =====================================================================
+// H2 — blocksDirSizeBytes correct byte total over a temp dir
+// =====================================================================
+void TestLogic::blocksDirSizeBytes() {
+    // empty/unknown root -> -1
+    QCOMPARE(cxmirror::blocksDirSizeBytes(QString()), (qint64)-1);
+
+    QTemporaryDir tmp;
+    QVERIFY(tmp.isValid());
+    QString root = tmp.path();
+
+    // No blocks/ dir yet -> -1 ("can't measure", never a heal trigger).
+    QCOMPARE(cxmirror::blocksDirSizeBytes(root), (qint64)-1);
+
+    // Build root/blocks/{blk00000.dat, index/foo.ldb} with known byte sizes.
+    QDir(root).mkpath("blocks/index");
+    auto writeBytes = [](const QString& path, int n) {
+        QFile f(path);
+        QVERIFY(f.open(QIODevice::WriteOnly));
+        f.write(QByteArray(n, 'x'));
+        f.close();
+    };
+    writeBytes(QDir(root).filePath("blocks/blk00000.dat"), 1000);
+    writeBytes(QDir(root).filePath("blocks/rev00000.dat"), 500);
+    writeBytes(QDir(root).filePath("blocks/index/000001.ldb"), 250);
+
+    // Recursive sum = 1000 + 500 + 250 = 1750.
+    QCOMPARE(cxmirror::blocksDirSizeBytes(root), (qint64)1750);
+
+    // testnet3/ resolution: when testnet3/ holds the chain, it's measured instead.
+    QString root2;
+    {
+        QTemporaryDir tmp2;
+        QVERIFY(tmp2.isValid());
+        root2 = tmp2.path();
+        QDir(root2).mkpath("blocks");                 // mainnet blocks (would be 0/empty)
+        QDir(root2).mkpath("testnet3/blocks");
+        // mark testnet3 as the live chain
+        writeBytes(QDir(root2).filePath("testnet3/debug.log"), 1);
+        writeBytes(QDir(root2).filePath("testnet3/blocks/blk00000.dat"), 4096);
+        QCOMPARE(cxmirror::blocksDirSizeBytes(root2), (qint64)4096);
+    }
+}
+
+QTEST_MAIN(TestLogic)
+#include "tst_logic.moc"
