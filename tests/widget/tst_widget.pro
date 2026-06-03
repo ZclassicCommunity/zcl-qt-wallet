@@ -66,6 +66,7 @@ SOURCES += \
     ../../src/logger.cpp \
     ../../src/addresscombo.cpp \
     ../../src/recurring.cpp \
+    ../../src/notifyserver.cpp \
     tst_widget.cpp
 
 # Q_OBJECT headers so MOC runs (matches zcl-qt-wallet.pro HEADERS that carry
@@ -76,6 +77,7 @@ HEADERS += \
     ../../src/qrcodelabel.h \
     ../../src/fillediconlabel.h \
     ../../src/addresscombo.h \
+    ../../src/notifyserver.h \
     ../../src/logger.h
 
 FORMS += \

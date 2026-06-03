@@ -44,8 +44,12 @@ void MainWindow::setupSendTab() {
         
     // This is the damnest thing ever. If we do AddressBook::readFromStorage() directly, the whole file
     // doesn't get read. It needs to run in a timer after everything has finished to be able to read
-    // the file properly. 
-    QTimer::singleShot(2000, [=]() { updateLabelsAutoComplete(); });
+    // the file properly.
+    // `this` is the receiver/context object so Qt CANCELS this 2s callback if the
+    // MainWindow is destroyed first — otherwise an orphaned singleShot fires
+    // updateLabelsAutoComplete() on freed memory (crash on a fast quit during the
+    // first 2s of startup; surfaced as a use-after-free under the test event loop).
+    QTimer::singleShot(2000, this, [this]() { updateLabelsAutoComplete(); });
 
     // The first address book button
     QObject::connect(ui->AddressBook1, &QPushButton::clicked, [=] () {
@@ -284,8 +288,11 @@ void MainWindow::addAddressSection() {
     // Set focus into the address
     Address1->setFocus();
 
-    // Delay the call to scroll to allow the scroll window to adjust
-    QTimer::singleShot(10, [=] () {ui->sendToScrollArea->ensureWidgetVisible(ui->addAddressButton);});                
+    // Delay the call to scroll to allow the scroll window to adjust. `this` is the
+    // context object so Qt cancels the callback if the MainWindow is destroyed
+    // within 10ms (same orphaned-singleShot UAF class as the updateLabelsAutoComplete
+    // fix above — captures `ui`, which dies with the window).
+    QTimer::singleShot(10, this, [this] () {ui->sendToScrollArea->ensureWidgetVisible(ui->addAddressButton);});
 }
 
 void MainWindow::addressChanged(int itemNumber, const QString& text) {   

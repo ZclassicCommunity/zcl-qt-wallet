@@ -60,9 +60,12 @@ SOURCES += \
     src/addressbook.cpp \
     src/logger.cpp \
     src/addresscombo.cpp \
-    src/recurring.cpp
+    src/recurring.cpp \
+    src/notifyserver.cpp
 
 HEADERS += \
+    src/notifyserver.h \
+    src/securerandom.h \
     src/mainwindow.h \
     src/precompiled.h \
     src/rpc.h \

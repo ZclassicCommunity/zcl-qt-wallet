@@ -54,14 +54,36 @@
 #include <QStyle>
 #include <memory>
 
+#include <QLocalSocket>
+#include <QSignalSpy>
+
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
 #include "rpc.h"
 #include "settings.h"
 #include "connection.h"
+#include "notifyserver.h"
 
 // Kept alive for the whole process so QStandardPaths/QSettings stay isolated.
 static QTemporaryDir* g_homeDir = nullptr;
+
+// ---- NOTIFY-SRV test helpers (free, no class state) -------------------------
+// A short, per-test unix-socket path under the temp dir (well within the ~108-char
+// AF_UNIX limit). NotifyServer::start() clears any stale socket first.
+static QString notifySockPath(const QString& tag) {
+    return QDir(QDir::tempPath()).filePath("zqwn_" + tag + ".sock");
+}
+// Connect a client, send `payload`, return the connected socket (caller spins the
+// event loop / reads). Returns nullptr if the connect failed.
+static QLocalSocket* notifySendLine(const QString& path, const QByteArray& payload) {
+    QLocalSocket* c = new QLocalSocket();
+    c->connectToServer(path);
+    if (!c->waitForConnected(1000)) { delete c; return nullptr; }
+    c->write(payload);
+    c->flush();
+    c->waitForBytesWritten(1000);
+    return c;
+}
 
 class TestWidget : public QObject {
     Q_OBJECT
@@ -786,6 +808,139 @@ private slots:
                  "P0-2 re-synced: the loud banner label must hide again");
 
         settleAndDelete(w);
+    }
+
+    // ====================================================================
+    // NOTIFY-SRV (NotifyServer) — localhost-only, token-gated push trigger.
+    // Driven directly via a QLocalSocket (no daemon), pinning every security
+    // invariant: CSPRNG token gate, injection-proof payload, read cap, idle
+    // reap, teardown, and "trigger-not-data" response.
+    // ====================================================================
+    void n1_listensWithCsprngToken() {
+        NotifyServer srv;
+        const QString p = notifySockPath("n1");
+        QVERIFY2(srv.start(p), "NotifyServer must start listening on the unix socket");
+        QVERIFY(srv.isListening());
+        QRegularExpression hex64("^[0-9a-f]{64}$");
+        QVERIFY2(hex64.match(srv.token()).hasMatch(),
+                 qPrintable("session token not 64-hex (256-bit): " + srv.token()));
+        QVERIFY2(srv.start(p), "start() must be idempotent while listening");
+    }
+
+    void n2_validNotifyEmitsOnceTriggerOnly() {
+        NotifyServer srv;
+        const QString p = notifySockPath("n2");
+        QVERIFY(srv.start(p));
+        QSignalSpy spy(&srv, &NotifyServer::notified);
+
+        const QByteArray id(64, 'a');   // a valid 64-hex id
+        QLocalSocket* c = notifySendLine(p, srv.token().toLatin1() + " " + id + "\n");
+        QVERIFY2(c, "client failed to connect to the notify socket");
+
+        // Validated notify -> notified(id) emitted exactly once.
+        QVERIFY2(spy.wait(2000), "notified() not emitted for a valid token+id");
+        QCOMPARE(spy.count(), 1);
+        QCOMPARE(spy.at(0).at(0).toString(), QString::fromLatin1(id));
+
+        // The peer receives ONLY an "OK" ack — never wallet data.
+        QByteArray resp;
+        for (int i = 0; i < 10 && resp.isEmpty(); ++i) { c->waitForReadyRead(200); resp += c->readAll(); }
+        QCOMPARE(resp, QByteArray("OK\n"));
+        c->disconnectFromServer(); c->deleteLater();
+    }
+
+    void n3_wrongTokenDropped() {
+        NotifyServer srv;
+        const QString p = notifySockPath("n3");
+        QVERIFY(srv.start(p));
+        QSignalSpy spy(&srv, &NotifyServer::notified);
+
+        const QByteArray badTok(64, 'b');   // 64-hex shape, WRONG value
+        QLocalSocket* c = notifySendLine(p, badTok + " " + QByteArray(64, 'a') + "\n");
+        QVERIFY(c);
+        QTest::qWait(300);
+        QCOMPARE(spy.count(), 0);            // no refresh on a wrong token
+        c->deleteLater();
+    }
+
+    void n4_injectionPayloadRejected() {
+        NotifyServer srv;
+        const QString p = notifySockPath("n4");
+        QVERIFY(srv.start(p));
+        QSignalSpy spy(&srv, &NotifyServer::notified);
+
+        // RIGHT token, but the id is shell-injection / wrong-length / non-hex. The
+        // strict ^[0-9a-f]{64}$ gate must reject every one (no refresh fires).
+        const QByteArray tok = srv.token().toLatin1();
+        const QList<QByteArray> evil = {
+            "$(rm -rf ~)", "abc;reboot", QByteArray(63, 'a'), QByteArray(65, 'a'),
+            "ZZZZ", "../../etc/passwd", "AAAA" + QByteArray(60, 'a')   // upper-hex
+        };
+        for (const QByteArray& bad : evil) {
+            QLocalSocket* c = notifySendLine(p, tok + " " + bad + "\n");
+            QVERIFY(c);
+            QTest::qWait(100);
+            c->deleteLater();
+        }
+        QCOMPARE(spy.count(), 0);
+    }
+
+    void n5_oversizedDropped() {
+        NotifyServer srv;
+        const QString p = notifySockPath("n5");
+        QVERIFY(srv.start(p));
+        QSignalSpy spy(&srv, &NotifyServer::notified);
+
+        // > kMaxBytes with NO newline: must be dropped, never buffered unbounded.
+        QByteArray flood(NotifyServer::kMaxBytes + 1024, 'a');
+        QLocalSocket* c = notifySendLine(p, flood);
+        QVERIFY(c);
+        QTest::qWait(300);
+        QCOMPARE(spy.count(), 0);
+        c->deleteLater();
+    }
+
+    void n6_absentTokenDropped() {
+        NotifyServer srv;
+        const QString p = notifySockPath("n6");
+        QVERIFY(srv.start(p));
+        QSignalSpy spy(&srv, &NotifyServer::notified);
+        // A single field (id only, no token) -> rejected.
+        QLocalSocket* c = notifySendLine(p, QByteArray(64, 'a') + "\n");
+        QVERIFY(c);
+        QTest::qWait(300);
+        QCOMPARE(spy.count(), 0);
+        c->deleteLater();
+    }
+
+    void n7_stopTearsDownAndInvalidates() {
+        NotifyServer srv;
+        const QString p = notifySockPath("n7");
+        QVERIFY(srv.start(p));
+        srv.stop();
+        QVERIFY(!srv.isListening());
+        QLocalSocket c;
+        c.connectToServer(p);
+        QVERIFY2(!c.waitForConnected(500), "socket must be gone after stop()");
+    }
+
+    void n8_idleConnectionReaped() {
+        NotifyServer srv;
+        const QString p = notifySockPath("n8");
+        QVERIFY(srv.start(p));
+        srv.testSetIdleMs(150);            // shorten the reap window for speed
+        QSignalSpy spy(&srv, &NotifyServer::notified);
+
+        QLocalSocket* c = new QLocalSocket();
+        c->connectToServer(p);
+        QVERIFY(c->waitForConnected(1000));
+        // Send nothing. qWait pumps the main-thread event loop (incl. the server's
+        // reaper QTimer); after the idle window the server must have closed us.
+        QTest::qWait(150 + 500);
+        QVERIFY2(c->state() == QLocalSocket::UnconnectedState,
+                 "idle connection was not reaped by the server");
+        QCOMPARE(spy.count(), 0);
+        c->deleteLater();
     }
 
     // ---- POLISH: production-dark-theme page screenshots -------------------------
