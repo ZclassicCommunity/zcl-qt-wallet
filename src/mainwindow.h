@@ -6,6 +6,7 @@
 
 #include <QProgressBar>
 #include <QElapsedTimer>
+#include <QSharedPointer>
 
 // Forward declare to break circular dependency.
 class RPC;
@@ -338,7 +339,7 @@ private:
     void backupWalletDat();
     void exportTransactions();
 
-    void doImport(QList<QString>* keys);
+    void doImport(QSharedPointer<QList<QString>> keys);
 
     void restoreSavedStates();
     bool eventFilter(QObject *object, QEvent *event);

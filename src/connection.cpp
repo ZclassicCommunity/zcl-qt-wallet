@@ -321,6 +321,24 @@ void ConnectionLoader::createZClassicConf() {
 
     file.close();
 
+    // CONF-2 verify: read the perms BACK from disk and confirm the conf is actually
+    // owner-only. setPermissions() above is best-effort (a pre-existing 0644 conf from
+    // an older wallet, or an exotic filesystem, may not have narrowed). If any
+    // group/other read or write bit is still set, the rpcpassword is exposed to a
+    // co-resident local user — log a CLEAR diagnostic (never the password) so it's
+    // visible. We do NOT abort: stranding the user on the connecting screen is worse
+    // than a logged warning, and a fresh conf is born 0600 via the umask above anyway.
+    {
+        QFile::Permissions p = QFile::permissions(confLocation);
+        const QFile::Permissions leaky =
+            QFileDevice::ReadGroup  | QFileDevice::WriteGroup |
+            QFileDevice::ReadOther  | QFileDevice::WriteOther;
+        if (p & leaky)
+            main->logger->write("WARNING: zclassic.conf could not be secured to 0600 — it "
+                                "remains group/other-accessible, exposing the RPC credentials "
+                                "to other local users on this machine. Please chmod 600 it.");
+    }
+
     // Now that zclassic.conf exists, try to autoconnect again
     this->doAutoConnect();
 }
@@ -583,6 +601,12 @@ bool ConnectionLoader::startEmbeddedZClassicd(const QStringList& extraArgs) {
     // -walletnotify/-blocknotify. ONLY on this OWNED-daemon path (rpc->getNotifyServer()
     // is non-null only for a non-headless session). A foreign/systemd daemon never
     // reaches here, so its socket is never started and it stays on the timer poll.
+    // Tracks whether the push socket is actually listening AND its token is on
+    // disk. The -walletnotify/-blocknotify launch-args below are gated on this:
+    // if provisioning failed we must NOT tell the daemon to fire notifies into a
+    // socket nobody is listening on (every event would spawn a connector that
+    // fails to connect — wasted forks). A false here just degrades to the timer poll.
+    bool notifyReady = false;
     if (rpc && rpc->getNotifyServer()) {
         NotifyServer* ns = rpc->getNotifyServer();
         // Both fail SAFE (a missing socket/token just degrades to the timer poll), but
@@ -591,6 +615,8 @@ bool ConnectionLoader::startEmbeddedZClassicd(const QStringList& extraArgs) {
             main->logger->write("NOTIFY-SRV: socket listen failed; falling back to poll");
         else if (!ns->writeTokenFile())
             main->logger->write("NOTIFY-SRV: token file write failed; falling back to poll");
+        else
+            notifyReady = ns->isListening();   // confirm the listener is actually up
     }
 
     // A. DETECT: if the node EXITS before the RPC connection is established (i.e.
@@ -642,9 +668,11 @@ bool ConnectionLoader::startEmbeddedZClassicd(const QStringList& extraArgs) {
         launchArgs << "-checkblocks=12";
     // NOTIFY-SRV: wire the daemon's -walletnotify/-blocknotify to our `--notify %s`
     // connector so wallet/block events PUSH a refresh instead of waiting for the poll.
-    // ONLY on the owned-daemon path (notifyServer non-null). The arg carries NO token
-    // (the connector reads it from the 0600 file); %s is substituted by the daemon.
-    if (rpc && rpc->getNotifyServer())
+    // ONLY when the socket+token were actually provisioned above (notifyReady). The arg
+    // carries NO token (the connector reads it from the 0600 file); %s is substituted by
+    // the daemon. If the socket never came up we leave these args OFF so the daemon does
+    // not fire notifies into a dead socket — the timer poll keeps the UI fresh instead.
+    if (notifyReady)
         launchArgs.append(RPC::buildNotifyArgs(QCoreApplication::applicationFilePath()));
     launchArgs.append(extraArgs);
     // NOTE: ezWarmupTimer is started by the caller (doAutoConnect / relaunchForRepair)

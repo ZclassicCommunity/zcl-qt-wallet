@@ -25,7 +25,10 @@ RPC::RPC(MainWindow* main) {
     // auto-connect entirely under the test build. (Guarded -> never in the app.)
     (void)cl;
 #else
-    QTimer::singleShot(1, [=]() { cl->loadConnection(); });
+    // Context object 'main': if the window is torn down before this 1ms timer
+    // fires (a very fast quit), Qt auto-cancels the singleShot so the lambda
+    // never runs against the freed ConnectionLoader (UAF on a fast quit).
+    QTimer::singleShot(1, main, [=]() { cl->loadConnection(); });
 #endif
 
     this->main = main;

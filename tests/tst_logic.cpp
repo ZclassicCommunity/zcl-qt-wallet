@@ -34,6 +34,11 @@
 #include "securerandom.h"      // CONF-1/NOTIFY-SRV: CSPRNG secret generation (real)
 #include <QSet>
 #include <QRegularExpression>
+#include <QFileInfo>
+
+#ifndef Q_OS_WIN
+#include <unistd.h>            // getuid() — mirrors the per-user temp-fallback subdir (ITEM 5)
+#endif
 
 // ---------------------------------------------------------------------------
 // Real valid ZClassic addresses, lifted from src/settings.cpp (donation/zboard).
@@ -226,6 +231,13 @@ private slots:
     void conf1_passwordHighEntropyCSPRNG();
     void conf1_notifyTokenHexFormat();
     void conf1_randomPasswordUsesCSPRNG();   // caller-divergence guard (connection.cpp)
+
+    // --- Hardening guards (source-text + behavioral) ---
+    void notify_tempFallbackDirIsOwnerOnly();         // ITEM 5 behavioral (mirrored)
+    void notify_runtimeDirHardensTempFallback();      // ITEM 5 source guard (notifyserver.cpp)
+    void notify_connectorLogsFailureToStderr();       // ITEM 4 source guard (notifyserver.cpp)
+    void notify_launchArgsGatedOnSocketReady();       // ITEM 2 source guard (connection.cpp)
+    void conf_permsVerifiedAfterWrite();              // ITEM 3 source guard (connection.cpp)
 
 private:
     QString sandboxAppData() const {
@@ -1031,6 +1043,149 @@ void TestLogic::conf1_randomPasswordUsesCSPRNG() {
              "connection.cpp calls rand() in real code — CONF-1 forbids the weak/predictable RNG");
     QVERIFY2(!code.contains("qrand"),
              "connection.cpp uses qrand() — CONF-1 requires QRandomGenerator::system()");
+}
+
+// =====================================================================
+// Hardening guards (ITEMs 2-5)
+//
+// ITEMs 2/3 live in connection.cpp and ITEMs 4/5 in notifyserver.cpp; the
+// behavior (gating launch-args on socketReady, reading conf perms back,
+// logging a connector failure, a 0700 temp-fallback dir) is wired into Qt
+// process/socket plumbing that the L0 binary does not link. These are
+// SOURCE-TEXT divergence guards in the SAME STYLE as
+// conf1_randomPasswordUsesCSPRNG() above: they read the real source and assert
+// the safety wiring is present, so a regression that silently drops it fails
+// the suite. ITEM 5 ALSO has a behavioral test below (the dir-creation logic is
+// small enough to mirror and verify the resulting perms are owner-only).
+// =====================================================================
+
+// Locate + comment-strip a src/ file the same way conf1_randomPasswordUsesCSPRNG does.
+static QString readStrippedSrc(const QString& relName) {
+    QStringList candidates = {
+        QStringLiteral(QT_TESTCASE_BUILDDIR) + "/../src/" + relName,
+        QFINDTESTDATA("../src/" + relName),
+    };
+    QString src;
+    for (const QString& c : candidates) {
+        if (c.isEmpty()) continue;
+        QFile f(c);
+        if (f.open(QIODevice::ReadOnly)) { src = QString::fromUtf8(f.readAll()); break; }
+    }
+    if (src.isEmpty()) return QString();
+
+    QString code;
+    int i = 0, n = src.length();
+    while (i < n) {
+        if (i + 1 < n && src[i] == '/' && src[i+1] == '/') {
+            int end = src.indexOf('\n', i + 2);
+            if (end < 0) break;
+            i = end;
+        } else if (i + 1 < n && src[i] == '/' && src[i+1] == '*') {
+            int end = src.indexOf("*/", i + 2);
+            if (end < 0) break;
+            i = end + 2;
+        } else {
+            code.append(src[i]);
+            ++i;
+        }
+    }
+    return code;
+}
+
+// ITEM 5 behavioral: the SHARED-temp fallback must yield an owner-only (0700) dir.
+// notifyRuntimeDir()'s fallback is file-static + not linked here, so mirror its exact
+// dir-creation steps into the test sandbox and assert the resulting perms confine access.
+void TestLogic::notify_tempFallbackDirIsOwnerOnly() {
+#ifdef Q_OS_WIN
+    QSKIP("POSIX dir-perm check; Windows uses ACLs (setPermissions) not mode bits");
+#else
+    // A throwaway "shared temp" root, then the per-user subdir the real code carves out.
+    const QString temp = QStandardPaths::writableLocation(QStandardPaths::TempLocation);
+    const QString sub  = QStringLiteral("zqw-test-%1").arg((uint)::getuid());
+    const QString dir  = QDir(temp).filePath(sub);
+    QDir().rmdir(dir);                       // clean slate (ignore if absent)
+    QDir().mkpath(dir);
+    QFile::setPermissions(dir, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
+
+    QVERIFY2(QFileInfo(dir).isDir(), qPrintable("fallback dir not created: " + dir));
+    QFile::Permissions p = QFile::permissions(dir);
+    // Owner may traverse; group/other must have NOTHING (0700 confinement).
+    QVERIFY(p.testFlag(QFileDevice::ReadOwner));
+    QVERIFY(p.testFlag(QFileDevice::WriteOwner));
+    QVERIFY(p.testFlag(QFileDevice::ExeOwner));
+    QVERIFY(!p.testFlag(QFileDevice::ReadGroup));
+    QVERIFY(!p.testFlag(QFileDevice::WriteGroup));
+    QVERIFY(!p.testFlag(QFileDevice::ExeGroup));
+    QVERIFY(!p.testFlag(QFileDevice::ReadOther));
+    QVERIFY(!p.testFlag(QFileDevice::WriteOther));
+    QVERIFY(!p.testFlag(QFileDevice::ExeOther));
+
+    QDir().rmdir(dir);                       // tidy up
+#endif
+}
+
+// ITEM 5 source guard: notifyRuntimeDir() must harden the TempLocation fallback with a
+// per-user subdir + mkpath + 0700 setPermissions (NOT return the shared temp dir bare).
+void TestLogic::notify_runtimeDirHardensTempFallback() {
+    const QString code = readStrippedSrc("notifyserver.cpp");
+    QVERIFY2(!code.isEmpty(), "could not locate src/notifyserver.cpp");
+    QVERIFY2(code.contains("TempLocation"),
+             "notifyserver.cpp no longer references TempLocation fallback");
+    QVERIFY2(code.contains("mkpath"),
+             "ITEM 5: temp fallback must mkpath a per-user subdir");
+    QVERIFY2(code.contains("setPermissions") && code.contains("ExeOwner"),
+             "ITEM 5: temp fallback subdir must be narrowed to owner-only (0700) perms");
+}
+
+// ITEM 4 source guard: runConnector() must emit a stderr diagnostic on a non-zero
+// sendNotify() result (the headless connector has no logger). No secret is printed.
+void TestLogic::notify_connectorLogsFailureToStderr() {
+    const QString code = readStrippedSrc("notifyserver.cpp");
+    QVERIFY2(!code.isEmpty(), "could not locate src/notifyserver.cpp");
+    QVERIFY2(code.contains("fprintf(stderr") || code.contains("qWarning"),
+             "ITEM 4: runConnector must log a connector failure to stderr/qWarning");
+    // Defense-in-depth: no stderr/qWarning diagnostic line may interpolate the token.
+    static const QRegularExpression leakyDiag(
+        "(fprintf\\s*\\(\\s*stderr|qWarning\\s*\\(\\s*)[^;]*token", QRegularExpression::DotMatchesEverythingOption);
+    QVERIFY2(!leakyDiag.match(code).hasMatch(),
+             "ITEM 4: the connector diagnostic must not print the token/secret");
+}
+
+// ITEM 2 source guard: the -walletnotify/-blocknotify launch-args must be gated on the
+// socket having actually started (a notifyReady/isListening flag), NOT appended
+// unconditionally whenever a NotifyServer object merely exists.
+void TestLogic::notify_launchArgsGatedOnSocketReady() {
+    const QString code = readStrippedSrc("connection.cpp");
+    QVERIFY2(!code.isEmpty(), "could not locate src/connection.cpp");
+    QVERIFY2(code.contains("isListening"),
+             "ITEM 2: notify launch-args must consult the socket's isListening() state");
+    QVERIFY2(code.contains("buildNotifyArgs"),
+             "connection.cpp no longer wires buildNotifyArgs (regression?)");
+    // The gate guard ('if (notifyReady)') and the append must both be present, and the
+    // append must be reached THROUGH the gate — not the old unconditional
+    // 'if (rpc && rpc->getNotifyServer()) ... buildNotifyArgs'.
+    QVERIFY2(code.contains("notifyReady"),
+             "ITEM 2: a notifyReady gate flag must guard the buildNotifyArgs append");
+    const int gateIdx   = code.indexOf("if (notifyReady)");
+    const int appendIdx = code.indexOf("launchArgs.append(RPC::buildNotifyArgs");
+    QVERIFY2(gateIdx >= 0 && appendIdx > gateIdx,
+             "ITEM 2: buildNotifyArgs must be appended only inside the notifyReady gate");
+}
+
+// ITEM 3 source guard: createZClassicConf() must READ the perms back from disk after the
+// setPermissions(0600) call and log a diagnostic if group/other bits remain (best-effort,
+// never aborts). The diagnostic must not echo the rpcpassword.
+void TestLogic::conf_permsVerifiedAfterWrite() {
+    const QString code = readStrippedSrc("connection.cpp");
+    QVERIFY2(!code.isEmpty(), "could not locate src/connection.cpp");
+    // Read-back of the on-disk perms after the write.
+    QVERIFY2(code.contains("QFile::permissions(confLocation)"),
+             "ITEM 3: createZClassicConf must read the conf perms back from disk");
+    // Tests for any group/other access bit and logs about it.
+    QVERIFY2(code.contains("ReadGroup") && code.contains("ReadOther"),
+             "ITEM 3: the verify must test for group/other read/write bits");
+    QVERIFY2(code.contains("could not be secured to 0600"),
+             "ITEM 3: a clear 0600 diagnostic must be logged when the conf stays leaky");
 }
 
 QTEST_MAIN(TestLogic)

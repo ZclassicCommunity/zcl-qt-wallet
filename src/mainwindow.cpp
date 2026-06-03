@@ -1574,7 +1574,10 @@ void MainWindow::setupSettingsModal() {
                 auto desc = tr("ZclWallet needs to restart to rescan/reindex. ZclWallet will now close, please restart ZclWallet to continue");
                 
                 QMessageBox::information(this, tr("Restart ZclWallet"), desc, QMessageBox::Ok);
-                QTimer::singleShot(1, [=]() { this->close(); });
+                // Context 'this': Qt auto-cancels the timer if the window is
+                // destroyed before it fires, so the lambda never calls close()
+                // on a freed MainWindow (UAF on a fast quit).
+                QTimer::singleShot(1, this, [=]() { this->close(); });
             }
         }
     });
@@ -1596,14 +1599,14 @@ void MainWindow::addressBook() {
 
 
 
-void MainWindow::doImport(QList<QString>* keys) {
+void MainWindow::doImport(QSharedPointer<QList<QString>> keys) {
     if (rpc->getConnection() == nullptr) {
-        // No connection, just return
+        // No connection, just return (keys is freed when the last reference drops).
         return;
     }
 
     if (keys->isEmpty()) {
-        delete keys;
+        // keys is a QSharedPointer now — it frees itself; no explicit delete.
         ui->statusBar->showMessage(tr("Private key import rescan finished"));
         return;
     }
@@ -1885,13 +1888,17 @@ void MainWindow::importPrivKey() {
             return !key.startsWith("#") && !key.trimmed().isEmpty();
         });
 
-        auto keys = new QList<QString>();
+        // QSharedPointer so the list is freed whether the deferred callback runs
+        // OR is auto-cancelled (the 'this' context below cancels it on a fast quit);
+        // a raw new'd list would leak on cancellation.
+        auto keys = QSharedPointer<QList<QString>>::create();
         std::transform(keysTmp.begin(), keysTmp.end(), std::back_inserter(*keys), [=](auto key) {
             return key.trimmed().split(" ")[0];
         });
 
-        // Start the import. The function takes ownership of keys
-        QTimer::singleShot(1, [=]() {doImport(keys);});
+        // Start the import. Context 'this': Qt auto-cancels the timer if the window
+        // is destroyed before it fires, so the lambda never touches a freed MainWindow.
+        QTimer::singleShot(1, this, [=]() {doImport(keys);});
 
         // Show the dialog that keys will be imported. 
         QMessageBox::information(this,

@@ -13,8 +13,12 @@
 #include <QFileInfo>
 #include <QCoreApplication>
 
+#include <cstdio>           // fprintf(stderr, ...) for the headless connector diagnostic
+
 #ifndef Q_OS_WIN
-#include <sys/stat.h>       // umask() so the unix socket is born owner-only
+#include <sys/stat.h>       // umask()/mkdir()/lstat() so the unix socket + temp dir are owner-only
+#include <unistd.h>         // geteuid() for the per-user 0700 temp-fallback subdir
+#include <cerrno>           // errno (EEXIST) for the secure mkdir-then-verify fallback
 #endif
 
 // Protocol (one line, newline-terminated): "<token> <id>\n"
@@ -204,9 +208,48 @@ static QString notifyRuntimeDir() {
     // tmpfs); fall back to the temp dir where that is unavailable (macOS/Windows or
     // a session with no XDG_RUNTIME_DIR).
     QString d = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
-    if (d.isEmpty())
-        d = QStandardPaths::writableLocation(QStandardPaths::TempLocation);
-    return d;
+    if (!d.isEmpty())
+        return d;   // already a 0700 per-user dir (e.g. /run/user/UID) — unchanged
+
+    // FALLBACK: TempLocation is a SHARED directory (e.g. /tmp, %TEMP%), so the socket
+    // and token would otherwise land where any local user can see/connect. Carve out a
+    // per-user 0700 subdirectory inside it so the containing directory confines access
+    // the way /run/user/UID does on Linux. Stable name (same user => same dir) so the
+    // GUI server and the headless connector agree on the path.
+    const QString temp = QStandardPaths::writableLocation(QStandardPaths::TempLocation);
+#ifndef Q_OS_WIN
+    // POSIX shared temp (e.g. /tmp): create the per-user subdir SECURELY. The name is
+    // predictable, so a co-resident attacker could pre-create it (or a symlink) — never
+    // trust a path we didn't make. ::mkdir(0700) sets the mode atomically at creation
+    // (no chmod window). On EEXIST, only trust it if it is a REAL directory (lstat, so a
+    // symlink fails S_ISDIR), owned by us, with NO group/other bits. Otherwise fall back
+    // to the shared temp dir directly: the token file is still 0600 and the socket is
+    // owner-only, so the token stays the gate — we just don't rely on a dir we can't vouch
+    // for. (This whole branch is unreachable on a normal Linux desktop, which uses the
+    // 0700 /run/user/UID RuntimeLocation above.)
+    const QString dir = QDir(temp).filePath(QStringLiteral("zqw-%1").arg((uint)::getuid()));
+    const QByteArray dirBytes = QFile::encodeName(dir);
+    if (::mkdir(dirBytes.constData(), 0700) == 0)
+        return dir;                                  // freshly created, ours, 0700
+    if (errno == EEXIST) {
+        struct stat st;
+        if (::lstat(dirBytes.constData(), &st) == 0 &&
+            S_ISDIR(st.st_mode) &&                   // a real dir (symlink would fail this)
+            st.st_uid == ::geteuid() &&              // owned by us
+            (st.st_mode & (S_IRWXG | S_IRWXO)) == 0) // no group/other access
+            return dir;                              // pre-existing but verifiably ours + 0700
+    }
+    return temp;                                     // suspect/unsecurable -> don't trust it
+#else
+    // Windows: %TEMP% is already per-user (under the user profile); a stable per-user name
+    // isolates concurrent sessions, and setPermissions applies an owner-only DACL.
+    const QString sub = QStringLiteral("zqw-%1").arg(QStandardPaths::writableLocation(
+                            QStandardPaths::HomeLocation).section('/', -1).section('\\', -1));
+    const QString dir = QDir(temp).filePath(sub);
+    QDir().mkpath(dir);
+    QFile::setPermissions(dir, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
+    return dir;
+#endif
 }
 
 QString NotifyServer::defaultSocketPath() {
@@ -270,5 +313,12 @@ int NotifyServer::runConnector(int argc, char** argv, const QString& id) {
     // Headless: a QCoreApplication (no GUI/QPA) just to drive QLocalSocket's
     // synchronous waitFor* calls. Reads the token from the 0600 file (never argv).
     QCoreApplication app(argc, argv);
-    return sendNotify(defaultSocketPath(), readTokenFile(), id);
+    const int rc = sendNotify(defaultSocketPath(), readTokenFile(), id);
+    // This connector has no logger; on failure it would vanish silently and a dead
+    // push channel would be undiagnosable. Emit ONE line to stderr (captured in the
+    // daemon's output) naming the failure code. NO token/secret is printed; rc codes:
+    //   2 bad id, 3 no token, 4 nobody listening, 5 no/!OK ack (see sendNotify()).
+    if (rc != 0)
+        fprintf(stderr, "zqw-notify: push failed (code %d) — falling back to poll\n", rc);
+    return rc;
 }
