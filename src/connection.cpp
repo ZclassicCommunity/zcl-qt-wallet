@@ -1,6 +1,11 @@
 #include "connection.h"
 #include "mainwindow.h"
 #include "settings.h"
+#include "securerandom.h"   // CONF-1: CSPRNG rpcpassword / notify token
+
+#ifndef Q_OS_WIN
+#include <sys/stat.h>       // CONF-2: umask() so a fresh zclassic.conf is born 0600
+#endif
 #include "ui_connection.h"
 #include "ui_createzclassicconfdialog.h"
 #include "rpc.h"
@@ -206,21 +211,14 @@ void ConnectionLoader::doAutoConnect(bool tryEzclassicdStart) {
     } 
 }
 
-QString randomPassword() {
-    static const char alphanum[] =
-        "0123456789"
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        "abcdefghijklmnopqrstuvwxyz";
-
-    const int passwordLength = 10;
-    char* s = new char[passwordLength + 1];
-
-    for (int i = 0; i < passwordLength; ++i) {
-        s[i] = alphanum[rand() % (sizeof(alphanum) - 1)];
-    }
-
-    s[passwordLength] = 0;
-    return QString::fromStdString(s);
+static QString randomPassword() {
+    // CONF-1: CSPRNG, >= 128 bits. The previous implementation drew 10 chars from
+    // rand()%62 (~59.5 bits, time-seeded and predictable) and leaked the heap
+    // buffer; both are gone. 32 base62 chars ≈ 190 bits. See src/securerandom.h
+    // (shared with the NOTIFY-SRV per-session token so there is one CSPRNG source).
+    // CONF-3: the returned value is a secret — it is written ONLY into the 0600
+    // zclassic.conf below and is NEVER logged, qDebug'd, or put in a status string.
+    return secureRandomBase62(32);
 }
 
 /**
@@ -273,8 +271,23 @@ void ConnectionLoader::createZClassicConf() {
     main->logger->write("Creating file " + confLocation);
     QDir().mkpath(fi.dir().absolutePath());
 
+    // CONF-2: the conf holds the rpcpassword (and, in Phase 1, the notify token),
+    // so it must be owner-only (0600) and NEVER group/world-readable for any
+    // instant — the hostile co-resident local user is in the threat model. Tighten
+    // the umask to 0077 ACROSS the create so a fresh conf is BORN 0600 (no TOCTOU
+    // window at the umask default of ~0644 before we could chmod it); the umask is
+    // restored immediately after open(). chmod-after still runs below to also narrow
+    // a pre-existing conf written 0644 by an older wallet. Linux/macOS only (POSIX
+    // umask); Windows file ACLs are handled by setPermissions alone.
+#ifndef Q_OS_WIN
+    mode_t oldMask = ::umask(0077);
+#endif
     QFile file(confLocation);
-    if (!file.open(QIODevice::ReadWrite | QIODevice::Truncate)) {
+    bool opened = file.open(QIODevice::ReadWrite | QIODevice::Truncate);
+#ifndef Q_OS_WIN
+    ::umask(oldMask);
+#endif
+    if (!opened) {
         main->logger->write("Could not create zclassic.conf, returning");
         // Don't silently strand the user on the connecting screen forever — tell
         // them what went wrong so they can fix permissions / free disk space.
@@ -283,8 +296,14 @@ void ConnectionLoader::createZClassicConf() {
             "enough free disk space, then open ZClassic again."));
         return;
     }
-        
-    QTextStream out(&file); 
+
+    // Belt-and-suspenders + pre-existing-conf narrowing (Truncate keeps an existing
+    // file's old mode, which umask does not touch). Best-effort: on a filesystem
+    // that can't honor perms we still write the conf (logged without any secret).
+    if (!file.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner))
+        main->logger->write("warning: could not restrict zclassic.conf to 0600");
+
+    QTextStream out(&file);
     
     out << "server=1\n";
     // No addnode here: mainnet.z.cash is a Zcash (ZEC) node, not a valid ZClassic

@@ -31,6 +31,9 @@
 #include "addresscombo.h"
 #include "addressbook.h"       // shim
 #include "privacybadgedelegate.h"   // PRIV-13/14: classify/labelFor/colorFor (real)
+#include "securerandom.h"      // CONF-1/NOTIFY-SRV: CSPRNG secret generation (real)
+#include <QSet>
+#include <QRegularExpression>
 
 // ---------------------------------------------------------------------------
 // Real valid ZClassic addresses, lifted from src/settings.cpp (donation/zboard).
@@ -217,6 +220,12 @@ private slots:
     void priv13_deshieldOnlyForPublicSendRow();
     // --- PRIV-14: badge colour hex tokens match dark.qss ---
     void priv14_badgeColorTokens();
+
+    // --- CONF-1 / NOTIFY-SRV: CSPRNG secret generation (securerandom.h, the
+    //     single source randomPassword() and the notify token both delegate to) ---
+    void conf1_passwordHighEntropyCSPRNG();
+    void conf1_notifyTokenHexFormat();
+    void conf1_randomPasswordUsesCSPRNG();   // caller-divergence guard (connection.cpp)
 
 private:
     QString sandboxAppData() const {
@@ -898,6 +907,130 @@ void TestLogic::priv14_badgeColorTokens() {
              "dark.qss missing amber token #d9822b in a REAL (non-comment) rule");
     QVERIFY2(code.contains("#c0392b", Qt::CaseInsensitive),
              "dark.qss missing red token #c0392b in a REAL (non-comment) rule");
+}
+
+// ---------------------------------------------------------------------------
+// CONF-1 / NOTIFY-SRV — the wallet's secrets (rpcpassword + per-session notify
+// token) MUST come from the system CSPRNG with >= 128 bits. The first two tests
+// exercise the shared securerandom.h body DIRECTLY (a short / weak / charset-
+// stuck generator inside the header fails their length + bit-floor + charset-
+// coverage asserts). connection.cpp — which holds randomPassword() — is too heavy
+// to link into this guiless suite, so the third test (conf1_randomPasswordUsesCSPRNG)
+// is a STATIC guard that pins the delegation: the conf writer must call
+// secureRandomBase62() and contain no raw rand()/qrand(), catching a caller that
+// diverges back to a weak RNG.
+// ---------------------------------------------------------------------------
+void TestLogic::conf1_passwordHighEntropyCSPRNG() {
+    // Default length is 32 base62 chars (the value randomPassword() uses).
+    const QString pw = secureRandomBase62();
+    QCOMPARE(pw.length(), 32);
+
+    // Bit floor: chars * log2(62) must clear the 128-bit CONF-1 requirement.
+    const double bits = pw.length() * 5.9541963;   // log2(62)
+    QVERIFY2(bits >= 128.0,
+             qPrintable(QString("rpcpassword entropy %1 bits < 128").arg(bits, 0, 'f', 1)));
+
+    // Charset: every character is base62 [0-9A-Za-z] (conf-parser-safe — no
+    // whitespace, '#', '=' or newline that could corrupt a key=value line).
+    const QString allowed =
+        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    for (const QChar c : pw)
+        QVERIFY2(allowed.contains(c),
+                 qPrintable(QString("rpcpassword has non-base62 char '%1'").arg(c)));
+
+    // CSPRNG sanity over a large sample: every value distinct (collision among
+    // ~190-bit strings is astronomically impossible — a constant/buggy generator
+    // would collide), and the full 62-symbol alphabet is exercised (a generator
+    // stuck on a subset — e.g. digits only — would be caught).
+    QSet<QString> seen;
+    QSet<QChar>   chars;
+    const int N = 512;
+    for (int i = 0; i < N; ++i) {
+        const QString s = secureRandomBase62();
+        seen.insert(s);
+        for (const QChar c : s) chars.insert(c);
+    }
+    QCOMPARE(seen.size(), N);                 // no repeats across 512 draws
+    QVERIFY2(chars.size() >= 60,
+             qPrintable(QString("only %1/62 base62 symbols seen across %2 samples — "
+                                "generator may be stuck on a subset").arg(chars.size()).arg(N)));
+
+    // Explicit length is honored (used to mint shorter/longer secrets if needed).
+    QCOMPARE(secureRandomBase62(22).length(), 22);   // ~131 bits, the 128-bit minimum
+}
+
+void TestLogic::conf1_notifyTokenHexFormat() {
+    // The notify token MUST match the on-the-wire NOTIFY-SRV payload contract
+    // exactly: 64 lowercase-hex chars (32 bytes = 256 bits). Validated here so the
+    // listener's `^[0-9a-f]{64}$` guard and the token minter agree by construction.
+    const QRegularExpression re("^[0-9a-f]{64}$");
+    const QString tok = secureRandomHex();
+    QCOMPARE(tok.length(), 64);
+    QVERIFY2(re.match(tok).hasMatch(),
+             qPrintable("notify token not 64 lowercase-hex chars: " + tok));
+
+    // Distinctness over a large sample (no repeats; full nibble alphabet seen).
+    QSet<QString> seen;
+    QSet<QChar>   nibbles;
+    const int N = 512;
+    for (int i = 0; i < N; ++i) {
+        const QString s = secureRandomHex();
+        QVERIFY(re.match(s).hasMatch());
+        seen.insert(s);
+        for (const QChar c : s) nibbles.insert(c);
+    }
+    QCOMPARE(seen.size(), N);
+    QCOMPARE(nibbles.size(), 16);            // all of 0-9a-f exercised
+
+    // Explicit byte count is honored: 16 bytes -> 32 hex chars (128 bits).
+    QCOMPARE(secureRandomHex(16).length(), 32);
+}
+
+void TestLogic::conf1_randomPasswordUsesCSPRNG() {
+    // Locate connection.cpp the same way priv14 finds dark.qss (QT_TESTCASE_BUILDDIR
+    // is the tests/ dir; src/ is its sibling).
+    QStringList candidates = {
+        QStringLiteral(QT_TESTCASE_BUILDDIR) + "/../src/connection.cpp",
+        QFINDTESTDATA("../src/connection.cpp"),
+    };
+    QString src;
+    for (const QString& c : candidates) {
+        if (c.isEmpty()) continue;
+        QFile f(c);
+        if (f.open(QIODevice::ReadOnly)) { src = QString::fromUtf8(f.readAll()); break; }
+    }
+    QVERIFY2(!src.isEmpty(), "could not locate src/connection.cpp for the CSPRNG caller guard");
+
+    // Strip // line + /* ... */ block comments so a 'rand()' written in PROSE (the
+    // comments here deliberately document the OLD weak generator) cannot fool the
+    // guard. We assert on the remaining real code only.
+    QString code;
+    {
+        int i = 0, n = src.length();
+        while (i < n) {
+            if (i + 1 < n && src[i] == '/' && src[i+1] == '/') {
+                int end = src.indexOf('\n', i + 2);
+                if (end < 0) break;
+                i = end;                          // keep the newline
+            } else if (i + 1 < n && src[i] == '/' && src[i+1] == '*') {
+                int end = src.indexOf("*/", i + 2);
+                if (end < 0) break;
+                i = end + 2;
+            } else {
+                code.append(src[i]);
+                ++i;
+            }
+        }
+    }
+
+    QVERIFY2(code.contains("secureRandomBase62"),
+             "connection.cpp must mint the rpcpassword via secureRandomBase62() (CONF-1)");
+    // 'rand()' (lowercase + parens) matches the weak C RNG but NOT QRandomGenerator
+    // ('Random', capital R, no parens) — so this fires only on a real regression.
+    QVERIFY2(!code.contains("rand()"),
+             "connection.cpp calls rand() in real code — CONF-1 forbids the weak/predictable RNG");
+    QVERIFY2(!code.contains("qrand"),
+             "connection.cpp uses qrand() — CONF-1 requires QRandomGenerator::system()");
 }
 
 QTEST_MAIN(TestLogic)
