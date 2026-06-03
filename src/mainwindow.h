@@ -183,7 +183,14 @@ public:
     // synced poll with a positive balance (a per-run one-shot there avoids re-firing
     // on every poll). Permanently silenced after a successful backup via the
     // persisted options/walletbackedup flag. Public so the RPC poller can call it.
+    // Still reachable from the Help menu; the rpc.cpp synced-edge trigger now calls
+    // the NON-blocking showBackupNag() (W1-2) instead of this modal.
     void promptWalletBackup();
+
+    // W1-2: surface the non-blocking amber "back up your wallet" Home card. Public so
+    // the RPC poller can call it from refreshBalances on the synced && balTotal>0 edge.
+    // No-op when already backed up (options/walletbackedup) or when the card isn't built.
+    void showBackupNag();
 
     // RUNTIME actionable dialog (edit #5). Reached from the sync poller (rpc.cpp) when an
     // ATTACHED FOREIGN node (one this wallet did NOT start: rpc->isEmbedded()==false) has
@@ -254,6 +261,15 @@ private:
     QLabel*      homeFixItText     = nullptr;   // "X ZCL is PUBLIC ..."
     QPushButton* homeSendBtn       = nullptr;   // quick action (primary when funded)
     QPushButton* homeReceiveBtn    = nullptr;   // quick action (primary when empty)
+
+    // W1-2: non-blocking amber "back up your wallet" Home card. Replaces the modal
+    // backup nag (promptWalletBackup's box.exec()). Built in setupHomeDashboard,
+    // reusing the EXACT fix-it/callout amber styling; surfaced by showBackupNag()
+    // (called from rpc.cpp on the synced && balTotal>0 && once-per-session edge),
+    // hidden once options/walletbackedup is set. Its buttons reuse the existing
+    // backup/export handlers. promptWalletBackup() stays reachable from Help.
+    QFrame*      homeBackupCard    = nullptr;   // amber card (hidden unless un-backed-up + funded)
+    QLabel*      homeBackupText    = nullptr;   // "Back up your wallet ..."
 
     // PRIV-18 — the REAL "Shield public funds" action, shared by the Home fix-it
     // card button and (conceptually) the balances context-menu "Shield balance to

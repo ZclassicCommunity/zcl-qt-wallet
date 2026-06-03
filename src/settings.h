@@ -57,6 +57,13 @@ public:
     bool    getShowCachedBalance();
     void    setShowCachedBalance(bool show);
 
+    // W1-1 (opt-out, default ON): show the MainWindow immediately on startup and
+    // run the node-warmup splash as a NON-blocking, dismissible overlay instead of
+    // blocking the UI behind a nested d->exec() modal loop for 1-2 minutes. When
+    // OFF (or headless) the proven d->exec() modal path is retained verbatim.
+    bool    getNonModalStartup();
+    void    setNonModalStartup(bool on);
+
     bool    isWalletBackedUp();
     void    setWalletBackedUp(bool backedUp);
 

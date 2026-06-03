@@ -311,6 +311,17 @@ void Settings::setShowCachedBalance(bool show) {
     QSettings().setValue("options/showcachedbalance", show);
 }
 
+bool Settings::getNonModalStartup() {
+    // W1-1 default ON: the MainWindow appears at once (already painting cached
+    // balances pre-RPC) and the warmup splash is a non-blocking, dismissible
+    // overlay rather than a UI-blocking nested d->exec() modal loop.
+    return QSettings().value("options/nonmodalstartup", true).toBool();
+}
+
+void Settings::setNonModalStartup(bool on) {
+    QSettings().setValue("options/nonmodalstartup", on);
+}
+
 void Settings::setPeers(int peers) {
     _peerConnections = peers;
 }

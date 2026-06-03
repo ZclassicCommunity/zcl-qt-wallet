@@ -284,6 +284,15 @@ private:
     // from re-showing every poll.
     bool                        ezForeignStuckShown         = false;
 
+    // W1-4: SUSTAINED-timeout gate for the foreign-node-stuck dialog. The poll-count
+    // gate (ezNoPeerPolls) alone can be reached quickly if the sync cadence is fast,
+    // false-firing the dialog during a legitimate multi-minute first-run warmup where
+    // a foreign node is briefly peerless. Require the peerless condition to ALSO have
+    // persisted for a wall-clock window (~120s, mirroring the connection.cpp warmup
+    // patience) before surfacing it. Started on the first peerless sample, invalidated
+    // the moment any peer appears.
+    QElapsedTimer               ezForeignStuckSince;
+
     // G6: the warmup-wedge cap (heal/attempts.warmupRestart) must only be cleared by
     // SUSTAINED health, never by one getinfo — otherwise a node that answers a single
     // getinfo and then re-wedges would reset the counter forever and never escalate

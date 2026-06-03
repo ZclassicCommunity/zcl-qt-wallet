@@ -963,7 +963,7 @@ void RPC::getInfoThenRefresh(bool force) {
             // F6: debounce the peerless banner — a single connections==0 sample
             // shouldn't flip it. Require ~3 consecutive peerless polls (~15s at the
             // 5s sync cadence); a single peer resets the counter instantly.
-            if (connections == 0) ezNoPeerPolls++; else ezNoPeerPolls = 0;
+            if (connections == 0) ezNoPeerPolls++; else { ezNoPeerPolls = 0; ezForeignStuckSince.invalidate(); ezForeignStuckShown = false; }   // W1-4: peers back -> let the stuck dialog re-surface if it gets stuck again later
             if (isSyncing && connections == 0 && ezNoPeerPolls >= 3) {
                 // RUNTIME STUB AUTO-HEAL: a node that STARTED FINE but loaded a tiny
                 // non-genesis "stub" chain (e.g. an aborted P2P sync left ~17MB of
@@ -1008,8 +1008,21 @@ void RPC::getInfoThenRefresh(bool force) {
                 // nullptr — it self-heals at its own startup and has bootstrap peers, so it
                 // is not peerless) NEVER reaches this branch; a foreign node WITH peers /
                 // syncing/synced never enters this peerless block at all (case C).
-                if (ezclassicd == nullptr && ezNoPeerPolls >= 36 && !ezForeignStuckShown) {
+                // W1-4: in addition to the poll-count gate, require a SUSTAINED
+                // wall-clock window (~120s) of being peerless before surfacing the
+                // actionable dialog, so a fast sync cadence can't false-fire it during
+                // a legitimate multi-minute first-run warmup. Start the timer on the
+                // first peerless sample seen here; it's invalidated below the moment a
+                // peer appears, and reset when the dialog is shown.
+                if (ezclassicd == nullptr && !ezForeignStuckSince.isValid())
+                    ezForeignStuckSince.start();
+                if (ezclassicd == nullptr && ezNoPeerPolls >= 36 && !ezForeignStuckShown &&
+                    ezForeignStuckSince.isValid() && ezForeignStuckSince.elapsed() >= 120000) {
                     ezForeignStuckShown = true;
+                    // W1-4: do NOT invalidate the timer here. ezForeignStuckShown already
+                    // suppresses a repeat while we stay peerless; both it and the timer are
+                    // reset the moment peers return (above), so the dialog can correctly
+                    // re-fire on a fresh stuck stretch rather than being silenced forever.
                     main->logger->write("Foreign node peerless/stuck past sustained window; "
                                         "surfacing actionable dialog (cannot heal a node we "
                                         "did not start)");
@@ -1274,17 +1287,19 @@ void RPC::refreshBalances() {
 
         // FUND-SAFETY: this wallet has no seed phrase, so an un-backed-up wallet.dat
         // is permanent, unrecoverable loss. Once we are fully synced AND the user
-        // actually holds a balance, prompt them to back up -- exactly ONCE per run.
-        // promptWalletBackup() is itself permanently silenced after a successful
-        // backup (options/walletbackedup), and the session one-shot here guarantees
-        // we never re-pop the dialog on subsequent balance polls (privacy-without-
-        // annoyance: it fires on the synced edge, not every refresh).
+        // actually holds a balance, surface the backup reminder -- exactly ONCE per
+        // run. W1-2: this now shows a NON-blocking amber Home card (showBackupNag())
+        // instead of the modal promptWalletBackup() box, so it never interrupts the
+        // user. It is permanently silenced after a successful backup
+        // (options/walletbackedup), and the session one-shot here guarantees we never
+        // re-fire on subsequent balance polls (it fires on the synced edge, not every
+        // refresh). promptWalletBackup() stays reachable from the Help menu.
         static bool backupPromptShownThisSession = false;
         if (!backupPromptShownThisSession &&
             !Settings::getInstance()->isSyncing() &&
             balTotal > 0) {
             backupPromptShownThisSession = true;
-            main->promptWalletBackup();
+            main->showBackupNag();
         }
     });
 

@@ -85,16 +85,65 @@ ConnectionLoader::~ConnectionLoader() {
 
 void ConnectionLoader::loadConnection() {
     QTimer::singleShot(1, [=]() { this->doAutoConnect(); });
-    // The connect dialog is shown application-modal via d->exec() (a nested event
-    // loop). NOTE: doRPCSetConnection's use-after-free fix (done(Accepted) + DEFERRED
-    // deleteLater(d) + deferred `delete this`) is what makes this safe — it never
-    // frees the dialog/loader while exec() is still on the stack. (An earlier
-    // experiment replaced exec() with show()+ApplicationModal to also make the splash
-    // quittable mid-startup, but that exposed a latent NULL-deref teardown crash on
-    // quit-during-pre-connect; reverted to the proven exec() form. Making the splash
-    // cleanly quittable is a tracked follow-up — backtrace captured.)
-    if (!Settings::getInstance()->isHeadless())
-        d->exec();
+
+    if (Settings::getInstance()->isHeadless())
+        return;   // no UI at all (test/headless): never show the dialog.
+
+    // W1-1: NON-MODAL startup (default ON). The old form blocked the entire UI for
+    // 1-2 minutes behind d->exec() (a nested event loop that hid the main window for
+    // the whole first-run node warmup). Instead show the MAIN WINDOW first so the
+    // user immediately sees their cached balances (restoreSavedStates paints them
+    // pre-RPC), then float the warmup splash as a NON-blocking, dismissible overlay.
+    //
+    // CRASH-SAFETY (why this no longer reproduces the prior teardown NULL-deref):
+    //  * The earlier naive show()-swap freed the loader/dialog while a queued poll
+    //    singleShot or an async getbootstrapinfo probe was still pending, then that
+    //    lambda ran against freed members. Here EVERY async continuation already
+    //    checks the shared ezAlive token (doAutoConnect / refreshZClassicdState /
+    //    probeBootstrapProgress / classifyForeignDaemon all bail on !*ezAlive), and
+    //    ~ConnectionLoader sets *ezAlive=false, so a late lambda is a guarded no-op.
+    //  * The loader is freed in exactly ONE place — doRPCSetConnection's DEFERRED
+    //    deleteLater(d) + QTimer::singleShot(0, main, [delete this]) — which now runs
+    //    in the MAIN event loop (not unwinding a nested exec()), so the proven
+    //    deferred-teardown ordering is intact and there is no nested-loop frame left
+    //    to corrupt. Dismissing the splash (rejected()) only hides it; it does NOT
+    //    free the loader, so no pending lambda can ever deref freed memory.
+    if (Settings::getInstance()->getNonModalStartup()) {
+        // Show the main window first / not gated on the splash.
+        if (main) {
+            main->show();
+            main->raise();
+            main->activateWindow();
+        }
+        // NON-blocking overlay: at most window-modal, NEVER application-modal (which
+        // would re-block the whole UI). A plain modeless show keeps the main window
+        // fully interactive while the node warms up.
+        d->setModal(false);
+        d->setWindowModality(Qt::NonModal);
+        // Dismissing the splash (title-bar X / Esc) must NOT quit the app and must NOT
+        // free the loader — it simply hides the overlay while warmup continues in the
+        // background (guarded poll lambdas keep running; doRPCSetConnection still
+        // closes everything cleanly when the node comes online). 'main' is the QObject
+        // context so this connection auto-disconnects if the window is torn down first.
+        QObject::connect(d, &QDialog::rejected, main, [this]() {
+            if (!ezAlive || !*ezAlive)   // loader already retired -> nothing to do
+                return;
+            if (ezProgrammaticClose)     // showError's d->close() owns this path
+                return;
+            // A user dismiss just hides the modeless overlay and leaves the main
+            // window up; warmup continues in the background.
+            main->logger->write("Startup splash dismissed; warmup continues in background");
+        });
+        d->show();
+        d->raise();
+        return;
+    }
+
+    // Flag OFF: retain the PROVEN application-modal d->exec() path verbatim. The
+    // use-after-free fix in doRPCSetConnection (done(Accepted) + DEFERRED
+    // deleteLater(d) + deferred `delete this`) is what keeps this safe — it never
+    // frees the dialog/loader while exec() is still on the stack.
+    d->exec();
 }
 
 void ConnectionLoader::doAutoConnect(bool tryEzclassicdStart) {
@@ -1826,10 +1875,18 @@ void ConnectionLoader::doRPCSetConnection(Connection* conn) {
     // Fix: close the modal loop with done(), then DEFER destroying BOTH the dialog
     // and this loader until d->exec() has fully unwound and we are back in the main
     // event loop. Null d first so ~ConnectionLoader's `delete d` becomes a safe no-op.
+    //
+    // W1-1: in the NON-MODAL startup mode this slot is dispatched directly in the MAIN
+    // event loop (the splash was d->show()n modeless, never d->exec()'d), so there is
+    // no nested exec() frame to corrupt — done(Accepted) just hides+finishes the
+    // modeless dialog. The SAME deferred ordering is kept verbatim for both modes: it
+    // is the single place the loader is freed, so the ezAlive-guarded poll/probe
+    // lambdas can never deref a freed member, and the modeless-dismiss rejected()
+    // handler never frees anything.
     if (d) {
         QDialog* dlg = d;
         d = nullptr;                       // ~ConnectionLoader must not double-free it
-        dlg->done(QDialog::Accepted);      // unwinds the nested d->exec() cleanly
+        dlg->done(QDialog::Accepted);      // unwinds the nested d->exec() cleanly (modal) / hides+finishes (modeless)
         dlg->deleteLater();                // freed only once back in the main loop
     }
 

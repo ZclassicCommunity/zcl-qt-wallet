@@ -128,6 +128,16 @@ MainWindow::MainWindow(QWidget *parent) :
         });
     }
 
+    // W1-2: the synced-edge backup nag is now a NON-blocking Home card (showBackupNag),
+    // not a modal. Keep the full guided backup flow (promptWalletBackup) reachable on
+    // demand from the Help menu so the user can invoke it any time. Created in code for
+    // the same reason as the repair action (the .ui is checked in / not regenerated).
+    {
+        auto* backupAction = new QAction(tr("Back up wallet…"), this);
+        ui->menuHelp->addAction(backupAction);
+        QObject::connect(backupAction, &QAction::triggered, this, &MainWindow::promptWalletBackup);
+    }
+
     // Initialize to the balances tab
     ui->tabWidget->setCurrentIndex(0);
 
@@ -750,6 +760,75 @@ void MainWindow::setupHomeDashboard() {
 
     summaryVBox->insertWidget(insertAt++, homeFixItCard);
 
+    // ---- 3b) BACK-UP CARD (W1-2: amber; hidden unless un-backed-up + funded) ----
+    // Replaces the modal backup nag (promptWalletBackup's box.exec()) with a
+    // non-blocking Home card that reuses the EXACT fix-it/callout amber styling
+    // (same objectNames -> same dark.qss rules). Surfaced by showBackupNag() on the
+    // synced && balTotal>0 edge, hidden once options/walletbackedup is set. Its two
+    // buttons reuse the existing backup/export handlers; promptWalletBackup() stays
+    // reachable from the Help menu for the full guided flow.
+    homeBackupCard = new QFrame(ui->tab);
+    homeBackupCard->setObjectName("homeFixItCard");   // reuse the amber-card qss rule
+    homeBackupCard->setFrameShape(QFrame::NoFrame);
+    auto* backupV = new QVBoxLayout(homeBackupCard);
+    backupV->setContentsMargins(12, 12, 12, 12);
+    backupV->setSpacing(8);
+
+    homeBackupText = new QLabel(
+        tr("Back up your wallet. This wallet has no recovery phrase — if this "
+           "computer is lost or its disk fails and you have no backup, your coins "
+           "are gone forever."),
+        homeBackupCard);
+    homeBackupText->setObjectName("homeFixItText");   // reuse the amber-body qss rule
+    homeBackupText->setWordWrap(true);
+
+    auto* backupRow = new QHBoxLayout();
+    backupRow->setSpacing(8);
+    auto* backupNowBtn = new QPushButton(tr("Back Up Now"), homeBackupCard);
+    backupNowBtn->setObjectName("homeFixItBtn");      // reuse the amber-button qss rule
+    backupNowBtn->setAutoDefault(false);
+    backupNowBtn->setCursor(Qt::PointingHandCursor);
+    auto* exportKeysBtn = new QPushButton(tr("Export Private Keys"), homeBackupCard);
+    exportKeysBtn->setObjectName("homeFixItBtn");
+    exportKeysBtn->setAutoDefault(false);
+    exportKeysBtn->setCursor(Qt::PointingHandCursor);
+
+    // Wire to the existing handlers. backupWalletDat()/exportAllKeys() are the same
+    // file-copy / key-export flows the Help menu uses; on a confirmed backup they set
+    // options/walletbackedup, after which showBackupNag() hides the card permanently.
+    QObject::connect(backupNowBtn, &QPushButton::clicked, [this]() {
+        backupWalletDat();
+        // backupWalletDat() persists options/walletbackedup on a successful copy; if
+        // the user actually backed up, drop the card immediately (idempotent).
+        if (Settings::getInstance()->isWalletBackedUp() && homeBackupCard)
+            homeBackupCard->setVisible(false);
+    });
+    QObject::connect(exportKeysBtn, &QPushButton::clicked, [this]() {
+        // Reuse the existing key-export dialog, then confirm the user actually saved
+        // before recording the backup (mirrors promptWalletBackup's export path so a
+        // false sense of safety is never created).
+        exportAllKeys();
+        auto saved = QMessageBox::question(this, tr("Did you save your keys?"),
+            tr("Did you save the file with your private keys somewhere safe?\n\n"
+               "Only choose Yes if you actually saved it — otherwise the reminder "
+               "stays."),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (saved == QMessageBox::Yes) {
+            Settings::getInstance()->setWalletBackedUp(true);
+            if (homeBackupCard)
+                homeBackupCard->setVisible(false);
+        }
+    });
+    backupRow->addWidget(backupNowBtn);
+    backupRow->addWidget(exportKeysBtn);
+    backupRow->addStretch();
+
+    backupV->addWidget(homeBackupText);
+    backupV->addLayout(backupRow);
+
+    homeBackupCard->setVisible(false);   // hidden until showBackupNag() surfaces it
+    summaryVBox->insertWidget(insertAt++, homeBackupCard);
+
     // ---- 4) COLLAPSE the redundant Summary breakdown (Polish P1) ------------
     // The balance was shown up to 4x (hero + Total subline + these standalone
     // Shielded/Transparent/Total rows + the Address Balances table). The hero now
@@ -1359,8 +1438,14 @@ void MainWindow::showForeignNodeStuck() {
         QPushButton* bundledBtn = portsAreFree
             ? box.addButton(tr("Use the bundled node"), QMessageBox::ActionRole)
             : nullptr;
-        QPushButton* quitBtn    = box.addButton(tr("Quit"), QMessageBox::RejectRole);
+        // W1-4: a dismissable "Remind me later" so a slow / temporarily-peerless node never
+        // traps the user in a relaunch-or-quit modal. Dismissing just continues using the
+        // wallet; the dialog stays suppressed (ezForeignStuckShown) until peers recover, then
+        // re-fires if it gets stuck again. This is also the Escape / window-close action.
+        QPushButton* laterBtn   = box.addButton(tr("Remind me later"), QMessageBox::RejectRole);
+        QPushButton* quitBtn    = box.addButton(tr("Quit"), QMessageBox::DestructiveRole);
         box.setDefaultButton(reopenBtn);
+        box.setEscapeButton(laterBtn);
 
         box.exec();
         QAbstractButton* clicked = box.clickedButton();
@@ -1379,10 +1464,13 @@ void MainWindow::showForeignNodeStuck() {
             logger->write("Foreign-node-stuck: Quit pressed");
             quitApp();
             return;
-        } else {   // reopenBtn or window-chrome close: relaunch so we can manage our own node
+        } else if (clicked == reopenBtn) {
             logger->write("Foreign-node-stuck: relaunching app so this wallet manages its own node");
             mwRelaunchSelf();
             quitApp();
+            return;
+        } else {   // laterBtn or window-chrome close: dismiss and keep using the wallet
+            logger->write("Foreign-node-stuck: 'Remind me later' — dismissed; will re-surface if still stuck after peers recover");
             return;
         }
     }
@@ -1660,6 +1748,18 @@ void MainWindow::balancesReady() {
 //
 // It is modal/blocking but ALWAYS dismissible ("Maybe later") so it can never
 // become an un-closable trap.
+// W1-2: surface the NON-blocking amber backup card on the Home dashboard. Called from
+// rpc.cpp on the synced && balTotal>0 && once-per-session edge (the same trigger that
+// used to fire the modal promptWalletBackup()). No-op once the wallet has been backed
+// up (options/walletbackedup) or when the card isn't built (e.g. before the dashboard
+// is set up). The card's own buttons (Back Up Now / Export Private Keys) silence it.
+void MainWindow::showBackupNag() {
+    if (Settings::getInstance()->isWalletBackedUp())
+        return;   // already backed up -> never nag again
+    if (homeBackupCard != nullptr)
+        homeBackupCard->setVisible(true);
+}
+
 void MainWindow::promptWalletBackup() {
     // Already backed up at some point? Never nag again.
     if (QSettings().value("options/walletbackedup", false).toBool())
@@ -1963,8 +2063,14 @@ void MainWindow::backupWalletDat() {
         return;
 
     if (!wallet.copy(backupName.toLocalFile())) {
-        QMessageBox::critical(this, tr("Couldn't backup"), tr("Couldn't backup the wallet.dat file.") + 
+        QMessageBox::critical(this, tr("Couldn't backup"), tr("Couldn't backup the wallet.dat file.") +
             tr("You need to back it up manually."), QMessageBox::Ok);
+    } else {
+        // W1-2: a confirmed file-copy backup silences the backup nag (the amber Home
+        // card + the legacy promptWalletBackup modal) permanently. Previously only
+        // promptWalletBackup()'s own copy path set this; now the Help-menu action and
+        // the Home card's "Back Up Now" button record it too.
+        Settings::getInstance()->setWalletBackedUp(true);
     }
 }
 
