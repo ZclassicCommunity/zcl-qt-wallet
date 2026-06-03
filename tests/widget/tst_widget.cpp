@@ -14,13 +14,31 @@
 // a daemon. The D-series tests never spin the event loop long enough for the
 // loader's singleShot(1) to fire at all (setChecked() emits toggled()
 // synchronously), so loadConnection() is inert for them.
+//
+// D-SERIES (Phase 3c, private-by-default Receive). The Receive page rests on ONE
+// shielded Sapling z-address with a green "Private" badge; the transparent +
+// legacy-Sprout radios are tucked behind a collapsed "Other address types
+// (advanced)" QToolButton (MainWindow::btnReceiveAdvanced). The D-series drives
+// that disclosure exactly as a user would — expand the toggle, then select an
+// option — and asserts:
+//   D1  private-by-default RESTING state (badge shown, panel collapsed, t-Addr
+//       hidden, no PUBLIC caption);
+//   D2  expanding reveals t-Addr and selecting it shows the red PUBLIC caption;
+//   D3  selecting legacy-Sprout DISABLES new-address (no Sprout backdoor);
+//   D4  collapsing RETURNS TO PRIVATE (caption cleared, badge restored, Sapling
+//       re-selected);
+//   D5  selecting Sapling clears the transparent caption.
+// Each fails if the private-by-default IA regresses (radios exposed at rest, the
+// disclosure not hiding t-Addr, or collapsing not returning to private).
 // ============================================================================
 #include <QtTest/QtTest>
 #include <QApplication>
 #include <QTemporaryDir>
 #include <QRadioButton>
+#include <QToolButton>
 #include <QLabel>
 #include <QPushButton>
+#include <QWidget>
 #include <QDialog>
 #include <QTimer>
 #include <QSettings>
@@ -64,25 +82,87 @@ private:
 
 private slots:
 
-    // ---- D1: rdioTAddr -> red PUBLIC caption on lblSproutWarning -----------
-    void d1_tAddrShowsPublicWarning() {
+    // NOTE on visibility throughout the D-series: the Receive widgets live on tab
+    // page 2, which is NOT the current page, so effective isVisible() is always
+    // false for any widget on a non-current tab regardless of its own flag. The
+    // behavior under test is each widget's OWN visible flag (does setup/the
+    // disclosure explicitly hide/show it), which is exactly what !isHidden()
+    // reports — independent of whether the parent page/window is mapped.
+
+    // ---- D1: PRIVATE-BY-DEFAULT resting state (Phase 3c) -------------------
+    // At rest the Receive page shows ONLY the shielded Sapling path: the green
+    // "Private" badge is shown, the advanced disclosure exists but is COLLAPSED,
+    // the t-Addr radio is NOT visible, and there is NO PUBLIC/scary caption.
+    // FAILS if private-by-default regresses (e.g. the radios are exposed at rest
+    // or the t-Addr option leaks onto the resting page).
+    void d1_receiveIsPrivateByDefault() {
         MainWindow* w = makeWindow();
         auto* ui = w->ui;
 
-        // NOTE on visibility: lblSproutWarning lives on the Receive tab (page 2),
-        // which is NOT the current page, so effective isVisible() is always false
-        // for a widget on a non-current tab. The behavior under test is whether
-        // setupRecieveTab() EXPLICITLY un-hides the label, which is exactly what
-        // !isHidden() reports (the widget's own visible flag, independent of
-        // whether its parent page/window is currently mapped).
+        // The disclosure machinery must have been built.
+        QVERIFY2(w->btnReceiveAdvanced != nullptr,
+                 "Phase-3c: the 'Other address types (advanced)' toggle must exist");
+        QVERIFY2(w->receiveAdvancedPanel != nullptr,
+                 "Phase-3c: the advanced disclosure panel must exist");
+        QVERIFY2(w->lblReceivePrivate != nullptr,
+                 "Phase-3c: the green 'Private' badge must exist");
 
-        // Precondition: warning hidden after construction.
-        QVERIFY(ui->lblSproutWarning->isHidden());
+        // Resting affordance: green Private badge SHOWN, advanced panel COLLAPSED.
+        QVERIFY2(!w->lblReceivePrivate->isHidden(),
+                 "at rest the green 'Private' badge must be visible");
+        QVERIFY2(w->lblReceivePrivate->text().contains("Private", Qt::CaseSensitive),
+                 "the badge text must read 'Private'");
+        QVERIFY2(w->receiveAdvancedPanel->isHidden(),
+                 "at rest the advanced (t-Addr/Sprout) panel must be COLLAPSED/hidden");
+        QVERIFY2(!w->btnReceiveAdvanced->isChecked(),
+                 "the advanced disclosure must default to COLLAPSED");
 
+        // The transparent option must NOT be reachable on the resting page. It is
+        // a child of the advanced panel (structural sanity), and that panel is
+        // COLLAPSED (asserted above via the panel's own hidden flag), so t-Addr is
+        // not effectively visible to the user. We test the panel's explicit flag,
+        // not rdioTAddr->isVisible(), because the whole Receive page sits on a
+        // non-current tab where every child's effective isVisible() is false
+        // regardless — see the D-series note.
+        QVERIFY2(ui->rdioTAddr->parentWidget() == w->receiveAdvancedPanel,
+                 "rdioTAddr must be reparented INTO the advanced panel");
+        QVERIFY2(w->receiveAdvancedPanel->isHidden(),
+                 "the t-Addr option is unreachable at rest (its panel is collapsed)");
+        // The Sapling radio is the hidden private default, not a visible choice.
+        QVERIFY2(ui->rdioZSAddr->isHidden(),
+                 "the Sapling radio is the hidden private default, not a visible choice");
+
+        // No scary caption at rest — receiving is private, full stop.
+        QVERIFY2(ui->lblSproutWarning->isHidden(),
+                 "no PUBLIC/Sprout caption may be shown on the private resting page");
+
+        delete w;
+    }
+
+    // ---- D2: expanding the disclosure reveals t-Addr -> PUBLIC caption -----
+    // Driving the disclosure exactly as a user would: expand it, then select the
+    // transparent option, and assert the red PUBLIC caption (reusing
+    // lblSproutWarning) with the correct copy. FAILS if expanding stops revealing
+    // t-Addr, or if selecting t-Addr stops warning that it is PUBLIC.
+    void d2_advancedRevealsTransparentPublicWarning() {
+        MainWindow* w = makeWindow();
+        auto* ui = w->ui;
+
+        // Expand "Other address types (advanced)" via its public toggle, the same
+        // signal a user click emits.
+        w->btnReceiveAdvanced->setChecked(true);
+        QVERIFY2(!w->receiveAdvancedPanel->isHidden(),
+                 "expanding the disclosure must REVEAL the advanced panel");
+        QVERIFY2(!ui->rdioTAddr->isHidden(),
+                 "expanding the disclosure must reveal the transparent (t-Addr) option");
+        // The green private badge steps aside while in advanced mode.
+        QVERIFY2(w->lblReceivePrivate->isHidden(),
+                 "the 'Private' badge must hide while the advanced panel is open");
+
+        // Now SELECT the transparent option -> the red PUBLIC caption appears.
         ui->rdioTAddr->setChecked(true);
-
         QVERIFY2(!ui->lblSproutWarning->isHidden(),
-                 "selecting rdioTAddr must reveal the PUBLIC warning label");
+                 "selecting t-Addr must reveal the PUBLIC warning caption");
 
         const QString t = ui->lblSproutWarning->text();
         QVERIFY2(t.contains("Transparent address.", Qt::CaseSensitive),
@@ -95,39 +175,75 @@ private slots:
         delete w;
     }
 
-    // ---- D3: under rdioZAddr the New-Address button is DISABLED ------------
-    void d3_zAddrDisablesNewAddressButton() {
+    // ---- D3: under legacy-Sprout the New-Address button is DISABLED --------
+    // The disclosure must never let a fresh deprecated Sprout address be minted:
+    // selecting the (read-only) legacy-Sprout radio DISABLES the new-address
+    // button, and the private Sapling default re-enables it. FAILS if the Sprout
+    // backdoor (new-address-while-Sprout) is reintroduced.
+    void d3_sproutDisablesNewAddressButton() {
         MainWindow* w = makeWindow();
         auto* ui = w->ui;
 
+        // rdioZAddr (legacy Sprout) is the read-only Sprout view inside the
+        // disclosure. Selecting it must disable new-address creation.
         ui->rdioZAddr->setChecked(true);
-
         QVERIFY2(!ui->btnRecieveNewAddr->isEnabled(),
-                 "Sprout (rdioZAddr) must DISABLE the new-address button (backdoor removed)");
+                 "legacy Sprout (rdioZAddr) must DISABLE the new-address button (backdoor removed)");
 
-        // And the Sapling radio re-enables it (belt-and-suspenders).
+        // Returning to the private Sapling default re-enables it.
         ui->rdioZSAddr->setChecked(true);
         QVERIFY2(ui->btnRecieveNewAddr->isEnabled(),
-                 "selecting Sapling (rdioZSAddr) must re-enable the new-address button");
+                 "the private Sapling default (rdioZSAddr) must re-enable the new-address button");
 
         delete w;
     }
 
-    // ---- D5: rdioTAddr then rdioZSAddr CLEARS the warning ------------------
+    // ---- D4: collapsing the disclosure RETURNS TO PRIVATE ------------------
+    // The disclosure is also a "go back to private" control: after showing the
+    // transparent PUBLIC caption, collapsing the disclosure must clear the caption,
+    // restore the green Private badge, and hide the panel. FAILS if collapsing
+    // leaves the page resting on a transparent/PUBLIC selection.
+    void d4_collapsingReturnsToPrivate() {
+        MainWindow* w = makeWindow();
+        auto* ui = w->ui;
+
+        // Expand + select transparent so the PUBLIC caption is up and the badge is
+        // hidden (the non-private state).
+        w->btnReceiveAdvanced->setChecked(true);
+        ui->rdioTAddr->setChecked(true);
+        QVERIFY(!ui->lblSproutWarning->isHidden());
+        QVERIFY(w->lblReceivePrivate->isHidden());
+
+        // Collapse the disclosure -> back to private.
+        w->btnReceiveAdvanced->setChecked(false);
+        QVERIFY2(w->receiveAdvancedPanel->isHidden(),
+                 "collapsing must hide the advanced panel");
+        QVERIFY2(ui->lblSproutWarning->isHidden(),
+                 "collapsing back to private must CLEAR the PUBLIC caption");
+        QVERIFY2(!w->lblReceivePrivate->isHidden(),
+                 "collapsing back to private must restore the green 'Private' badge");
+        QVERIFY2(ui->rdioZSAddr->isChecked(),
+                 "collapsing must re-select the private Sapling default");
+
+        delete w;
+    }
+
+    // ---- D5: selecting Sapling CLEARS the transparent warning -------------
+    // Independent of the disclosure arrow: directly switching the underlying state
+    // machine from t-Addr to shielded Sapling must clear the PUBLIC caption (no
+    // scary caption on a private address). FAILS if Sapling stops clearing it.
     void d5_saplingClearsTransparentWarning() {
         MainWindow* w = makeWindow();
         auto* ui = w->ui;
 
-        // Show the transparent PUBLIC warning first (label on the non-current
-        // Receive page, so assert via !isHidden() — see d1's note).
+        // Show the transparent PUBLIC warning first.
         ui->rdioTAddr->setChecked(true);
         QVERIFY(!ui->lblSproutWarning->isHidden());
 
-        // Switching to shielded Sapling must clear it (no scary caption on a
-        // private address).
+        // Switching to shielded Sapling must clear it.
         ui->rdioZSAddr->setChecked(true);
         QVERIFY2(ui->lblSproutWarning->isHidden(),
-                 "switching rdioTAddr -> rdioZSAddr must HIDE the warning label");
+                 "switching t-Addr -> Sapling must HIDE the warning label");
 
         delete w;
     }

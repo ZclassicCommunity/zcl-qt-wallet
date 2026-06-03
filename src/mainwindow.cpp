@@ -24,6 +24,7 @@
 #include <QFrame>
 #include <QLabel>
 #include <QPushButton>
+#include <QToolButton>
 #include <QFont>
 #include <QButtonGroup>
 #include <QAbstractButton>
@@ -2213,19 +2214,22 @@ void MainWindow::setupRecieveTab() {
     // Focus enter for the Receive Tab
     QObject::connect(ui->tabWidget, &QTabWidget::currentChanged, [=] (int tab) {
         if (tab == 2) {
-            // Switched to receive tab, so update everything. 
+            // Switched to receive tab. Phase-3c: come to REST in the private view —
+            // the shielded Sapling address is the only thing on screen; the
+            // transparent/legacy-Sprout options stay tucked behind the collapsed
+            // "Other address types (advanced)" disclosure.
 
-            // Hide Sapling radio button if Sapling is not active
-            if (Settings::getInstance()->isSaplingActive()) {
-                ui->rdioZSAddr->setVisible(true);    
-                ui->rdioZSAddr->setChecked(true);
-                ui->rdioZAddr->setText("z-Addr(Legacy Sprout)");
-            } else {
-                ui->rdioZSAddr->setVisible(false);    
-                ui->rdioZAddr->setChecked(true);
-                ui->rdioZAddr->setText("z-Addr");   // Don't use the "Sprout" label if there's no Sapling
-            }
-            
+            // Keep the legacy-Sprout label honest, and re-evaluate which advanced
+            // options are even offered (Sprout is hidden unless funds are held).
+            ui->rdioZAddr->setText(Settings::getInstance()->isSaplingActive()
+                                   ? "z-Addr (Legacy Sprout)" : "z-Addr");
+            refreshReceiveAdvancedOptions();
+
+            // Collapse the disclosure and select the private (Sapling) address.
+            // setReceiveAdvancedExpanded(false) checks rdioZSAddr (the state
+            // machine), which loads the Sapling z-addrs and clears any warning.
+            setReceiveAdvancedExpanded(false);
+
             // And then select the first one
             ui->listRecieveAddresses->setCurrentIndex(0);
         }
@@ -2313,6 +2317,179 @@ void MainWindow::setupRecieveTab() {
 
         this->exportKeys(addr);
     });
+
+    // Phase-3c: private-by-default IA. Build the disclosure LAST so it can reparent
+    // the now-fully-wired radios into the collapsible advanced panel and bring the
+    // page to its private resting view. Done after all the toggle handlers above
+    // are connected so reparenting never drops a connection.
+    setupReceivePrivacyDisclosure();
+}
+
+// Phase-3c (Quiet+): restructure the Receive page so it is PRIVATE BY DEFAULT.
+//
+// At rest the page shows ONLY the shielded Sapling z-address (combo/QR/label) plus
+// a green "Private" indicator. The three radios that used to sit at the top of the
+// "Address Type" group are reparented into a collapsible panel revealed by a
+// "▸ Other address types (advanced)" QToolButton; the panel is HIDDEN at rest.
+// Expanding it exposes the transparent (t-Addr) option and — only when the wallet
+// holds legacy Sprout funds — the read-only legacy-Sprout view. The radios remain
+// the underlying state machine (all their existing toggle handlers are untouched);
+// we only change WHERE they live and WHEN they are shown.
+void MainWindow::setupReceivePrivacyDisclosure() {
+    // The radios currently live in horizontalLayout_9, itself the first item of
+    // groupBox_6's verticalLayout_9. Find that group's vertical layout so we can
+    // insert the private badge + disclosure ABOVE the existing address combo row.
+    auto* groupLayout = qobject_cast<QVBoxLayout*>(ui->groupBox_6->layout());
+    if (groupLayout == nullptr) return;   // defensive: layout shape unexpected
+
+    // The group box "Address Type" title is now redundant clutter for the private-
+    // first view; relabel it to something privacy-forward.
+    ui->groupBox_6->setTitle(tr("Receive privately"));
+
+    // ---- 1) Green PRIVATE indicator (the resting-state affordance) ----------
+    lblReceivePrivate = new QLabel(ui->groupBox_6);
+    lblReceivePrivate->setObjectName("lblReceivePrivate");   // qss hook (green badge)
+    lblReceivePrivate->setText(tr("●  Private — shielded (z) address"));
+    lblReceivePrivate->setTextFormat(Qt::PlainText);
+    lblReceivePrivate->setToolTip(tr(
+        "This is a shielded Sapling address. The amount, sender and recipient are "
+        "encrypted on the blockchain — private by default."));
+
+    // ---- 2) Advanced disclosure toggle --------------------------------------
+    btnReceiveAdvanced = new QToolButton(ui->groupBox_6);
+    btnReceiveAdvanced->setObjectName("btnReceiveAdvanced");   // qss hook
+    btnReceiveAdvanced->setText(tr("Other address types (advanced)"));
+    btnReceiveAdvanced->setCheckable(true);
+    btnReceiveAdvanced->setChecked(false);
+    btnReceiveAdvanced->setCursor(Qt::PointingHandCursor);
+    btnReceiveAdvanced->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    btnReceiveAdvanced->setArrowType(Qt::RightArrow);          // ▸ collapsed
+    btnReceiveAdvanced->setAutoRaise(true);
+
+    // ---- 3) Collapsible panel that will HOST the reparented radios ----------
+    receiveAdvancedPanel = new QWidget(ui->groupBox_6);
+    receiveAdvancedPanel->setObjectName("receiveAdvancedPanel");
+    auto* panelV = new QVBoxLayout(receiveAdvancedPanel);
+    panelV->setContentsMargins(2, 4, 2, 4);
+    panelV->setSpacing(4);
+
+    auto* advCaption = new QLabel(receiveAdvancedPanel);
+    advCaption->setObjectName("lblReceiveAdvancedCaption");
+    advCaption->setWordWrap(true);
+    advCaption->setText(tr(
+        "Most people never need these. Transparent (t) addresses are PUBLIC; "
+        "legacy Sprout is shown only for funds you already hold."));
+
+    auto* radiosRow = new QHBoxLayout();
+    radiosRow->setContentsMargins(0, 0, 0, 0);
+    radiosRow->setSpacing(12);
+
+    // Reparent the existing radios out of horizontalLayout_9 into our panel. The
+    // Sapling radio is the private DEFAULT and stays hidden inside the panel (it is
+    // the state machine, not a user-facing choice); only t-Addr and legacy-Sprout
+    // are user-visible advanced choices.
+    radiosRow->addWidget(ui->rdioTAddr);
+    radiosRow->addWidget(ui->rdioZAddr);
+    radiosRow->addStretch(1);
+
+    // rdioZSAddr is reparented too (so it lives with its peers in one button group
+    // container) but stays hidden — selecting it IS the private resting view.
+    ui->rdioZSAddr->setParent(receiveAdvancedPanel);
+    ui->rdioZSAddr->setVisible(false);
+
+    panelV->addWidget(advCaption);
+    panelV->addLayout(radiosRow);
+
+    receiveAdvancedPanel->setVisible(false);   // collapsed at rest
+
+    // ---- 4) Splice everything in ABOVE the address-combo row ----------------
+    // groupLayout currently: [0]=horizontalLayout_9 (now-empty radios row),
+    // [1]=horizontalLayout_10 (combo + New Address), [2]=lblSproutWarning.
+    // Insert: badge, advanced-toggle, advanced-panel at the very top (in order).
+    groupLayout->insertWidget(0, lblReceivePrivate);
+    groupLayout->insertWidget(1, btnReceiveAdvanced);
+    groupLayout->insertWidget(2, receiveAdvancedPanel);
+
+    // ---- 5) Wire the toggle -------------------------------------------------
+    QObject::connect(btnReceiveAdvanced, &QToolButton::toggled, [=](bool checked) {
+        setReceiveAdvancedExpanded(checked);
+    });
+
+    // ---- 6) Bring the page to its private resting VISUAL state --------------
+    // NOTE: this runs during MainWindow construction, BEFORE `rpc` exists
+    // (setupRecieveTab() is called before `rpc = new RPC(this)`). We therefore set
+    // only the resting *visual* state here and must NOT fire a radio toggle that
+    // would dereference the still-null rpc (addZAddrsToComboList / updateTAddrCombo
+    // both deref this->rpc). The actual private (Sapling) SELECTION that populates
+    // the combo happens on the first tab-switch to Receive (currentChanged, tab==2),
+    // once rpc is live — exactly as the original code did. The Sapling radio itself
+    // never needs to be user-visible: it is the private default state machine.
+    receiveAdvancedExpanded = false;
+    receiveAdvancedPanel->setVisible(false);
+    {
+        QSignalBlocker block(btnReceiveAdvanced);
+        btnReceiveAdvanced->setChecked(false);
+        btnReceiveAdvanced->setArrowType(Qt::RightArrow);
+    }
+    if (lblReceivePrivate)
+        lblReceivePrivate->setVisible(true);
+    ui->rdioZSAddr->setVisible(false);
+    ui->lblSproutWarning->setVisible(false);   // no scary caption at rest
+
+    // Sprout funds are unknown until rpc is live (returns false now, re-evaluated
+    // on every Receive tab-switch); hides the legacy-Sprout radio when not held.
+    refreshReceiveAdvancedOptions();
+}
+
+// Show/hide the advanced disclosure. Collapsing always returns to the private
+// (Sapling) view so the page never rests on a transparent/Sprout selection.
+void MainWindow::setReceiveAdvancedExpanded(bool expanded) {
+    receiveAdvancedExpanded = expanded;
+
+    if (btnReceiveAdvanced) {
+        QSignalBlocker block(btnReceiveAdvanced);   // avoid toggle->this re-entry
+        btnReceiveAdvanced->setChecked(expanded);
+        btnReceiveAdvanced->setArrowType(expanded ? Qt::DownArrow : Qt::RightArrow);
+    }
+    if (receiveAdvancedPanel)
+        receiveAdvancedPanel->setVisible(expanded);
+
+    if (!expanded) {
+        // Returning to private: re-select Sapling (clears the PUBLIC caption via the
+        // rdioZSAddr toggle handler) so collapsing is also "go back to private".
+        if (!ui->rdioZSAddr->isChecked())
+            ui->rdioZSAddr->setChecked(true);
+        else
+            ui->lblSproutWarning->setVisible(false);
+    }
+    // The green PRIVATE badge is the resting affordance: show it only while private.
+    if (lblReceivePrivate)
+        lblReceivePrivate->setVisible(!expanded);
+}
+
+// True iff the wallet holds at least one legacy (non-Sapling) z-address — i.e.
+// Sprout funds the user may still want to view/spend. Uses the same Sapling test
+// the combo-population path uses, so it agrees with what rdioZAddr would show.
+bool MainWindow::walletHasLegacySprout() const {
+    if (rpc == nullptr) return false;
+    auto* zaddrs = rpc->getAllZAddresses();
+    if (zaddrs == nullptr) return false;
+    for (const auto& addr : *zaddrs) {
+        if (!Settings::getInstance()->isSaplingAddress(addr))
+            return true;
+    }
+    return false;
+}
+
+// Offer the legacy-Sprout radio ONLY when the wallet actually holds Sprout funds;
+// otherwise it is dead clutter that re-introduces a deprecated path. The t-Addr
+// radio is always available under the disclosure. Safe to call before build.
+void MainWindow::refreshReceiveAdvancedOptions() {
+    const bool hasSprout = walletHasLegacySprout();
+    ui->rdioZAddr->setVisible(hasSprout);
+    // If Sprout funds vanished while it was selected, fall back to private.
+    if (!hasSprout && ui->rdioZAddr->isChecked())
+        ui->rdioZSAddr->setChecked(true);
 }
 
 void MainWindow::updateTAddrCombo(bool checked) {

@@ -256,3 +256,44 @@ QPushButton#homeFixItBtn {
 }
 QPushButton#homeFixItBtn:hover   { background-color: #e09444; border-color: #e09444; }
 QPushButton#homeFixItBtn:pressed { background-color: #c2731f; }
+
+/* ============================================================================
+ * Phase 3c: private-by-default RECEIVE (Quiet+).
+ * The Receive page rests on ONE shielded Sapling z-address with a green "Private"
+ * badge; the transparent + legacy-Sprout radios live behind a collapsed
+ * "▸ Other address types (advanced)" QToolButton (built in
+ * mainwindow.cpp setupReceivePrivacyDisclosure). Tokens: green #1f7a1f,
+ * dim #9aa0a6. Additive only — no existing rule is changed.
+ * ============================================================================ */
+
+/* ---- green "Private" resting affordance ----------------------------------- */
+QLabel#lblReceivePrivate {
+    color: #2a9d2a;                 /* private/green, a touch brighter for the dot */
+    font-size: 12pt;
+    font-weight: 700;
+    padding: 2px 0px;
+}
+
+/* ---- the "Other address types (advanced)" disclosure toggle --------------- */
+QToolButton#btnReceiveAdvanced {
+    background: transparent;
+    color: #9aa0a6;                 /* demoted/dim, like the nav "Advanced" gear */
+    border: none;
+    border-radius: 6px;
+    padding: 6px 6px;
+    font-size: 11pt;
+    font-weight: 600;
+    text-align: left;
+}
+QToolButton#btnReceiveAdvanced:hover   { color: #e6e6e6; }
+QToolButton#btnReceiveAdvanced:checked { color: #e6e6e6; }
+QToolButton#btnReceiveAdvanced::menu-indicator { image: none; }
+
+/* ---- the collapsible advanced panel + its caption ------------------------- */
+QWidget#receiveAdvancedPanel { background: transparent; }
+QLabel#lblReceiveAdvancedCaption {
+    color: #9aa0a6;
+    font-size: 10pt;
+    font-weight: 500;
+    padding-bottom: 2px;
+}

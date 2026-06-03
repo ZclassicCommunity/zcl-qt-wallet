@@ -13,6 +13,8 @@ class Settings;
 class QSystemTrayIcon;
 class QButtonGroup;
 class QPushButton;
+class QToolButton;
+class QWidget;
 
 using json = nlohmann::json;
 
@@ -67,6 +69,16 @@ public:
     void updateFromCombo();
 
     Ui::MainWindow*     ui;
+
+    // Phase-3c redesign (Quiet+): private-by-default RECEIVE widgets, built
+    // programmatically by setupReceivePrivacyDisclosure(). Public alongside `ui`
+    // (the L1 widget tests assert the private-by-default IA through these): the
+    // green "Private" resting badge, the "Other address types (advanced)" toggle,
+    // and the collapsible panel that hosts the (hidden-at-rest) radios.
+    QToolButton*        btnReceiveAdvanced    = nullptr;   // "▸ Other address types (advanced)"
+    QWidget*            receiveAdvancedPanel  = nullptr;   // collapsible container for the radios
+    QLabel*             lblReceivePrivate     = nullptr;   // green "Private — shielded (z) address" badge
+    bool                receiveAdvancedExpanded = false;
 
     QLabel*             statusLabel;
     QLabel*             statusIcon;
@@ -230,6 +242,28 @@ private:
 
     void addNewZaddr(bool sapling);
     std::function<void(bool)> addZAddrsToComboList(bool sapling);
+
+    // Phase-3c redesign (Quiet+): private-by-default RECEIVE. The Receive page
+    // shows, at rest, ONLY the shielded Sapling z-address + a green "Private"
+    // indicator — no radios. The transparent (t-Addr) option and, only when the
+    // wallet holds legacy Sprout funds, the read-only Sprout view, are tucked
+    // behind a collapsed "Other address types (advanced)" disclosure.
+    //
+    // The existing rdioZSAddr/rdioTAddr/rdioZAddr radios are KEPT as the
+    // underlying state machine (every existing toggle handler is preserved), but
+    // are reparented INTO the collapsible disclosure panel and hidden at rest.
+    // Built programmatically (no structural .ui churn); reuses lblSproutWarning
+    // for the red PUBLIC caption exactly as before.
+    void setupReceivePrivacyDisclosure();
+    // Show/hide the advanced disclosure panel; keeps the toggle arrow + collapsed
+    // state in sync and, when collapsing, returns to the private (Sapling) view.
+    void setReceiveAdvancedExpanded(bool expanded);
+    // True iff the wallet currently holds at least one legacy (non-Sapling/Sprout)
+    // z-address; gates whether the read-only legacy-Sprout radio is offered at all.
+    bool walletHasLegacySprout() const;
+    // Refresh which advanced options are offered (e.g. hide the legacy-Sprout radio
+    // when no Sprout funds are held). Safe to call before the disclosure is built.
+    void refreshReceiveAdvancedOptions();
 
     void memoButtonClicked(int number, bool includeReplyTo = false);
     void setMemoEnabled(int number, bool enabled);
