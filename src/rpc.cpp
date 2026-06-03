@@ -14,8 +14,19 @@ using json = nlohmann::json;
 RPC::RPC(MainWindow* main) {
     auto cl = new ConnectionLoader(main, this);
 
-    // Execute the load connection async, so we can set up the rest of RPC properly. 
+    // Execute the load connection async, so we can set up the rest of RPC properly.
+#ifdef ZCL_WIDGET_TEST
+    // L1 widget tests construct the REAL MainWindow/RPC but have NO daemon. The
+    // auto-connect kicks off a SELF-PERPETUATING doAutoConnect() re-arm chain; a
+    // loop-spinning test (one that calls confirmTx -> d.exec()) would start that
+    // chain, and a later step firing after the test's window is gone would touch
+    // freed objects (UAF/SIGSEGV) and bleed across tests. Tests drive balances/
+    // addresses via the testSet* seams instead of a live connection, so skip the
+    // auto-connect entirely under the test build. (Guarded -> never in the app.)
+    (void)cl;
+#else
     QTimer::singleShot(1, [=]() { cl->loadConnection(); });
+#endif
 
     this->main = main;
     this->ui = main->ui;
@@ -276,14 +287,31 @@ void RPC::getZUnspent(const std::function<void(json)>& cb) {
 }
 
 void RPC::newZaddr(bool sapling, const std::function<void(json)>& cb) {
+#ifdef ZCL_WIDGET_TEST
+    // TEST-ONLY SEAM (L1 widget tests, MAJOR-3): there is NO daemon/connection, so
+    // route through a controllable stub instead of conn-> (which would null-deref).
+    // The test installs the next result via testSetNextZaddrResult(): a non-empty
+    // string is delivered to the callback as a JSON string (a successful create);
+    // an empty/unset result delivers nothing (simulates a FAILED create). This lets
+    // the fail-open vs fail-closed paths in createSaplingAddressSync() be driven
+    // deterministically. Compiled in ONLY under ZCL_WIDGET_TEST; never in the app.
+    (void)sapling;
+    if (!testNextZaddrResult.isEmpty()) {
+        QString r = testNextZaddrResult;
+        testNextZaddrResult.clear();   // one-shot: consume so a later create can fail
+        cb(json(r.toStdString()));
+    }
+    return;
+#else
     json payload = {
         {"jsonrpc", "1.0"},
         {"id", "someid"},
         {"method", "z_getnewaddress"},
         {"params", { sapling ? "sapling" : "sprout" }},
     };
-    
+
     conn->doRPCWithDefaultErrorHandling(payload, cb);
+#endif
 }
 
 void RPC::newTaddr(const std::function<void(json)>& cb) {
@@ -1024,10 +1052,16 @@ void RPC::refreshAddresses() {
     zaddresses = new QList<QString>();
 
     getZAddresses([=] (json reply) {
-        for (auto& it : reply.get<json::array_t>()) {   
+        for (auto& it : reply.get<json::array_t>()) {
             auto addr = QString::fromStdString(it.get<json::string_t>());
             zaddresses->push_back(addr);
         }
+
+        // PRIV-28 eager provisioning: now that the z-address list is known, make sure
+        // at least one Sapling z-address exists so the send/shield path never has to
+        // block on key generation. Idempotent + one-shot (no-op once a Sapling addr
+        // exists or after the first attempt this run).
+        main->ensureSaplingProvisioned();
 
         // Refresh the sent and received txs from all these z-addresses
         refreshSentZTrans();
@@ -1737,6 +1771,11 @@ bool RPC::confirmEmbeddedStopped() {
  * Get a Sapling address from the user's wallet
  */
 QString RPC::getDefaultSaplingAddress() {
+    // MINOR-1 null-guard: zaddresses is null until the first refreshAddresses().
+    // Never deref it -- callers (e.g. shieldPublicFunds) treat "" as "none yet".
+    if (zaddresses == nullptr)
+        return QString();
+
     for (QString addr: *zaddresses) {
         if (Settings::getInstance()->isSaplingAddress(addr))
             return addr;

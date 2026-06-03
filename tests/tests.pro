@@ -16,8 +16,14 @@ CONFIG  += c++14 console
 CONFIG  -= app_bundle
 
 # widgets is required only because addresscombo.cpp derives from QComboBox.
-# We run guiless via QT_QPA_PLATFORM=offscreen (no X server needed).
-QT      += core testlib widgets network gui
+# We run guiless via QT_QPA_PLATFORM=offscreen (no X server needed). svg is needed
+# by privacybadgedelegate.cpp (QSvgRenderer for the tinted badge icons).
+QT      += core testlib widgets network gui svg
+
+# PRIV-13/14: compile the privacybadgedelegate test seams (testClassify/...). The
+# define gates ONLY the static forwarding accessors in privacybadgedelegate.h; it
+# adds NO behavior and is never present in the shipped app build.
+DEFINES += ZCL_WIDGET_TEST
 
 # Keep all build artifacts inside tests/bin so they NEVER collide with the
 # app's own bin/ (which holds the product objects/moc).
@@ -34,15 +40,21 @@ INCLUDEPATH += $$PWD/shim
 INCLUDEPATH += $$PWD/../src
 INCLUDEPATH += $$PWD/../src/3rdparty
 
-# addresscombo.h carries Q_OBJECT -> qmake must run moc on it (generates the
-# vtable). Listing it in HEADERS triggers that without touching the source file.
+# addresscombo.h + privacybadgedelegate.h carry Q_OBJECT -> qmake must run moc on
+# them (generates the vtable). Listing them in HEADERS triggers that without
+# touching the source files.
 HEADERS += ../src/addresscombo.h
+HEADERS += ../src/privacybadgedelegate.h
 
 # Product pure-logic sources (UNMODIFIED) + shims + the test.
+# privacybadgedelegate.cpp is pure classification + paint logic; the PRIV-13/14
+# tests exercise ONLY classify*/labelFor/colorFor via the test seam (no painting),
+# but linking the whole TU keeps the tested logic byte-identical to production.
 SOURCES += \
     ../src/settings.cpp \
     ../src/senttxstore.cpp \
     ../src/addresscombo.cpp \
+    ../src/privacybadgedelegate.cpp \
     shim/addressbook_stub.cpp \
     tst_logic.cpp
 

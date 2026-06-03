@@ -248,8 +248,15 @@ double Settings::getZCLPrice() {
 }
 
 bool Settings::getAutoShield() {
-    // Load from Qt settings
-    return QSettings().value("options/autoshield", false).toBool();
+    // PRIV-9 (privacy-by-default): auto-shield is ON unless the user explicitly
+    // turned it off. When set, transparent change is routed to a Sapling z-address
+    // (PRIV-10), so a default send never silently leaves change sitting on a public
+    // t-address. A canary L0 test (TestLogic::priv9_autoShieldDefaultOn) asserts
+    // this default stays TRUE -- if someone flips it back to false, that test goes
+    // red. NOTE: scope is shield-CHANGE only (DECISION #1), not full output
+    // shielding -- explicitly sending to a t-recipient stays allowed (with the
+    // de-shield warning + acknowledgement, PRIV-11/PRIV-12).
+    return QSettings().value("options/autoshield", true).toBool();
 }
 
 void Settings::setAutoShield(bool allow) {

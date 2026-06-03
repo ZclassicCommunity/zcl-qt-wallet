@@ -32,4 +32,11 @@ struct Tx {
     double          fee;
 };
 
+// PRIV-11 / UX-12 — the four-way SendCategory enum AND the pure classifier
+// `sendCategoryOf()` are the SINGLE SOURCE OF TRUTH in src/sendcategory.h (resolved
+// via the L0 target's INCLUDEPATH += ../src). The L0 suite links that exact body —
+// no hand-copied enum or mirrored logic lives in this shim anymore. Included AFTER
+// the Tx/ToFields structs above, on which the classifier operates.
+#include "sendcategory.h"
+
 #endif // MAINWINDOW_H

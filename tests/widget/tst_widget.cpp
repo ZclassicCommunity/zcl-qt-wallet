@@ -42,6 +42,14 @@
 #include <QDialog>
 #include <QTimer>
 #include <QSettings>
+#include <QMessageBox>
+#include <QCoreApplication>
+#include <QEventLoop>
+#include <QEvent>
+#include <QDir>
+#include <QFile>
+#include <QPixmap>
+#include <memory>
 
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
@@ -81,6 +89,17 @@ private:
     }
 
 private slots:
+
+    // Between every test, invalidate any stray modal-dismisser poll chain (bump the
+    // generation so a leftover QTimer::singleShot re-arm self-cancels on its next
+    // fire) and reset the shared ack/confirm flags. We deliberately do NOT spin the
+    // event loop here: the D-series relies on the RPC's deferred loadConnection()
+    // singleShot never firing (no daemon), so processEvents() must not be called.
+    void cleanup() {
+        ++_modalGen;
+        _ackSeen = false;
+        _confirmAccepted = false;
+    }
 
     // NOTE on visibility throughout the D-series: the Receive widgets live on tab
     // page 2, which is NOT the current page, so effective isVisible() is always
@@ -330,10 +349,527 @@ private slots:
         QSettings().setValue("options/walletbackedup", false);  // restore
         delete w;
     }
+
+    // ---- P1: confirmTx shows the right four-way badge + warning per quadrant ---
+    // PRIV-11/UX-12: the REAL MainWindow::classifySend drives confirmTx's privacy
+    // badge ("confirmPrivacyBadge") + the red publicWarning. We capture both for all
+    // four quadrants. FAILS if any quadrant mislabels (e.g. z->t not flagged red, or
+    // a private z->z showing a public warning).
+    void p1_confirmDialogFourWayClassification() {
+        MainWindow* w = makeWindow();
+        w->testSeedBalances();
+
+        const QString T  = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        const QString ZS = "zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u";
+
+        struct Case { QString from, to, badgeContains; bool warn; SendCategory cat; };
+        QList<Case> cases = {
+            { ZS, ZS, "PRIVATE",   false, SendCategory::ZToZ_private   },
+            { T,  ZS, "SHIELDING", false, SendCategory::TToZ_shielding },
+            { ZS, T,  "DE-SHIELD", true,  SendCategory::ZToT_deshield  },
+            { T,  T,  "PUBLIC",    true,  SendCategory::TToT_public    },
+        };
+
+        for (const Case& c : cases) {
+            Tx tx; tx.fromAddr = c.from; tx.fee = 0.0001;
+            ToFields f; f.addr = c.to; f.amount = 1.0; f.txtMemo = "";
+            tx.toAddrs.append(f);
+
+            // The REAL classifier must agree with the expected quadrant.
+            QCOMPARE(int(MainWindow::classifySend(tx)), int(c.cat));
+
+            QString badge; int warnVis = -1;
+            // De-shield pops a SECOND (ack) modal after accept; for this read-only
+            // capture we REJECT the confirm dialog so no ack box appears.
+            armBadgeReader(&badge, &warnVis, /*accept=*/false);
+            w->testConfirmTx(tx);
+
+            QVERIFY2(warnVis != -1, qPrintable("confirm dialog never appeared for " + c.from + "->" + c.to));
+            QVERIFY2(badge.contains(c.badgeContains, Qt::CaseSensitive),
+                     qPrintable(QString("badge '%1' missing '%2' for %3->%4")
+                                .arg(badge, c.badgeContains, c.from, c.to)));
+            QCOMPARE(warnVis == 1, c.warn);
+        }
+        settleAndDelete(w);
+    }
+
+    // ---- P2: ONLY z->t (de-shield) adds the acknowledgement gate (PRIV-12) ------
+    // After the user ACCEPTS the confirm dialog, a z->t send must pop a SECOND
+    // "De-shield to a public address?" ack (default No) before confirmTx returns
+    // true; the other three categories must NOT add that friction. We accept the
+    // confirm dialog and detect whether a follow-up ack modal appears.
+    void p2_deshieldRequiresAcknowledgement() {
+        MainWindow* w = makeWindow();
+        w->testSeedBalances();
+
+        const QString T  = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        const QString ZS = "zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u";
+
+        // z->t : ack REQUIRED. Accept confirm, then DECLINE the ack -> confirmTx must
+        // return false (the send is blocked by the missing acknowledgement).
+        {
+            Tx tx; tx.fromAddr = ZS; tx.fee = 0.0001;
+            ToFields f; f.addr = T; f.amount = 1.0; tx.toAddrs.append(f);
+            armAckHandler(/*ackAnswer=*/QMessageBox::No);
+            bool ret = w->testConfirmTx(tx);
+            QVERIFY2(_ackSeen, "z->t de-shield MUST pop an acknowledgement after accept");
+            QVERIFY2(!ret, "declining the de-shield ack MUST block the send (confirmTx==false)");
+        }
+
+        // z->t : accept confirm AND accept the ack -> confirmTx returns true.
+        {
+            Tx tx; tx.fromAddr = ZS; tx.fee = 0.0001;
+            ToFields f; f.addr = T; f.amount = 1.0; tx.toAddrs.append(f);
+            armAckHandler(/*ackAnswer=*/QMessageBox::Yes);
+            bool ret = w->testConfirmTx(tx);
+            QVERIFY2(_ackSeen, "z->t de-shield ack must appear");
+            QVERIFY2(ret, "accepting the de-shield ack must let the send proceed (confirmTx==true)");
+        }
+
+        // z->z private : NO ack. Accept confirm -> returns true with NO second modal.
+        {
+            Tx tx; tx.fromAddr = ZS; tx.fee = 0.0001;
+            ToFields f; f.addr = ZS; f.amount = 1.0; f.txtMemo = ""; tx.toAddrs.append(f);
+            armAckHandler(/*ackAnswer=*/QMessageBox::No);
+            bool ret = w->testConfirmTx(tx);
+            QVERIFY2(!_ackSeen, "z->z private MUST NOT add a de-shield acknowledgement");
+            QVERIFY2(ret, "z->z private accept must proceed without extra friction");
+        }
+
+        // t->t public : NO ack either (it is public, but not a de-shield).
+        {
+            Tx tx; tx.fromAddr = T; tx.fee = 0.0001;
+            ToFields f; f.addr = T; f.amount = 1.0; tx.toAddrs.append(f);
+            armAckHandler(/*ackAnswer=*/QMessageBox::No);
+            bool ret = w->testConfirmTx(tx);
+            QVERIFY2(!_ackSeen, "t->t public MUST NOT add a de-shield acknowledgement");
+            QVERIFY2(ret, "t->t public accept must proceed without the de-shield gate");
+        }
+
+        settleAndDelete(w);
+    }
+
+    // ---- P3: PRIV-10 auto-shield change is routed to a Sapling z-address --------
+    // With auto-shield ON, a transparent FROM, and a Sapling z-address available,
+    // createTxFromSendPage() MUST append a CHANGE output to the Sapling address (so
+    // change is never silently left transparent). We drive the real send page.
+    void p3_autoShieldRoutesChangeToSapling() {
+        MainWindow* w = makeWindow();
+        auto* ui = w->ui;
+
+        const QString T  = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        const QString ZS = "zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u";
+
+        QSettings().setValue("options/autoshield", true);   // PRIV-9 default, explicit here
+        QSettings().sync();
+
+        // Seed: t-from holds 10 ZCL, and a Sapling z-address exists as the change sink.
+        auto* bals = new QMap<QString, double>();
+        (*bals)[T] = 10.0;
+        w->getRPC()->testSetBalances(bals);
+        // MAJOR-2: the change is now based on the CONFIRMED, spendable UTXO total (not
+        // getAllBalances(), which includes unconfirmed). Seed a confirmed UTXO so the
+        // confirmed basis covers the send + fee.
+        auto* utxos = new QList<UnspentOutput>();
+        utxos->append(UnspentOutput{ T, "txid0", "10.0", /*conf=*/10, /*spendable=*/true });
+        w->getRPC()->testSetUTXOs(utxos);
+        auto* zs = new QList<QString>(); zs->append(ZS);
+        w->getRPC()->testSetZAddresses(zs);
+
+        // From = the transparent address; recipient = a Sapling z-addr (so the only
+        // non-recipient Sapling addr is ZS, free to be the change sink); send 3 ZCL.
+        ui->inputsCombo->clear();
+        ui->inputsCombo->addItem(T, 10.0);
+        ui->inputsCombo->setCurrentIndex(0);
+        ui->Address1->setText("zs10m00rvkhfm4f7n23e4sxsx275r7ptnggx39ygl0vy46j9mdll5c97gl6dxgpk0njuptg2mn9w5s");
+        ui->Amount1->setText("3");
+
+        Tx tx = w->testCreateTxFromSendPage();
+
+        // There must be a change output to the Sapling z-address ZS (10 - 3 - fee).
+        bool changeToSapling = false;
+        for (const auto& to : tx.toAddrs) {
+            if (to.addr == ZS) {
+                changeToSapling = true;
+                QVERIFY2(to.amount > 6.9 && to.amount < 7.0,
+                         qPrintable(QString("change amount unexpected: %1").arg(to.amount)));
+            }
+        }
+        QVERIFY2(changeToSapling,
+                 "PRIV-10: transparent change MUST be routed to a Sapling z-address, "
+                 "never left transparent");
+
+        // And NO change output may be a transparent address.
+        for (const auto& to : tx.toAddrs)
+            QVERIFY2(!(to.addr == T),
+                     "PRIV-10: change must NEVER be routed back to a transparent address");
+
+        QSettings().remove("options/autoshield");
+        QSettings().sync();
+        settleAndDelete(w);
+    }
+
+    // ---- P4: PRIV-18 Home "Shield public funds" initiates a real t->z shield ----
+    // The fix-it button now drives shieldPublicFunds(): pick the largest t-source as
+    // From, fill the default Sapling z-address as the recipient, check Max, navigate
+    // to Send. FAILS if it regresses to a bare navigate (recipient left empty).
+    void p4_shieldPublicFundsSetsUpRealShield() {
+        MainWindow* w = makeWindow();
+        auto* ui = w->ui;
+
+        const QString T  = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        const QString ZS = "zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u";
+
+        auto* bals = new QMap<QString, double>();
+        (*bals)[T] = 5.0;
+        w->getRPC()->testSetBalances(bals);
+        auto* zs = new QList<QString>(); zs->append(ZS);
+        w->getRPC()->testSetZAddresses(zs);
+        auto* ts = new QList<QString>(); ts->append(T);
+        w->getRPC()->testSetTAddresses(ts);
+        // MINOR-1: shieldPublicFunds() now mirrors ensureSaplingProvisioned()'s
+        // readiness guard (connection up + z-addresses loaded). Install a sentinel
+        // Connection so the guard passes in-process (it is never actually USED here:
+        // the seeded Sapling z-address resolves before any RPC).
+        installSentinelConnection(w);
+
+        ui->inputsCombo->clear();
+        ui->inputsCombo->addItem(T, 5.0);
+
+        w->testShieldPublicFunds();
+
+        // Real shield: recipient is the default Sapling z-address, From is the
+        // transparent source, Max is checked, and we are on the Send page.
+        QCOMPARE(ui->Address1->text(), ZS);
+        QVERIFY2(ui->inputsCombo->currentText().startsWith(T),
+                 "shield From must be the transparent source");
+        QVERIFY2(ui->Max1->isChecked(), "shield must check Max (send the whole t-balance)");
+        QCOMPARE(ui->tabWidget->currentIndex(), 1);   // Send page
+
+        settleAndDelete(w);
+    }
+
+    // ---- P5: capture a confirm-dialog screenshot for EACH classification --------
+    // PRIV-11/UX-12 visual evidence. Drives the REAL confirmTx() for all four
+    // quadrants and grabs the dialog (QWidget::grab) to a PNG showing the badge text
+    // + the appropriate warning. Output dir overridable via ZCL_SHOTS_DIR (the build
+    // wrapper binds /build/shots). This is a capture aid, not a strict assertion, but
+    // it still verifies the dialog renders for each category.
+    void p5_screenshotFourWayConfirm() {
+        MainWindow* w = makeWindow();
+        w->testSeedBalances();
+
+        const QString T  = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        const QString ZS = "zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u";
+
+        QString dir = qEnvironmentVariable("ZCL_SHOTS_DIR", "/build/shots");
+        QDir().mkpath(dir);
+
+        struct Shot { QString from, to, file; };
+        QList<Shot> shots = {
+            { ZS, ZS, "confirm_zz_private.png"   },
+            { T,  ZS, "confirm_tz_shielding.png" },
+            { ZS, T,  "confirm_zt_deshield.png"  },
+            { T,  T,  "confirm_tt_public.png"    },
+        };
+
+        for (const Shot& s : shots) {
+            Tx tx; tx.fromAddr = s.from; tx.fee = 0.0001;
+            ToFields f; f.addr = s.to; f.amount = 1.0; f.txtMemo = "";
+            tx.toAddrs.append(f);
+
+            QString path = QDir(dir).filePath(s.file);
+            bool grabbed = armGrabber(path);
+            Q_UNUSED(grabbed);
+            w->testConfirmTx(tx);
+
+            QVERIFY2(QFile::exists(path),
+                     qPrintable("confirm screenshot not written: " + path));
+        }
+        settleAndDelete(w);
+    }
+
+    // ---- P6: PRIV-10/19/28 last-resort create — fail-OPEN vs fail-CLOSED --------
+    // The reviewer proved the suite passed even if createSaplingAddressSync() always
+    // returned "" (the change silently stayed PUBLIC). This test pins BOTH halves of
+    // the last-resort path, driving the REAL createTxFromSendPage() with auto-shield
+    // ON, a transparent FROM, and NO Sapling z-address present (so the eager-provision
+    // path is exhausted and the synchronous create is the only route):
+    //   (a) when the newZaddr(true) stub yields a VALID zs-address, the change routes
+    //       to THAT freshly-created Sapling address and NEVER to a t-address;
+    //   (b) when the stub FAILS (returns ""), the send FAILS CLOSED — createTx returns
+    //       an INVALID Tx (empty fromAddr) and NO transparent-change output is built.
+    // Goes RED if MAJOR-1 (fail-closed) regresses to the old silent fail-open.
+    void p6_autoShieldLastResortFailClosed() {
+        const QString T       = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        const QString FRESH_ZS= "zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u";
+        const QString RECIP_ZS= "zs10m00rvkhfm4f7n23e4sxsx275r7ptnggx39ygl0vy46j9mdll5c97gl6dxgpk0njuptg2mn9w5s";
+
+        QSettings().setValue("options/autoshield", true);
+        QSettings().sync();
+
+        auto seed = [&](MainWindow* w) {
+            auto* ui = w->ui;
+            // getAllBalances() reports 10 ZCL (it SUMS unconfirmed), but only 8 ZCL is
+            // CONFIRMED + spendable; the other 2 is an unconfirmed (conf==0) utxo.
+            // MAJOR-2: the change MUST be based on the 8 confirmed (= 8 - 3 - fee), NOT
+            // on the 10 reported by getAllBalances(). The assertion below pins this.
+            auto* bals = new QMap<QString, double>(); (*bals)[T] = 10.0;
+            w->getRPC()->testSetBalances(bals);
+            auto* utxos = new QList<UnspentOutput>();
+            utxos->append(UnspentOutput{ T, "txid0", "8.0", /*conf=*/10, /*spendable=*/true });
+            utxos->append(UnspentOutput{ T, "txid1", "2.0", /*conf=*/0,  /*spendable=*/true });
+            w->getRPC()->testSetUTXOs(utxos);
+            // NO Sapling z-address present -> findUnusedSaplingChangeAddr() returns ""
+            // and the synchronous create is the only path to a change sink.
+            w->getRPC()->testSetZAddresses(new QList<QString>());
+
+            ui->inputsCombo->clear();
+            ui->inputsCombo->addItem(T, 10.0);
+            ui->inputsCombo->setCurrentIndex(0);
+            ui->Address1->setText(RECIP_ZS);   // Sapling recipient (not Sprout)
+            ui->Amount1->setText("3");
+        };
+
+        // (a) FAIL-OPEN path: the create SUCCEEDS -> change routes to the fresh zs addr.
+        {
+            MainWindow* w = makeWindow();
+            seed(w);
+            w->getRPC()->testSetNextZaddrResult(FRESH_ZS);   // create returns a valid zs
+            // Arm a dismisser so that IF the create were (wrongly) to fail -- e.g. the
+            // reviewer's mutation where createSaplingAddressSync() always returns "" --
+            // the fail-closed warning is dismissed and this case goes cleanly RED on the
+            // assertion below (a non-empty fromAddr) instead of hanging on the modal.
+            armModalDismisser();
+
+            Tx tx = w->testCreateTxFromSendPage();
+
+            QVERIFY2(!tx.fromAddr.isEmpty(),
+                     "valid create: the send must NOT abort (regression: "
+                     "createSaplingAddressSync() returning \"\" makes this RED)");
+            bool changeToFresh = false;
+            for (const auto& to : tx.toAddrs) {
+                if (to.addr == FRESH_ZS) {
+                    changeToFresh = true;
+                    // MAJOR-2: change = CONFIRMED(8) - amount(3) - fee(0.0001) ~= 4.9999.
+                    // If this were (wrongly) based on getAllBalances()'s 10, it'd be ~7.0,
+                    // emitting an UNFUNDABLE change the daemon would reject.
+                    QVERIFY2(to.amount > 4.9 && to.amount < 5.0,
+                             qPrintable(QString("MAJOR-2: change must be based on CONFIRMED "
+                                                "balance (~4.9999), got: %1").arg(to.amount)));
+                }
+                QVERIFY2(to.addr != T,
+                         "change must NEVER be routed back to a transparent address");
+            }
+            QVERIFY2(changeToFresh,
+                     "PRIV-10: change MUST route to the freshly-created Sapling address");
+            settleAndDelete(w);
+        }
+
+        // (b) FAIL-CLOSED path: the create FAILS ("") -> the send aborts, NO transparent
+        //     change is built. A blocking warning would pop; dismiss any stray modal.
+        {
+            MainWindow* w = makeWindow();
+            seed(w);
+            // Do NOT install a next-zaddr result -> newZaddr(true) delivers nothing,
+            // createSaplingAddressSync() returns "" -> fail-closed.
+            armModalDismisser();
+
+            Tx tx = w->testCreateTxFromSendPage();
+
+            QVERIFY2(tx.fromAddr.isEmpty(),
+                     "MAJOR-1 fail-closed: a failed Sapling create MUST abort the send "
+                     "(invalid Tx), never proceed with transparent change");
+            for (const auto& to : tx.toAddrs)
+                QVERIFY2(to.addr != T,
+                         "MAJOR-1 fail-closed: NO transparent-change output may be built");
+            settleAndDelete(w);
+        }
+
+        QSettings().remove("options/autoshield");
+        QSettings().sync();
+    }
+
+    // ---- P7: PRIV-27 — Sprout recipient change-warning shown once, then silenced --
+    // Auto-shield ON, transparent FROM, ONE legacy-Sprout (zc...) recipient: the
+    // change cannot be shielded (turnstile forbids Sprout+Sapling mixing), so the
+    // "change cannot be shielded for this send" info box is shown EXACTLY ONCE and
+    // suppressed on repeat (the sproutChangeWarned one-shot). FAILS if the warning
+    // is silently dropped or nags on every build.
+    void p7_sproutRecipientChangeWarnOnce() {
+        MainWindow* w = makeWindow();
+        auto* ui = w->ui;
+
+        const QString T  = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        const QString ZC = "zcEgrceTwvoiFdEvPWcsJHAMrpLsprMF6aRJiQa3fan5ZphyXLPuHghnEPrEPRoEVzUy65GnMVyCTRdkT6BYBepnXh6NBYs";
+
+        QSettings().setValue("options/autoshield", true);
+        QSettings().sync();
+
+        auto* bals = new QMap<QString, double>(); (*bals)[T] = 10.0;
+        w->getRPC()->testSetBalances(bals);
+        auto* utxos = new QList<UnspentOutput>();
+        utxos->append(UnspentOutput{ T, "txid0", "10.0", 10, true });
+        w->getRPC()->testSetUTXOs(utxos);
+        w->getRPC()->testSetZAddresses(new QList<QString>());
+
+        ui->inputsCombo->clear();
+        ui->inputsCombo->addItem(T, 10.0);
+        ui->inputsCombo->setCurrentIndex(0);
+        ui->Address1->setText(ZC);    // legacy Sprout recipient
+        ui->Amount1->setText("3");
+
+        // First build: the Sprout change info box MUST appear exactly once.
+        _infoSeen = 0;
+        armInfoCounter();
+        (void)w->testCreateTxFromSendPage();
+        QVERIFY2(_infoSeen == 1,
+                 qPrintable(QString("PRIV-27: Sprout-change info box must show ONCE on "
+                                    "first build, saw %1").arg(_infoSeen)));
+
+        // Second build (same window/run): suppressed by the one-shot guard.
+        _infoSeen = 0;
+        armInfoCounter();
+        (void)w->testCreateTxFromSendPage();
+        QVERIFY2(_infoSeen == 0,
+                 qPrintable(QString("PRIV-27: Sprout-change info box must be SUPPRESSED "
+                                    "on repeat, saw %1").arg(_infoSeen)));
+
+        QSettings().remove("options/autoshield");
+        QSettings().sync();
+        settleAndDelete(w);
+    }
 #endif
 
 private:
 #ifdef ZCL_WIDGET_TEST
+    // Poll for the confirm dialog, grab() it to a PNG, then reject it (a de-shield's
+    // ack only appears AFTER accept, so rejecting avoids the second modal here).
+    bool armGrabber(const QString& path, int tries = 60) {
+        int gen = (tries == 60) ? ++_modalGen : _modalGen;
+        QTimer::singleShot(tries > 50 ? 0 : 10, [=]() {
+            if (gen != _modalGen) return;
+            QWidget* dlg = QApplication::activeModalWidget();
+            if (!dlg || !dlg->findChild<QLabel*>("confirmPrivacyBadge")) {
+                if (tries > 0) armGrabber(path, tries - 1);
+                return;
+            }
+            dlg->grab().save(path, "PNG");
+            if (auto* qd = qobject_cast<QDialog*>(dlg)) qd->reject();
+            else dlg->close();
+        });
+        return true;
+    }
+#endif
+
+private:
+#ifdef ZCL_WIDGET_TEST
+
+    // Read the confirm dialog's privacy badge text + publicWarning visibility, then
+    // either accept or reject it. Polls until the confirm dialog (the one carrying
+    // 'confirmPrivacyBadge') is up. badgeOut/warnOut are filled before closing.
+    // Generation counter: every arm* bumps it; a poll for a stale generation simply
+    // stops, so a leftover re-arm chain from an earlier test/case can never fire into
+    // a later one and dismiss its dialog early.
+    int _modalGen = 0;
+
+    // Tear down a P-series window. Bumps the modal generation first so any stray
+    // modal-dismisser poll self-cancels, then deletes the window. This is safe because
+    // the test build skips the RPC auto-connect chain (rpc.cpp ZCL_WIDGET_TEST guard),
+    // so there is no self-perpetuating doAutoConnect() re-arm holding dangling captures.
+    void settleAndDelete(MainWindow* w) {
+        ++_modalGen;
+        delete w;
+    }
+
+    // Self-rearming singleShot poll (mirrors the proven armConfirmDismisser). Finds
+    // the active modal, captures the confirm dialog's badge + publicWarning, then
+    // accepts/rejects it. Re-arms (up to a bound) until a modal is up.
+    void armBadgeReader(QString* badgeOut, int* warnOut, bool accept, int tries = 60) {
+        int gen = (tries == 60) ? ++_modalGen : _modalGen;   // bump on the initial arm
+        QTimer::singleShot(tries > 50 ? 0 : 10, [=]() {
+            if (gen != _modalGen) return;                    // superseded -> stop
+            QWidget* dlg = QApplication::activeModalWidget();
+            if (!dlg) {
+                if (tries > 0) armBadgeReader(badgeOut, warnOut, accept, tries - 1);
+                return;
+            }
+            auto* badge = dlg->findChild<QLabel*>("confirmPrivacyBadge");
+            if (badge && badgeOut) *badgeOut = badge->text();
+            auto* pw = dlg->findChild<QLabel*>("publicWarning");
+            if (warnOut) *warnOut = (pw && !pw->isHidden()) ? 1 : 0;
+            if (auto* qd = qobject_cast<QDialog*>(dlg)) { accept ? qd->accept() : qd->reject(); }
+            else dlg->close();
+        });
+    }
+
+    // Handle the confirm-then-ack sequence for the de-shield path. Polls active
+    // modals: ACCEPTS the confirm dialog (the one with 'confirmPrivacyBadge'); when a
+    // SUBSEQUENT message box appears WITHOUT that badge (the de-shield ack), records
+    // that it was seen and answers it with ackAnswer. Self-rearming; stops after the
+    // ack (or after accepting confirm if no ack follows, detected by a short idle).
+    // Member state for the confirm-then-ack sequence (PRIV-12). Using members (not
+    // stack pointers captured in a lambda) removes any dangling-pointer risk if a
+    // poll fires after the test slot returns.
+    bool _ackSeen = false;
+    QMessageBox::StandardButton _ackAnswer = QMessageBox::No;
+    bool _confirmAccepted = false;
+
+    // Drive the confirm-then-ack sequence. Self-rearming singleShot poll:
+    //   * ACCEPT the confirm dialog (the modal carrying 'confirmPrivacyBadge');
+    //   * a de-shield then pops a SECOND modal that is a QMessageBox WITHOUT that
+    //     badge (the ack) — set _ackSeen and answer it with _ackAnswer;
+    //   * non-deshield categories pop NO second QMessageBox — _ackSeen stays false.
+    void armAckHandler(QMessageBox::StandardButton ackAnswer) {
+        _ackSeen = false;
+        _confirmAccepted = false;
+        _ackAnswer = ackAnswer;
+        _ackGen = ++_modalGen;
+        // `idleTries` counts ONLY polls where no modal is up; it is reset whenever a
+        // modal is present (so we never give up while a dialog is still on screen).
+        pollAck(60);
+    }
+    int _ackGen = 0;
+    void pollAck(int idleTries) {
+        const int gen = _ackGen;
+        QTimer::singleShot(5, [this, idleTries, gen]() {
+            if (gen != _modalGen) return;   // superseded by a newer arm -> stop
+            QWidget* dlg = QApplication::activeModalWidget();
+            if (!dlg) {
+                // No modal up. After the confirm was accepted, a short idle with no
+                // QMessageBox means the category had NO ack (the non-deshield cases).
+                if (idleTries > 0) pollAck(idleTries - 1);
+                return;
+            }
+
+            // The confirm dialog carries the privacy badge; accept it once.
+            if (dlg->findChild<QLabel*>("confirmPrivacyBadge")) {
+                if (!_confirmAccepted) {
+                    _confirmAccepted = true;
+                    if (auto* qd = qobject_cast<QDialog*>(dlg)) qd->accept();
+                }
+                pollAck(60);   // reset idle budget: a modal is/was up, keep watching
+                return;
+            }
+
+            // A QMessageBox after the confirm dialog == the de-shield acknowledgement
+            // (objectName "deshieldAck"). It is an explicit instance, so done() on it
+            // reliably makes its exec() return the chosen StandardButton.
+            if (_confirmAccepted) {
+                if (auto* mb = qobject_cast<QMessageBox*>(dlg)) {
+                    _ackSeen = true;
+                    // Dismiss with the chosen StandardButton. Under the offscreen QPA a
+                    // single done() can race the modal loop's start, so we re-arm and
+                    // keep issuing done() until the box is gone (idempotent).
+                    mb->setResult(_ackAnswer);
+                    mb->done(_ackAnswer);
+                    pollAck(60);
+                    return;
+                }
+            }
+            pollAck(60);       // some other modal up; keep watching (reset idle)
+        });
+    }
 
     // Arm a one-shot that finds the active modal confirm dialog, reads its
     // 'publicWarning' QLabel visibility into *out, then rejects the dialog so
@@ -358,6 +894,57 @@ private:
             *out = (pw && !pw->isHidden()) ? 1 : 0;
             if (auto* qd = qobject_cast<QDialog*>(dlg)) qd->reject();
             else dlg->close();
+        });
+    }
+
+    // MAJOR-1 / PRIV-27: a blocking QMessageBox (warning/information/critical static)
+    // spins a nested modal loop INSIDE the synchronous testCreateTxFromSendPage()
+    // call. These pollers fire from that nested loop to dismiss the box (so the call
+    // returns) and, for PRIV-27, to COUNT how many appeared.
+
+    // MINOR-1: install a sentinel (non-null but unused) Connection so the readiness
+    // guard in shieldPublicFunds() is satisfied without a live daemon. The Connection
+    // ctor just stores pointers; nothing on the tested path actually issues RPC.
+    void installSentinelConnection(MainWindow* w) {
+        auto cfg = std::make_shared<ConnectionConfig>();
+        auto* c  = new Connection(w, new QNetworkAccessManager(), new QNetworkRequest(), cfg);
+        w->getRPC()->testSetConnection(c);
+    }
+
+    // Count of message boxes seen+dismissed since the last armInfoCounter().
+    int _infoSeen = 0;
+
+    // Self-rearming poll: whenever a modal is up, dismiss it; for the counting variant
+    // bump _infoSeen. Generation-guarded so a stale chain can't bleed across cases.
+    void armInfoCounter(int tries = 200) {
+        const int gen = (tries == 200) ? ++_modalGen : _modalGen;
+        QTimer::singleShot(tries == 200 ? 0 : 3, [this, gen, tries]() {
+            if (gen != _modalGen) return;            // superseded -> stop
+            QWidget* dlg = QApplication::activeModalWidget();
+            if (dlg) {
+                ++_infoSeen;
+                if (auto* mb = qobject_cast<QMessageBox*>(dlg)) { mb->done(QMessageBox::Ok); }
+                else if (auto* qd = qobject_cast<QDialog*>(dlg)) { qd->reject(); }
+                else dlg->close();
+            }
+            if (tries > 0) armInfoCounter(tries - 1);  // keep watching for more
+        });
+    }
+
+    // Dismiss any single blocking modal (used by the fail-closed path so the warning
+    // box doesn't wedge the synchronous create). Re-arms until one is seen+closed.
+    void armModalDismisser(int tries = 200) {
+        const int gen = (tries == 200) ? ++_modalGen : _modalGen;
+        QTimer::singleShot(tries == 200 ? 0 : 3, [this, gen, tries]() {
+            if (gen != _modalGen) return;
+            QWidget* dlg = QApplication::activeModalWidget();
+            if (dlg) {
+                if (auto* mb = qobject_cast<QMessageBox*>(dlg)) { mb->done(QMessageBox::Ok); return; }
+                if (auto* qd = qobject_cast<QDialog*>(dlg)) { qd->reject(); return; }
+                dlg->close();
+                return;
+            }
+            if (tries > 0) armModalDismisser(tries - 1);
         });
     }
 #endif

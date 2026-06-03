@@ -710,10 +710,12 @@ void MainWindow::setupHomeDashboard() {
     fixItBtn->setObjectName("homeFixItBtn");
     fixItBtn->setAutoDefault(false);
     fixItBtn->setCursor(Qt::PointingHandCursor);
-    // THIS phase: navigate to Send only. NO auto-shield semantics here (that is a
-    // later, separately-tested phase) — do NOT wire getAutoShield/confirm here.
+    // PRIV-18 — wire the fix-it button to the REAL shielding flow (no longer a bare
+    // navigate). shieldPublicFunds() sets up a t -> (default Sapling z) shielding
+    // send on the Send page, reusing the same "Shield balance to Sapling" semantics
+    // as the balances context menu, then navigates to Send for the user to confirm.
     QObject::connect(fixItBtn, &QPushButton::clicked, [this]() {
-        ui->tabWidget->setCurrentIndex(1);
+        shieldPublicFunds();
     });
 
     cardV->addWidget(homeFixItText);
@@ -749,6 +751,107 @@ void MainWindow::updateHomeFixIt(double transparent) {
                     .arg(Settings::getZCLDisplayFormat(transparent)));
     }
     homeFixItCard->setVisible(hasPublic);
+}
+
+// PRIV-18 — the REAL "Shield public funds" action behind the Home fix-it button.
+// Reuses the SAME semantics as the balances context-menu "Shield balance to
+// Sapling" path: select the largest transparent source as From, fill the default
+// Sapling z-address (auto-created if none exists, PRIV-19/PRIV-28) as the To
+// recipient, check Max, and navigate to the Send page for the user to confirm.
+// It does NOT auto-execute -- the user reviews + confirms (this is a t->z shielding
+// send, classified TToZ_shielding, so NO de-shield acknowledgement is added).
+void MainWindow::shieldPublicFunds() {
+    if (!rpc)
+        return;
+
+    // MINOR-1 null-deref guard: getDefaultSaplingAddress() below dereferences the
+    // zaddresses list, which is null until the first refreshAddresses(). Mirror
+    // ensureSaplingProvisioned()'s readiness guard -- if the connection or the
+    // z-address list isn't up yet, just open Send and let the user retry.
+    if (!rpc->getConnection() || !rpc->getAllZAddresses()) {
+        ui->tabWidget->setCurrentIndex(1);
+        return;
+    }
+
+    // 1) Pick the largest-balance transparent (t) address as the source.
+    QString fromT;
+    double  bestBal = 0;
+    if (rpc->getAllBalances()) {
+        for (auto it = rpc->getAllBalances()->constBegin(); it != rpc->getAllBalances()->constEnd(); ++it) {
+            if (Settings::isTAddress(it.key()) && it.value() > bestBal) {
+                bestBal = it.value();
+                fromT   = it.key();
+            }
+        }
+    }
+    if (fromT.isEmpty()) {
+        // Fall back to any known t-address; if there are genuinely no public funds,
+        // there is nothing to shield -- just open Send.
+        fromT = rpc->getDefaultTAddress();
+    }
+    if (fromT.isEmpty() || bestBal <= 0.0000001) {
+        ui->tabWidget->setCurrentIndex(1);
+        return;
+    }
+
+    // 2) Resolve the default Sapling destination, AUTO-CREATING one if none exists
+    //    (PRIV-19: callers must never degrade to Sprout/transparent).
+    QString toZ = rpc->getDefaultSaplingAddress();
+    if (toZ.isEmpty())
+        toZ = createSaplingAddressSync();
+    if (toZ.isEmpty()) {
+        // Could not provision a shielded destination -- do not silently shield to a
+        // non-private address; tell the user and bail to Send.
+        QMessageBox::warning(this, tr("Could not shield"),
+            tr("A shielded (Sapling) address could not be created right now, so your "
+               "public funds were not shielded. Please try again in a moment."),
+            QMessageBox::Ok);
+        ui->tabWidget->setCurrentIndex(1);
+        return;
+    }
+
+    // 3) Set up the send page exactly like the context-menu shield path:
+    //    From = the transparent source, To = the Sapling z-address, Max checked.
+    for (int i = 0; i < ui->inputsCombo->count(); i++) {
+        if (ui->inputsCombo->itemText(i).startsWith(fromT)) {
+            ui->inputsCombo->setCurrentIndex(i);
+            break;
+        }
+    }
+    removeExtraAddresses();
+    ui->Address1->setText(toZ);
+    ui->Max1->setChecked(true);
+
+    // 4) Navigate to Send for explicit user review + confirm.
+    ui->tabWidget->setCurrentIndex(1);
+}
+
+// PRIV-28 — eager Sapling provisioning. Ensure at least ONE Sapling z-address
+// exists so the send/shield path never has to block on key generation (the
+// synchronous mid-send create is only a last resort). Idempotent + one-shot per
+// run: returns immediately if a Sapling address already exists or if we've already
+// attempted provisioning this session. Called from the address-refresh path once
+// addresses are known.
+void MainWindow::ensureSaplingProvisioned() {
+    if (saplingProvisionAttempted)
+        return;
+    if (!rpc || !rpc->getConnection() || !rpc->getAllZAddresses())
+        return;   // not ready yet; will be retried on a later refresh
+
+    // Already have a Sapling address? Then nothing to do (mark attempted so we don't
+    // keep scanning the list on every refresh).
+    if (!rpc->getDefaultSaplingAddress().isEmpty()) {
+        saplingProvisionAttempted = true;
+        return;
+    }
+
+    // No Sapling address yet -> create one in the background (non-blocking). Mark
+    // attempted up front so concurrent refreshes don't fire multiple creates.
+    saplingProvisionAttempted = true;
+    rpc->newZaddr(true, [this](json reply) {
+        if (reply.is_string())
+            rpc->refreshAddresses();   // pull the freshly-minted address into the wallet
+    });
 }
 
 // Phase-3a redesign (Quiet+): the modern left vertical NAV RAIL.

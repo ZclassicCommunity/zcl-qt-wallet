@@ -48,13 +48,21 @@ QString PrivacyBadgeDelegate::extractAddress(const QString& displayText) {
 }
 
 PrivacyBadgeDelegate::Kind PrivacyBadgeDelegate::classify(const QString& displayText) {
+    // The transactions model (txtablemodel.cpp) renders shielded rows with no
+    // address as the literal "(Shielded)" placeholder -> that's a private
+    // send/receive. Check this on the RAW display text BEFORE extractAddress(),
+    // which would otherwise strip the surrounding parens to "Shielded" and miss
+    // this case (PRIV-13: "(Shielded)" -> Private).
+    if (displayText.trimmed().compare("(Shielded)", Qt::CaseInsensitive) == 0)
+        return Kind::Private;
+
     const QString addr = extractAddress(displayText);
     if (addr.isEmpty())
         return Kind::None;
 
-    // The transactions model renders shielded rows with no address as the
-    // literal "(Shielded)" placeholder -> that's a private send/receive.
-    if (addr.compare("(Shielded)", Qt::CaseInsensitive) == 0)
+    // Defensive: also catch a bare "Shielded" (post-strip) the same way.
+    if (addr.compare("(Shielded)", Qt::CaseInsensitive) == 0 ||
+        addr.compare("Shielded",   Qt::CaseInsensitive) == 0)
         return Kind::Private;
 
     auto* st = Settings::getInstance();

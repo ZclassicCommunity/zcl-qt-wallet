@@ -22,13 +22,15 @@
 // ============================================================================
 #include <QtTest/QtTest>
 #include <QtGlobal>
+#include <QStandardItemModel>
 
 #include "settings.h"
 #include "senttxstore.h"
-#include "mainwindow.h"        // shim: ToFields / Tx
+#include "mainwindow.h"        // shim: ToFields / Tx + SendCategory
 #include "rpc.h"               // shim: TransactionItem
 #include "addresscombo.h"
 #include "addressbook.h"       // shim
+#include "privacybadgedelegate.h"   // PRIV-13/14: classify/labelFor/colorFor (real)
 
 // ---------------------------------------------------------------------------
 // Real valid ZClassic addresses, lifted from src/settings.cpp (donation/zboard).
@@ -145,6 +147,15 @@ static qint64 blocksDirSizeBytes(const QString& datadirRoot) {
 
 } // namespace cxmirror
 
+// =====================================================================
+// PRIV-11/UX-12 — the four-way classifier is the REAL production free function
+// `sendCategoryOf()` (src/sendcategory.h), pulled in via the shim mainwindow.h
+// include. There is NO hand-copied mirror: the L0 cases below call the SAME body
+// production uses (MainWindow::classifySend forwards to it), so a regression in
+// the classifier goes red here directly, and the L1 suite drives it via the real
+// MainWindow::classifySend over the same quadrants.
+// =====================================================================
+
 
 class TestLogic : public QObject {
     Q_OBJECT
@@ -189,6 +200,23 @@ private slots:
     void longWarmupPhase_data();       // H1
     void longWarmupPhase();
     void blocksDirSizeBytes();         // H2
+
+    // --- PRIV-9: auto-shield default-ON canary ---
+    void priv9_autoShieldDefaultOn();
+
+    // --- PRIV-11/UX-12: four-way send classification (mirror of classifySend) ---
+    void priv11_sendClassification_data();
+    void priv11_sendClassification();
+    // PRIV-12 locus: ONLY z->t (de-shield) is the acknowledgement-gated category.
+    void priv12_onlyDeshieldIsGated_data();
+    void priv12_onlyDeshieldIsGated();
+
+    // --- PRIV-13: privacy-badge classify()/classifyForIndex()/labelFor() (real) ---
+    void priv13_badgeClassify_data();
+    void priv13_badgeClassify();
+    void priv13_deshieldOnlyForPublicSendRow();
+    // --- PRIV-14: badge colour hex tokens match dark.qss ---
+    void priv14_badgeColorTokens();
 
 private:
     QString sandboxAppData() const {
@@ -641,6 +669,235 @@ void TestLogic::blocksDirSizeBytes() {
         writeBytes(QDir(root2).filePath("testnet3/blocks/blk00000.dat"), 4096);
         QCOMPARE(cxmirror::blocksDirSizeBytes(root2), (qint64)4096);
     }
+}
+
+// =====================================================================
+// PRIV-9 — auto-shield default is ON. CANARY: if someone flips the
+// QSettings default back to false (settings.cpp getAutoShield), this goes red.
+// We must assert the DEFAULT, i.e. with options/autoshield UNSET.
+// =====================================================================
+void TestLogic::priv9_autoShieldDefaultOn() {
+    // Ensure the key is genuinely unset so we read the compiled-in default.
+    QSettings().remove("options/autoshield");
+    QSettings().sync();
+
+    QVERIFY2(Settings::getInstance()->getAutoShield(),
+             "PRIV-9 CANARY: getAutoShield() must default to TRUE when "
+             "options/autoshield is unset (privacy-by-default flip). If this fails, "
+             "someone reverted the default back to false in settings.cpp.");
+
+    // And the setter must still round-trip both ways (off stays off, on stays on).
+    Settings::getInstance()->setAutoShield(false);
+    QVERIFY(!Settings::getInstance()->getAutoShield());
+    Settings::getInstance()->setAutoShield(true);
+    QVERIFY(Settings::getInstance()->getAutoShield());
+
+    // Restore the unset/default state for any later test.
+    QSettings().remove("options/autoshield");
+    QSettings().sync();
+}
+
+// =====================================================================
+// PRIV-11 / UX-12 — four-way from-aware classification, all quadrants.
+// Uses real checksum-valid addresses so Settings::isT/isZ run their full path.
+// =====================================================================
+void TestLogic::priv11_sendClassification_data() {
+    QTest::addColumn<QString>("from");
+    QTest::addColumn<QString>("to");
+    QTest::addColumn<int>("expected");   // SendCategory as int
+
+    const QString T  = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";  // mainnet t-addr
+    // z->z private (shielded from, shielded to)
+    QTest::newRow("z->z private")    << addr::ZS_SAPLING << addr::ZS_ZBOARD << int(SendCategory::ZToZ_private);
+    QTest::newRow("z->z sprout from")<< addr::ZC_SPROUT  << addr::ZS_SAPLING << int(SendCategory::ZToZ_private);
+    // t->z shielding (transparent from, shielded to)
+    QTest::newRow("t->z shielding")  << T               << addr::ZS_SAPLING << int(SendCategory::TToZ_shielding);
+    // z->t de-shield (shielded from, transparent to) — the strongest warning case
+    QTest::newRow("z->t deshield")   << addr::ZS_SAPLING << T               << int(SendCategory::ZToT_deshield);
+    QTest::newRow("sprout->t desh")  << addr::ZC_SPROUT  << T               << int(SendCategory::ZToT_deshield);
+    // t->t public (transparent from, transparent to)
+    QTest::newRow("t->t public")     << T               << T               << int(SendCategory::TToT_public);
+}
+
+void TestLogic::priv11_sendClassification() {
+    QFETCH(QString, from);
+    QFETCH(QString, to);
+    QFETCH(int, expected);
+
+    Settings::getInstance()->setTestnet(false);
+
+    Tx tx;
+    tx.fromAddr = from;
+    tx.fee = 0.0001;
+    ToFields f; f.addr = to; f.amount = 1.0;
+    tx.toAddrs.append(f);
+
+    // Calls the REAL production classifier (src/sendcategory.h), the same body
+    // MainWindow::classifySend forwards to — no mirror.
+    QCOMPARE(int(sendCategoryOf(tx)), expected);
+}
+
+// PRIV-12: ONLY a z->t DE-SHIELD requires the acknowledgement gate; the other
+// three categories MUST NOT add that friction. This drives the REAL product gate
+// `isDeshieldSend()` (src/sendcategory.h — the same body MainWindow::isDeshield
+// forwards to) over a real Tx per quadrant, NOT a value computed in the test. A
+// z->t with MULTIPLE recipients (one transparent) must still be gated: ANY
+// transparent recipient taints the whole send.
+void TestLogic::priv12_onlyDeshieldIsGated_data() {
+    QTest::addColumn<QString>("from");
+    QTest::addColumn<QString>("to");
+    QTest::addColumn<QString>("to2");   // optional 2nd recipient ("" => none)
+    QTest::addColumn<bool>("gated");
+
+    const QString T = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";   // mainnet t-addr
+
+    QTest::newRow("z->z private not gated")   << addr::ZS_SAPLING << addr::ZS_ZBOARD << QString() << false;
+    QTest::newRow("t->z shielding not gated") << T               << addr::ZS_SAPLING << QString() << false;
+    QTest::newRow("z->t deshield GATED")      << addr::ZS_SAPLING << T               << QString() << true;
+    QTest::newRow("t->t public not gated")    << T               << T               << QString() << false;
+    // z -> (z, t): a single transparent recipient among shielded ones still gates.
+    QTest::newRow("z->(z,t) deshield GATED")  << addr::ZS_SAPLING << addr::ZS_ZBOARD << T         << true;
+}
+
+void TestLogic::priv12_onlyDeshieldIsGated() {
+    QFETCH(QString, from);
+    QFETCH(QString, to);
+    QFETCH(QString, to2);
+    QFETCH(bool, gated);
+
+    Settings::getInstance()->setTestnet(false);
+
+    Tx tx;
+    tx.fromAddr = from;
+    tx.fee = 0.0001;
+    ToFields f; f.addr = to; f.amount = 1.0;
+    tx.toAddrs.append(f);
+    if (!to2.isEmpty()) {
+        ToFields f2; f2.addr = to2; f2.amount = 0.5;
+        tx.toAddrs.append(f2);
+    }
+
+    // Calls the REAL product gate (no value recomputed inside the test).
+    QCOMPARE(isDeshieldSend(tx), gated);
+}
+
+// =====================================================================
+// PRIV-13 — privacy-badge classify() maps each address family correctly. Uses
+// the REAL PrivacyBadgeDelegate::testClassify seam (no duplicated truth table).
+// =====================================================================
+void TestLogic::priv13_badgeClassify_data() {
+    QTest::addColumn<QString>("display");
+    QTest::addColumn<bool>("testnet");
+    QTest::addColumn<int>("kind");   // PrivacyBadgeDelegate::Kind as int
+
+    using K = PrivacyBadgeDelegate::Kind;
+    QTest::newRow("sapling -> Private")        << addr::ZS_SAPLING << false << int(K::Private);
+    QTest::newRow("sprout -> PrivateLegacy")   << addr::ZC_SPROUT  << false << int(K::PrivateLegacy);
+    QTest::newRow("t -> Public")               << QString("t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi") << false << int(K::Public);
+    QTest::newRow("(Shielded) -> Private")     << QString("(Shielded)") << false << int(K::Private);
+    QTest::newRow("empty -> None")             << QString("")      << false << int(K::None);
+    QTest::newRow("label(addr) strip sapling") << (QString("Alice (") + addr::ZS_SAPLING + ")") << false << int(K::Private);
+    QTest::newRow("testnet sapling -> Private")<< addr::ZTS_SAPLING << true  << int(K::Private);
+}
+
+void TestLogic::priv13_badgeClassify() {
+    QFETCH(QString, display);
+    QFETCH(bool, testnet);
+    QFETCH(int, kind);
+
+    Settings::getInstance()->setTestnet(testnet);
+    QCOMPARE(int(PrivacyBadgeDelegate::testClassify(display)), kind);
+    Settings::getInstance()->setTestnet(false);
+}
+
+// PRIV-13 — Deshield is promoted ONLY for a Public (transparent) recipient on a
+// row whose Type cell (col 0) contains send/sent. A transparent recipient on a
+// receive row stays Public; a shielded recipient never becomes Deshield.
+void TestLogic::priv13_deshieldOnlyForPublicSendRow() {
+    using K = PrivacyBadgeDelegate::Kind;
+    Settings::getInstance()->setTestnet(false);
+
+    const QString T  = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+    const QString ZS = addr::ZS_SAPLING;
+
+    // A model with col0 = Type, col1 = Address (mirrors the transactions table).
+    QStandardItemModel model(3, 2);
+    model.setData(model.index(0, 0), "send");      model.setData(model.index(0, 1), T);
+    model.setData(model.index(1, 0), "receive");   model.setData(model.index(1, 1), T);
+    model.setData(model.index(2, 0), "send");      model.setData(model.index(2, 1), ZS);
+
+    // send + transparent recipient -> Deshield (the privacy-leaking case).
+    QCOMPARE(int(PrivacyBadgeDelegate::testClassifyForIndex(model.index(0, 1), T)),  int(K::Deshield));
+    // receive + transparent -> stays Public (incoming public funds, not a leak).
+    QCOMPARE(int(PrivacyBadgeDelegate::testClassifyForIndex(model.index(1, 1), T)),  int(K::Public));
+    // send + shielded recipient -> Private (never Deshield).
+    QCOMPARE(int(PrivacyBadgeDelegate::testClassifyForIndex(model.index(2, 1), ZS)), int(K::Private));
+
+    // No model / no Type column -> the bare classify() result (Public), never Deshield.
+    QCOMPARE(int(PrivacyBadgeDelegate::testClassifyForIndex(QModelIndex(), T)), int(K::Public));
+}
+
+// =====================================================================
+// PRIV-14 — badge label + colour hex tokens. The hex MUST match dark.qss:
+//   green #1f7a1f (Private/Legacy), amber #d9822b (Public), red #c0392b (Deshield).
+// We also grep the shipped res/styles/dark.qss for the same tokens so the badge
+// and the stylesheet can never silently drift apart.
+// =====================================================================
+void TestLogic::priv14_badgeColorTokens() {
+    using K = PrivacyBadgeDelegate::Kind;
+
+    // Labels.
+    QCOMPARE(PrivacyBadgeDelegate::testLabelFor(K::Private),       QString("Private"));
+    QCOMPARE(PrivacyBadgeDelegate::testLabelFor(K::PrivateLegacy), QString("Private (legacy)"));
+    QCOMPARE(PrivacyBadgeDelegate::testLabelFor(K::Public),        QString("PUBLIC"));
+    QCOMPARE(PrivacyBadgeDelegate::testLabelFor(K::Deshield),      QString("De-shield"));
+
+    // Colour hex (QColor::name() is lower-case "#rrggbb").
+    QCOMPARE(PrivacyBadgeDelegate::testColorHexFor(K::Private),       QString("#1f7a1f"));
+    QCOMPARE(PrivacyBadgeDelegate::testColorHexFor(K::PrivateLegacy), QString("#1f7a1f"));
+    QCOMPARE(PrivacyBadgeDelegate::testColorHexFor(K::Public),        QString("#d9822b"));
+    QCOMPARE(PrivacyBadgeDelegate::testColorHexFor(K::Deshield),      QString("#c0392b"));
+
+    // Guard: the SAME hex tokens must be present in the shipped dark.qss. Resolve
+    // the stylesheet relative to this test file's source dir (set by qmake via
+    // QT_TESTCASE_BUILDDIR = the tests/ dir; dark.qss lives at ../res/styles).
+    QStringList candidates = {
+        QStringLiteral(QT_TESTCASE_BUILDDIR) + "/../res/styles/dark.qss",
+        QFINDTESTDATA("../res/styles/dark.qss"),
+    };
+    QString qss;
+    for (const QString& c : candidates) {
+        if (c.isEmpty()) continue;
+        QFile f(c);
+        if (f.open(QIODevice::ReadOnly)) { qss = QString::fromUtf8(f.readAll()); break; }
+    }
+    QVERIFY2(!qss.isEmpty(), "could not locate res/styles/dark.qss to guard the colour tokens");
+
+    // NIT-4: strip C-style /* ... */ comments before grepping, so the guard proves
+    // each token backs a REAL rule (not just a mention in the header legend). A token
+    // present only inside a comment must NOT satisfy the guard. Manual single-pass
+    // strip (avoids QRegExp greedy-match foot-guns across multiple comment blocks).
+    QString code;
+    {
+        int i = 0;
+        while (i < qss.length()) {
+            if (i + 1 < qss.length() && qss[i] == '/' && qss[i+1] == '*') {
+                int end = qss.indexOf("*/", i + 2);
+                if (end < 0) break;          // unterminated comment -> drop the rest
+                i = end + 2;
+            } else {
+                code.append(qss[i]);
+                ++i;
+            }
+        }
+    }
+
+    QVERIFY2(code.contains("#1f7a1f", Qt::CaseInsensitive),
+             "dark.qss missing green token #1f7a1f in a REAL (non-comment) rule");
+    QVERIFY2(code.contains("#d9822b", Qt::CaseInsensitive),
+             "dark.qss missing amber token #d9822b in a REAL (non-comment) rule");
+    QVERIFY2(code.contains("#c0392b", Qt::CaseInsensitive),
+             "dark.qss missing red token #c0392b in a REAL (non-comment) rule");
 }
 
 QTEST_MAIN(TestLogic)

@@ -26,12 +26,19 @@ struct ToFields {
     QString encodedMemo;
 };
 
-// Struct used to represent a Transaction. 
+// Struct used to represent a Transaction.
 struct Tx {
     QString         fromAddr;
     QList<ToFields> toAddrs;
     double          fee;
 };
+
+// PRIV-11 / UX-12 — the four-way SendCategory enum + the pure free classifier
+// `sendCategoryOf()` are the SINGLE SOURCE OF TRUTH and live in sendcategory.h, so
+// BOTH production (MainWindow::classifySend forwards there) AND the L0 unit suite
+// link the exact same body (no hand-copied mirror can drift). Included AFTER the
+// Tx/ToFields structs above, on which the classifier operates.
+#include "sendcategory.h"
 
 namespace Ui {
     class MainWindow;
@@ -48,6 +55,15 @@ public:
     void updateLabelsAutoComplete();
     RPC* getRPC() { return rpc; }
 
+    // PRIV-11 / UX-12 — pure, test-readable classifier. Decides the four-way send
+    // category from the Tx's from/to address types alone (no widget/RPC state), so
+    // both confirmTx() and the L0/L1 tests can call it. See SendCategory above.
+    static SendCategory classifySend(const Tx& tx);
+    // The strongest-warning de-shield case (z -> t) is the ONLY one that requires
+    // the explicit acknowledgement gate (PRIV-12). Small helper kept next to the
+    // classifier so the rule lives in exactly one place.
+    static bool isDeshield(const Tx& tx) { return isDeshieldSend(tx); }
+
 #ifdef ZCL_WIDGET_TEST
     // TEST-ONLY SEAM (L1 widget tests). Compiled in ONLY when ZCL_WIDGET_TEST is
     // defined (tests/widget/tst_widget.pro). NEVER present in the shipped app
@@ -56,6 +72,12 @@ public:
     // confirmTx's rpc->getAllBalances() deref is safe without a live daemon.
     bool testConfirmTx(Tx tx)  { return confirmTx(tx); }
     void testSeedBalances();
+    // Build the send-page Tx through the REAL createTxFromSendPage() path so the
+    // L1 fail-open tests (PRIV-10) exercise the actual production routing.
+    Tx   testCreateTxFromSendPage() { return createTxFromSendPage(); }
+    // Drive the REAL shield flow the Home fix-it button now uses (PRIV-18): set up
+    // a t -> default-Sapling send on the Send page exactly as a click would.
+    void testShieldPublicFunds()    { shieldPublicFunds(); }
 #endif
 
     QString doSendTxValidations(Tx tx);
@@ -106,6 +128,12 @@ public:
     //     transparent amount (balT) and passes it here rather than re-querying.
     // Public so the RPC poller can call it. No-op until setupHomeDashboard() has run.
     void updateHomeFixIt(double transparent);
+
+    // PRIV-28 eager Sapling provisioning: ensure at least one Sapling z-address
+    // exists so the send/shield path never has to block on key generation (the
+    // synchronous mid-send create is only a last resort). Idempotent + one-shot per
+    // run. Public so the RPC address-refresh path can call it once addresses load.
+    void ensureSaplingProvisioned();
     // longStretch=true after a LONG peerless stretch (~3min): adds a stronger
     // "check your internet / try again later" hint (SELF-HEAL SYNCED-ZERO-PEERS).
     void setSyncStatusWaitingForPeers(bool longStretch = false);
@@ -210,6 +238,16 @@ private:
     QFrame*      homeFixItCard     = nullptr;   // amber card (hidden unless t>0)
     QLabel*      homeFixItText     = nullptr;   // "X ZCL is PUBLIC ..."
 
+    // PRIV-18 — the REAL "Shield public funds" action, shared by the Home fix-it
+    // card button and (conceptually) the balances context-menu "Shield balance to
+    // Sapling" path. Sets up a t -> (default Sapling z) shielding send on the Send
+    // page: picks the largest-balance transparent source as From, resolves the
+    // default Sapling z-address (auto-creating one if none exists, PRIV-19/PRIV-28),
+    // fills it as the To recipient, checks Max, and navigates to Send. It does NOT
+    // auto-execute -- the user still reviews + confirms (the send is t->z shielding,
+    // so no de-shield acknowledgement is added). No-op if no transparent funds.
+    void shieldPublicFunds();
+
     // SINGLE destructive launch path shared by the Help -> Repair action and the
     // runtime stub auto-heal: stop the embedded node, then drive a fresh
     // ConnectionLoader through startManualRepair() (the staged re-download ladder).
@@ -224,6 +262,25 @@ private:
 
     Tx   createTxFromSendPage();
     bool confirmTx(Tx tx);
+
+    // PRIV-10/PRIV-19/PRIV-28 fail-open change-shielding helpers (see sendtab.cpp).
+    // findUnusedSaplingChangeAddr: an existing Sapling addr not colliding with a
+    // recipient, or "". createSaplingAddressSync: blocking last-resort create that
+    // ONLY ever returns a real Sapling address (never degrades to Sprout/transparent).
+    QString findUnusedSaplingChangeAddr(const Tx& tx);
+    QString createSaplingAddressSync();
+    // MAJOR-2: CONFIRMED (confirmations>0), spendable balance of `addr`, summed from
+    // the wallet's UTXO set. z_sendmany spends only confirmed notes, so this is the
+    // correct basis for the auto-shield change amount (getAllBalances() includes
+    // unconfirmed). Null-safe (returns 0 if UTXOs aren't loaded yet).
+    double  confirmedSpendableBalance(const QString& addr);
+    // PRIV-27 one-shot: surface the Sprout-recipient "change stays transparent"
+    // constraint at most once per run instead of nagging on every keystroke/build.
+    bool sproutChangeWarned = false;
+    bool saplingProvisionAttempted = false;   // one-shot guard for ensureSaplingProvisioned
+    // MINOR-3: reentrancy guard for the blocking createSaplingAddressSync() pump, so a
+    // second sendButton click can't nest a second synchronous create.
+    bool saplingSyncCreateInFlight = false;
 
     void setupTurnstileDialog();
     void turnstileDoMigration(QString fromAddr = "");

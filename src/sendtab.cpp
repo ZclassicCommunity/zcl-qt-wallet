@@ -473,31 +473,42 @@ void MainWindow::maxAmountChecked(int checked) {
     }
 }
 
-// Create a Tx from the current state of the send page. 
+// PRIV-11 / UX-12 — pure four-way classifier. The actual body is the single
+// source of truth `sendCategoryOf()` in sendcategory.h, which both production and
+// the L0 unit suite link directly (no hand-copied mirror). This member just
+// forwards so existing callers (confirmTx) and the static seam keep working.
+SendCategory MainWindow::classifySend(const Tx& tx) {
+    return sendCategoryOf(tx);
+}
+
+// Create a Tx from the current state of the send page.
 Tx MainWindow::createTxFromSendPage() {
     Tx tx;
 
     bool sendChangeToSapling = Settings::getInstance()->getAutoShield();
 
-    // Gather the from / to addresses 
+    // Gather the from / to addresses
     tx.fromAddr = ui->inputsCombo->currentText();
     sendChangeToSapling = sendChangeToSapling && Settings::isTAddress(tx.fromAddr);
 
     // For each addr/amt in the sendTo tab
-    int totalItems = ui->sendToWidgets->children().size() - 2;   // The last one is a spacer, so ignore that        
+    int totalItems = ui->sendToWidgets->children().size() - 2;   // The last one is a spacer, so ignore that
     double totalAmt = 0;
+    bool   sproutRecipient = false;
     for (int i=0; i < totalItems; i++) {
         QString addr = ui->sendToWidgets->findChild<QLineEdit*>(QString("Address") % QString::number(i+1))->text().trimmed();
         // Remove label if it exists
         addr = AddressBook::addressFromAddressLabel(addr);
-        
+
         // If address is sprout, then we can't send change to sapling, because of turnstile.
+        if (Settings::getInstance()->isSproutAddress(addr))
+            sproutRecipient = true;
         sendChangeToSapling = sendChangeToSapling && !Settings::getInstance()->isSproutAddress(addr);
 
-        double  amt  = ui->sendToWidgets->findChild<QLineEdit*>(QString("Amount")  % QString::number(i+1))->text().trimmed().toDouble();        
+        double  amt  = ui->sendToWidgets->findChild<QLineEdit*>(QString("Amount")  % QString::number(i+1))->text().trimmed().toDouble();
         totalAmt += amt;
         QString memo = ui->sendToWidgets->findChild<QLabel*>(QString("MemoTxt")  % QString::number(i+1))->text().trimmed();
-        
+
         tx.toAddrs.push_back( ToFields{addr, amt, memo, memo.toUtf8().toHex()} );
     }
 
@@ -508,32 +519,164 @@ Tx MainWindow::createTxFromSendPage() {
         tx.fee = Settings::getMinerFee();
     }
 
+    // PRIV-27 — for a Sprout recipient, Sapling change is suppressed (turnstile
+    // forbids mixing), so the change cannot be shielded to Sapling on THIS tx.
+    // Surface that constraint to the user (once) rather than silently leaving the
+    // change transparent. We only nag when auto-shield is ON and the from-addr is
+    // transparent (the only case where change WOULD otherwise be shielded).
+    if (Settings::getInstance()->getAutoShield() && Settings::isTAddress(tx.fromAddr)
+            && sproutRecipient && !sproutChangeWarned) {
+        sproutChangeWarned = true;
+        QMessageBox::information(this, tr("Change cannot be shielded for this send"),
+            tr("Because a recipient is a legacy Sprout (zc...) z-address, this wallet "
+               "cannot route the transparent change to a shielded Sapling address on the "
+               "same transaction (the network forbids mixing Sprout and Sapling). Any "
+               "change from this send will remain on a PUBLIC transparent address.\n\n"
+               "To keep everything private, send to a Sapling (zs...) recipient instead, "
+               "or migrate your Sprout funds to Sapling first."),
+            QMessageBox::Ok);
+    }
+
+    // PRIV-10 / PRIV-19 / PRIV-28 — auto-shield, FAIL CLOSED on privacy. With
+    // auto-shield ON and a transparent from-addr, the change MUST be routed to a
+    // Sapling z-address. If a usable Sapling address exists we use it; if NONE
+    // exists we auto-create one (synchronous newZaddr(true) -- the last-resort
+    // fallback per DECISION #2; the common case is covered by
+    // ensureSaplingProvisioned() at first funding). If a Sapling change address
+    // STILL cannot be obtained, we do NOT proceed silently (z_sendmany would then
+    // route the change to a PUBLIC t-address) -- we ABORT the send and return an
+    // INVALID Tx. Fail CLOSED, never open.
     if (Settings::getInstance()->getAutoShield() && sendChangeToSapling) {
-        auto saplingAddr = std::find_if(rpc->getAllZAddresses()->begin(), rpc->getAllZAddresses()->end(), [=](auto i) -> bool { 
-            // We're finding a sapling address that is not one of the To addresses, because zclassic doesn't allow duplicated addresses
-            bool isSapling = Settings::getInstance()->isSaplingAddress(i); 
-            if (!isSapling) return false;
+        QString changeAddr = findUnusedSaplingChangeAddr(tx);
 
-            // Also check all the To addresses
-            for (auto t : tx.toAddrs) {
-                if (t.addr == i)
-                    return false;
-            }
+        // No existing usable Sapling address -> create one NOW. This is a blocking
+        // RPC, but only on the (rare) first-ever send before any Sapling key exists.
+        if (changeAddr.isEmpty())
+            changeAddr = createSaplingAddressSync();
 
-            return true;
-        });
+        if (changeAddr.isEmpty()) {
+            // MAJOR-1 fail-closed: we could not obtain a Sapling change sink, so the
+            // change would otherwise stay PUBLIC. Surface a blocking warning (mirrors
+            // shieldPublicFunds()'s style) and abort by returning an invalid Tx.
+            QMessageBox::warning(this, tr("Could not shield"),
+                tr("Could not shield — a Sapling change address could not be created, "
+                   "so your change would stay PUBLIC. Please try again in a moment."),
+                QMessageBox::Ok);
+            return Tx();   // invalid: empty fromAddr -> doSendTxValidations aborts the send
+        }
 
-        if (saplingAddr != rpc->getAllZAddresses()->end()) {
-            double change = rpc->getAllBalances()->value(tx.fromAddr) - totalAmt - tx.fee;
+        // MAJOR-2 funds-safety: base the change on the CONFIRMED, spendable balance of
+        // the from-addr. getAllBalances() SUMS unconfirmed (confirmations==0) utxos,
+        // but z_sendmany spends ONLY confirmed notes, so a change computed from the
+        // unconfirmed-inclusive total would emit an UNFUNDABLE change output and the
+        // daemon would reject the whole tx with insufficient-funds. If the confirmed
+        // spendable balance can't cover amount+fee, surface the existing not-enough-
+        // funds message UP FRONT and abort rather than emitting an unfundable change.
+        const double confirmed = confirmedSpendableBalance(tx.fromAddr);
+        if (confirmed < totalAmt + tx.fee) {
+            QMessageBox::critical(this, tr("Transaction Error"),
+                tr("Not enough confirmed funds. You're trying to send %1 (including the "
+                   "fee), but this address only holds %2 in confirmed, spendable funds. "
+                   "Wait for your incoming funds to confirm and try again.")
+                   .arg(Settings::getZCLDisplayFormat(totalAmt + tx.fee))
+                   .arg(Settings::getZCLDisplayFormat(confirmed)),
+                QMessageBox::Ok);
+            return Tx();   // invalid: abort the send
+        }
 
-            if (Settings::getDecimalString(change) != "0") {
-                QString changeMemo = tr("Change from ") + tx.fromAddr;
-                tx.toAddrs.push_back(ToFields{ *saplingAddr, change, changeMemo, changeMemo.toUtf8().toHex() });
-            }
+        double change = confirmed - totalAmt - tx.fee;
+        if (Settings::getDecimalString(change) != "0") {
+            QString changeMemo = tr("Change from ") + tx.fromAddr;
+            tx.toAddrs.push_back(ToFields{ changeAddr, change, changeMemo, changeMemo.toUtf8().toHex() });
         }
     }
-    
+
     return tx;
+}
+
+// MAJOR-2 — sum the CONFIRMED (confirmations > 0), spendable UTXOs the GUI already
+// holds for `addr`. z_sendmany only spends confirmed notes, so this (not the
+// unconfirmed-inclusive getAllBalances() total) is the correct basis for the
+// auto-shield change amount. Null-safe: returns 0 if the UTXO set isn't loaded yet.
+double MainWindow::confirmedSpendableBalance(const QString& addr) {
+    if (!rpc || !rpc->getUTXOs())
+        return 0.0;
+    double sum = 0.0;
+    for (const UnspentOutput& u : *rpc->getUTXOs()) {
+        if (u.address == addr && u.confirmations > 0 && u.spendable)
+            sum += u.amount.toDouble();
+    }
+    return sum;
+}
+
+// Find an existing Sapling z-address usable as the change sink: it must be a real
+// Sapling address AND not collide with any recipient (zclassic rejects a duplicate
+// output address). Returns "" if none exists. Factored out of createTxFromSendPage
+// so the fail-open create path is a clean single branch.
+QString MainWindow::findUnusedSaplingChangeAddr(const Tx& tx) {
+    if (!rpc || !rpc->getAllZAddresses())
+        return QString();
+    for (const QString& a : *rpc->getAllZAddresses()) {
+        if (!Settings::getInstance()->isSaplingAddress(a))
+            continue;
+        bool collides = false;
+        for (const auto& t : tx.toAddrs)
+            if (t.addr == a) { collides = true; break; }
+        if (!collides)
+            return a;
+    }
+    return QString();
+}
+
+// PRIV-10 fail-open last resort: synchronously create a fresh Sapling z-address via
+// the daemon and return it. Blocks the GUI thread briefly; only reached when NO
+// Sapling address exists at send time (the eager ensureSaplingProvisioned() path
+// normally pre-creates one at first funding). Returns "" if creation fails (so the
+// caller degrades gracefully rather than crashing) -- but NEVER returns a non-Sapling
+// address, so change is never routed to Sprout/transparent.
+QString MainWindow::createSaplingAddressSync() {
+    if (!rpc)
+        return QString();
+
+    // MINOR-3 reentrancy guard: the event-loop pump below keeps the app live, so a
+    // second sendButton click (or any code path) could re-enter this blocking
+    // create. Refuse to nest -- a single in-flight create at a time.
+    if (saplingSyncCreateInFlight)
+        return QString();
+    saplingSyncCreateInFlight = true;
+    // RAII-clear on every return path (early-outs below included).
+    struct ClearGuard { bool* f; ~ClearGuard() { *f = false; } } _clr{ &saplingSyncCreateInFlight };
+
+    QString created;
+    rpc->newZaddr(true, [&](json reply) {
+        if (reply.is_string())
+            created = QString::fromStdString(reply.get<json::string_t>());
+    });
+
+    // newZaddr is async on the network thread; pump the event loop briefly so the
+    // reply lands before we return. Bounded so a dead daemon can never wedge a send.
+    // ExcludeUserInputEvents (MINOR-3): suppress mouse/key delivery during the pump
+    // so a second sendButton click can't be processed mid-create. We only pump while
+    // a connection actually exists -- with no daemon connection the async create can
+    // never complete, so pumping would just spin to the timeout for nothing (and the
+    // caller will fail CLOSED on the empty result).
+    QElapsedTimer t; t.start();
+    while (created.isEmpty() && rpc->getConnection() && t.elapsed() < 8000) {
+        QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 50);
+    }
+
+    if (!created.isEmpty()) {
+        // Make the new address available to the rest of the wallet immediately. Only
+        // when a connection exists -- a successful create implies one; calling
+        // refreshAddresses() with no connection just bounces to noConnection() (which
+        // tears down the live UI state), so skip it on that impossible-in-prod path.
+        if (rpc->getConnection())
+            rpc->refreshAddresses();
+        // Defensive: only ever return a real Sapling address (never degrade).
+        if (!Settings::getInstance()->isSaplingAddress(created))
+            return QString();
+    }
+    return created;
 }
 
 bool MainWindow::confirmTx(Tx tx) {
@@ -572,19 +715,30 @@ bool MainWindow::confirmTx(Tx tx) {
     delete confirm.sendToAddrs->findChild<QLabel*>("minerFee");
     delete confirm.sendToAddrs->findChild<QLabel*>("minerFeeUSD");
     
-    // For each addr/amt/memo, construct the JSON and also build the confirm dialog box    
+    // PRIV-11 / UX-12 — four-way, from-aware privacy classification. The legacy
+    // binary isPublicTx is gone; the category drives BOTH the publicWarning copy and
+    // the dialog title/badge below, and (PRIV-12) whether the z->t acknowledgement
+    // gate fires before the send.
+    const SendCategory category = classifySend(tx);
+
+    // For each addr/amt/memo, construct the JSON and also build the confirm dialog box
     int row = 0;
     double totalSpending = 0;
 
-    // P1-3: a send becomes PUBLIC (loses privacy) the moment any of the funds land on a
-    // transparent t-address, because the amount is then visible on the public blockchain.
-    bool isPublicTx = false;
+    // NIT-2 — recognize the auto-shield CHANGE output so we can label it as such in
+    // the confirm dialog (rather than showing a bare zs... recipient that looks like
+    // an unexpected payee). The change row is the Sapling output whose memo is the
+    // change memo createTxFromSendPage() stamped: tr("Change from ") + fromAddr.
+    const QString changeMemoMarker = tr("Change from ") + tx.fromAddr;
 
     for (int i=0; i < tx.toAddrs.size(); i++) {
         auto toAddr = tx.toAddrs[i];
 
-        if (Settings::isTAddress(toAddr.addr))
-            isPublicTx = true;
+        const bool isAutoShieldChange =
+            Settings::getInstance()->getAutoShield()
+            && Settings::isTAddress(tx.fromAddr)
+            && Settings::getInstance()->isSaplingAddress(toAddr.addr)
+            && toAddr.txtMemo == changeMemoMarker;
 
         // Add new Address widgets instead of the same one.
         {
@@ -592,7 +746,11 @@ bool MainWindow::confirmTx(Tx tx) {
             auto Addr = new QLabel(confirm.sendToAddrs);
             Addr->setObjectName(QString("Addr") % QString::number(i + 1));
             Addr->setWordWrap(true);
-            Addr->setText(fnSplitAddressForWrap(toAddr.addr));
+            // NIT-2: a clear, reassuring label for the auto-shielded change row.
+            if (isAutoShieldChange)
+                Addr->setText(tr("Change (auto-shielded to your wallet)"));
+            else
+                Addr->setText(fnSplitAddressForWrap(toAddr.addr));
             confirm.gridLayout->addWidget(Addr, row, 0, 1, 1);
 
             // Amount (ZCL)
@@ -610,8 +768,9 @@ bool MainWindow::confirmTx(Tx tx) {
             AmtUSD->setAlignment(Qt::AlignRight | Qt::AlignTrailing | Qt::AlignVCenter);
             confirm.gridLayout->addWidget(AmtUSD, row, 2, 1, 1);            
 
-            // Memo
-            if (toAddr.addr.startsWith("z") && !toAddr.txtMemo.isEmpty()) {
+            // Memo (suppressed for the auto-shield change row -- its Addr label
+            // already says "Change (auto-shielded to your wallet)"; NIT-2).
+            if (!isAutoShieldChange && toAddr.addr.startsWith("z") && !toAddr.txtMemo.isEmpty()) {
                 row++;
                 auto Memo = new QLabel(confirm.sendToAddrs);
                 Memo->setObjectName(QStringLiteral("Memo") % QString::number(i + 1));
@@ -673,10 +832,77 @@ bool MainWindow::confirmTx(Tx tx) {
     // No peers warning
     confirm.nopeersWarning->setVisible(Settings::getInstance()->getPeers() == 0);
 
-    // P1-3: public (de-shield) warning
-    confirm.publicWarning->setVisible(isPublicTx);
+    // PRIV-11 / UX-12 — drive the confirm dialog wording + a privacy badge from the
+    // four-way category. Tokens mirror dark.qss / PrivacyBadgeDelegate:
+    //   green #1f7a1f  amber #d9822b  red #c0392b
+    // A small badge QLabel ("confirmPrivacyBadge") is created once and reused; the
+    // existing red publicWarning label carries the long-form copy and is only shown
+    // for the two public quadrants (z->t de-shield = strongest; t->t = public).
+    {
+        QString badgeText, badgeColor, dialogTitle, warningText;
+        // NIT-3: the reused publicWarning label is tinted per category token instead
+        // of the .ui's static "color: red;" -- amber for plain public, red (strongest)
+        // for the de-shield leak. Mirrors dark.qss / PrivacyBadgeDelegate tokens.
+        QString warningColor;
+        bool    showWarning = false;
 
-    // And FromAddress in the confirm dialog 
+        switch (category) {
+        case SendCategory::ZToZ_private:
+            badgeText   = tr("PRIVATE  z → z");
+            badgeColor  = "#1f7a1f";                       // green
+            dialogTitle = tr("Confirm private transaction");
+            break;
+        case SendCategory::TToZ_shielding:
+            badgeText   = tr("SHIELDING  t → z");
+            badgeColor  = "#e6e6e6";                       // neutral text
+            dialogTitle = tr("Confirm shielding transaction");
+            break;
+        case SendCategory::ZToT_deshield:
+            badgeText    = tr("DE-SHIELD  z → t");
+            badgeColor   = "#c0392b";                      // red (strongest)
+            warningColor = "#c0392b";                      // red de-shield warning
+            dialogTitle  = tr("Confirm DE-SHIELD (public) transaction");
+            warningText  = tr("DE-SHIELD: you are moving funds from a PRIVATE (shielded) "
+                             "address to a PUBLIC transparent address. The amount, the "
+                             "recipient, AND the link back to your shielded sender become "
+                             "permanently visible to everyone on the blockchain.");
+            showWarning = true;
+            break;
+        case SendCategory::TToT_public:
+            badgeText    = tr("PUBLIC  t → t");
+            badgeColor   = "#d9822b";                      // amber
+            warningColor = "#d9822b";                      // amber public warning
+            dialogTitle  = tr("Confirm public transaction");
+            warningText  = tr("This transaction is PUBLIC: the amount and recipient will "
+                             "be permanently visible to everyone on the blockchain.");
+            showWarning = true;
+            break;
+        }
+
+        d.setWindowTitle(dialogTitle);
+
+        // The privacy badge: created once on the From group's layout so it sits at
+        // the very top of the dialog. objectName is stable so the L1 test can read it.
+        auto* badge = d.findChild<QLabel*>("confirmPrivacyBadge");
+        if (!badge) {
+            badge = new QLabel(confirm.groupBox);
+            badge->setObjectName("confirmPrivacyBadge");
+            confirm.verticalLayout_2->insertWidget(0, badge);
+        }
+        badge->setText(badgeText);
+        badge->setStyleSheet(QString("font-weight: 700; color: %1;").arg(badgeColor));
+
+        // The long-form warning copy (publicWarning): shown for the two public
+        // quadrants only, with category-specific text + token color (NIT-3).
+        if (showWarning) {
+            confirm.publicWarning->setText(warningText);
+            confirm.publicWarning->setStyleSheet(
+                QString("color: %1; font-weight: 600;").arg(warningColor));
+        }
+        confirm.publicWarning->setVisible(showWarning);
+    }
+
+    // And FromAddress in the confirm dialog
     confirm.sendFrom->setText(fnSplitAddressForWrap(tx.fromAddr));
     QString tooltip = tr("Current balance      : ") +
         Settings::getZCLUSDDisplayFormat(rpc->getAllBalances()->value(tx.fromAddr));
@@ -685,18 +911,46 @@ bool MainWindow::confirmTx(Tx tx) {
     confirm.sendFrom->setToolTip(tooltip);
 
     // Show the dialog and submit it if the user confirms
-    if (d.exec() == QDialog::Accepted) {        
+    if (d.exec() == QDialog::Accepted) {
+        // PRIV-12 — a z->t DE-SHIELD send requires an explicit, non-default-accept
+        // acknowledgement before it proceeds. The other three categories
+        // (z->z private, t->z shielding, t->t public) MUST NOT add this friction.
+        // Default button is No, so a careless Enter does not de-shield.
+        if (category == SendCategory::ZToT_deshield) {
+            // Explicit QMessageBox instance (objectName "deshieldAck") rather than the
+            // blocking static, so the acknowledgement is reliably testable and the
+            // default button is the SAFE No (a careless Enter does not de-shield).
+            QMessageBox ack(QMessageBox::Warning, tr("De-shield to a public address?"),
+                tr("This send moves funds OUT of your private (shielded) balance onto a "
+                   "PUBLIC transparent address. The amount, the recipient, and the link "
+                   "back to your shielded sender will be permanently visible on the "
+                   "blockchain.\n\nThis cannot be undone. De-shield anyway?"),
+                QMessageBox::Yes | QMessageBox::No, this);
+            ack.setObjectName("deshieldAck");
+            ack.setDefaultButton(QMessageBox::No);
+            if (ack.exec() != QMessageBox::Yes)
+                return false;
+        }
+
         // Then delete the additional fields from the sendTo tab
         removeExtraAddresses();
         return true;
     } else {
         return false;
-    }        
+    }
 }
 
 // Send button clicked
 void MainWindow::sendButton() {
     Tx tx = createTxFromSendPage();
+
+    // MAJOR-1/MAJOR-2 fail-closed abort: createTxFromSendPage() returns an INVALID
+    // Tx (empty fromAddr) when it has already surfaced a blocking reason -- the
+    // change could not be shielded (privacy fail-closed), or there are not enough
+    // confirmed funds. Bail silently here so we don't stack a second, vaguer
+    // "From Address is Invalid" error on top of the precise one already shown.
+    if (tx.fromAddr.isEmpty())
+        return;
 
     // Still-syncing acknowledgement gate: during sync the balance/UTXO set is
     // incomplete, so a send can silently fail. Make the user explicitly accept

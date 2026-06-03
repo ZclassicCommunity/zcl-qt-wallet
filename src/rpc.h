@@ -68,10 +68,28 @@ public:
     const QMap<QString, bool>*        getUsedAddresses()     { return usedAddresses; }
 
 #ifdef ZCL_WIDGET_TEST
-    // TEST-ONLY SEAM (L1 widget tests). Compiled in ONLY under ZCL_WIDGET_TEST;
-    // NEVER in the shipped app. Installs a balances map so confirmTx() (which
-    // dereferences getAllBalances()) is safe in-process without a live daemon.
+    // TEST-ONLY SEAMS (L1 widget tests). Compiled in ONLY under ZCL_WIDGET_TEST;
+    // NEVER in the shipped app. Install balances/z-address state so confirmTx() and
+    // createTxFromSendPage() (PRIV-10 change routing) run in-process without a live
+    // daemon. testSetZAddresses lets the PRIV-10 fail-open test control whether a
+    // Sapling change-sink exists.
     void testSetBalances(QMap<QString, double>* b) { delete allBalances; allBalances = b; }
+    void testSetZAddresses(QList<QString>* z)       { delete zaddresses; zaddresses = z; }
+    void testSetTAddresses(QList<QString>* t)       { delete taddresses; taddresses = t; }
+    // MAJOR-2: install the wallet's UTXO set so confirmedSpendableBalance() (the
+    // confirmed-only change basis) can be driven without a daemon.
+    void testSetUTXOs(QList<UnspentOutput>* u)      { delete utxos; utxos = u; }
+    // MAJOR-3: control the result of the next newZaddr(true) sync-create. A non-empty
+    // string makes the create SUCCEED (returns that address); leaving it empty makes
+    // the create FAIL (callback never fires), exercising the fail-closed path. The
+    // string is consumed (one-shot) so a subsequent create with no fresh value fails.
+    void testSetNextZaddrResult(const QString& addr) { testNextZaddrResult = addr; }
+    // MINOR-1: install a sentinel Connection so the readiness guard in
+    // shieldPublicFunds()/ensureSaplingProvisioned() (which mirrors the real
+    // "connection up?" check) is satisfied in-process without a live daemon. The
+    // installed Connection is never actually USED on these paths (the seeded
+    // Sapling address resolves first), only its non-null-ness is checked.
+    void testSetConnection(Connection* c) { conn = c; }
 #endif
 
     void newZaddr(bool sapling, const std::function<void(json)>& cb);
@@ -248,6 +266,13 @@ private:
 
     // Current balance in the UI. If this number updates, then refresh the UI
     QString                     currentBalance;
+
+#ifdef ZCL_WIDGET_TEST
+    // MAJOR-3 test seam backing store: the address the next newZaddr(true) returns
+    // (one-shot). Empty => the sync-create fails (fail-closed path). Never present
+    // in the shipped app build.
+    QString                     testNextZaddrResult;
+#endif
 };
 
 #endif // RPCCLIENT_H

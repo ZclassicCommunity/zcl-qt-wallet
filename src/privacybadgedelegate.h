@@ -43,9 +43,25 @@ public:
     QSize sizeHint(const QStyleOptionViewItem& option,
                    const QModelIndex& index) const override;
 
-private:
-    // The privacy classification of an address, and the badge it maps to.
+    // The privacy classification of an address, and the badge it maps to. Public so
+    // the L0/L1 tests (PRIV-13/14) can name the categories; the classify*/labelFor/
+    // colorFor logic stays the single source of truth (no duplicated truth table).
     enum class Kind { None, Private, PrivateLegacy, Public, Deshield };
+
+#ifdef ZCL_WIDGET_TEST
+    // TEST-ONLY SEAMS (PRIV-13/14): forward to the private static logic so the unit
+    // tests exercise the REAL classify()/classifyForIndex()/labelFor()/colorFor()
+    // without duplicating it. Compiled in ONLY under ZCL_WIDGET_TEST (the L1 widget
+    // target); never present in the shipped app. colorFor is returned as an
+    // "#rrggbb" string so the test can compare against the dark.qss hex tokens.
+    static Kind    testClassify(const QString& displayText)            { return classify(displayText); }
+    static Kind    testClassifyForIndex(const QModelIndex& i,
+                                        const QString& displayText)     { return classifyForIndex(i, displayText); }
+    static QString testLabelFor(Kind k)                                 { return labelFor(k); }
+    static QString testColorHexFor(Kind k)                              { return colorFor(k).name(); }
+#endif
+
+private:
 
     Mode _mode;
 

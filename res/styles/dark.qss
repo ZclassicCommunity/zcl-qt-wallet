@@ -297,3 +297,26 @@ QLabel#lblReceiveAdvancedCaption {
     font-weight: 500;
     padding-bottom: 2px;
 }
+
+/* ============================================================================
+ * Danger / DE-SHIELD styling (PRIV-11/UX-12, NIT-4). The red token #c0392b is
+ * the strongest privacy warning -- a private->transparent de-shield leak. This
+ * is a REAL rule (not a comment), so the PRIV-14 token guard protects an actual
+ * shipped style and the red de-shield surface can never silently drift away.
+ *   * QLabel#publicWarning[deshield="true"] -- the confirm dialog's reused
+ *     warning label when the send is a z->t de-shield (the code also sets an
+ *     inline color, but this default keeps it red even before that runs).
+ *   * a generic ".deshield" danger pill for any future Deshield badge widget.
+ * ============================================================================ */
+QLabel#publicWarning[deshield="true"] {
+    color: #c0392b;                 /* red: strongest de-shield warning */
+    font-weight: 600;
+}
+.deshield, QLabel[badgeKind="deshield"] {
+    background-color: rgba(192, 57, 43, 0.14);   /* faint red surface */
+    border: 1px solid #c0392b;
+    border-radius: 8px;
+    color: #c0392b;
+    padding: 2px 8px;
+    font-weight: 700;
+}
