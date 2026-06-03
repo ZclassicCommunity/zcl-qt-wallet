@@ -462,7 +462,10 @@ void MainWindow::maxAmountChecked(int checked) {
         }
 
         if (Settings::getInstance()->getAllowCustomFees()) {
-            sumAllAmounts = ui->minerFeeAmt->text().toDouble();
+            // += (not =): must ADD the custom fee to the other recipients' amounts
+            // already summed above, else MAX is computed too large (it ignores the
+            // other outputs) and the send fails with a confusing "Not enough funds".
+            sumAllAmounts += ui->minerFeeAmt->text().toDouble();
         }
         else {
             sumAllAmounts += Settings::getMinerFee();
