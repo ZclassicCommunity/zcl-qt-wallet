@@ -67,6 +67,13 @@ public:
     const QMap<QString, double>*      getAllBalances()       { return allBalances; }
     const QMap<QString, bool>*        getUsedAddresses()     { return usedAddresses; }
 
+#ifdef ZCL_WIDGET_TEST
+    // TEST-ONLY SEAM (L1 widget tests). Compiled in ONLY under ZCL_WIDGET_TEST;
+    // NEVER in the shipped app. Installs a balances map so confirmTx() (which
+    // dereferences getAllBalances()) is safe in-process without a live daemon.
+    void testSetBalances(QMap<QString, double>* b) { delete allBalances; allBalances = b; }
+#endif
+
     void newZaddr(bool sapling, const std::function<void(json)>& cb);
     void newTaddr(const std::function<void(json)>& cb);
 

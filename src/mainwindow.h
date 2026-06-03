@@ -44,6 +44,16 @@ public:
     void updateLabelsAutoComplete();
     RPC* getRPC() { return rpc; }
 
+#ifdef ZCL_WIDGET_TEST
+    // TEST-ONLY SEAM (L1 widget tests). Compiled in ONLY when ZCL_WIDGET_TEST is
+    // defined (tests/widget/tst_widget.pro). NEVER present in the shipped app
+    // build. Exposes the private confirmTx() so the E2 de-shield-warning test can
+    // drive the real confirm dialog, and seeds an empty RPC balances map so
+    // confirmTx's rpc->getAllBalances() deref is safe without a live daemon.
+    bool testConfirmTx(Tx tx)  { return confirmTx(tx); }
+    void testSeedBalances();
+#endif
+
     QString doSendTxValidations(Tx tx);
     void setDefaultPayFrom();
 

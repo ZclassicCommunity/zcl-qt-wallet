@@ -2015,3 +2015,14 @@ MainWindow::~MainWindow()
     delete loadingMovie;
     delete logger;
 }
+
+#ifdef ZCL_WIDGET_TEST
+// TEST-ONLY SEAM (L1 widget tests). Compiled in ONLY under ZCL_WIDGET_TEST;
+// NEVER present in the shipped app. Installs an empty balances map on the RPC so
+// confirmTx()'s rpc->getAllBalances()->value(...) deref is safe in-process
+// without a live daemon (the value() of an absent key is 0, which is fine for a
+// pure UX-warning assertion).
+void MainWindow::testSeedBalances() {
+    rpc->testSetBalances(new QMap<QString, double>());
+}
+#endif
