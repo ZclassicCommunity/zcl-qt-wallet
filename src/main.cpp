@@ -179,7 +179,7 @@ public:
         parser.addHelpOption();
 
         // A boolean option for running it headless
-        QCommandLineOption headlessOption(QStringList() << "headless", "Running it via GUI.");
+        QCommandLineOption headlessOption(QStringList() << "headless", "Run the wallet without the GUI (headless node only).");
         parser.addOption(headlessOption);
 
         // No embedded will disable the embedded zclassicd node

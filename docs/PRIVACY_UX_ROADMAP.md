@@ -1,5 +1,9 @@
 # Privacy-by-default UX/UI roadmap — ZClassic wallet
 
+> **Engineering / roadmap doc — not user documentation.** The Tier-0 items below are
+> implemented on `feature/privacy-by-default-tier0` and are **not yet in the released
+> v2.1.2-beta5**.
+
 Goal: make the wallet **private by default**, **private without annoying the user**,
 and **fast + secure**, grounded in the actual code (not generic advice). Produced by
 a multi-agent audit of the real `.ui`/`.cpp` plus a live headless run of the shipped

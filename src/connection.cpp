@@ -307,7 +307,12 @@ void ConnectionLoader::createZClassicConf() {
 }
 
 
-void ConnectionLoader::downloadParams(std::function<void(void)> cb) {    
+// DEAD CODE — NOT on the startup path. The daemon now peer-fetches the zk-params
+// itself, hash-verified (see the param-fetch note near line 115); z.cash PERMANENTLY
+// 403s the URLs enqueued below, and that dead download is exactly what used to hang
+// fresh installs. This function (and doNextDownload) are retained for reference only
+// and have no live caller. Do NOT wire these z.cash URLs back into onboarding.
+void ConnectionLoader::downloadParams(std::function<void(void)> cb) {
     main->logger->write("Adding params to download queue");
 
     // P1-7: make sure there is enough room before pulling ~1.7GB of security files.
@@ -529,9 +534,9 @@ bool ConnectionLoader::startEmbeddedZClassicd(const QStringList& extraArgs) {
     if (!QFile(zclassicdProgram).exists())
         zclassicdProgram = ensureDaemonExtracted();
 #elif defined(Q_OS_DARWIN)
-    // No runtime extraction on macOS: notarization / hardened runtime forbid
-    // executing a binary written at runtime, so the signed daemon ships as a
-    // sibling inside Contents/MacOS and ensureDaemonExtracted() returns empty.
+    // No runtime extraction on macOS: a hardened-runtime / code-signed build must
+    // not exec a binary written at runtime, so the signed daemon ships as a sibling
+    // inside Contents/MacOS and ensureDaemonExtracted() returns empty.
     zclassicdProgram = appPath.absoluteFilePath("zclassicd");
 #else
     zclassicdProgram = appPath.absoluteFilePath("zclassicd.exe");
@@ -629,7 +634,7 @@ bool ConnectionLoader::startEmbeddedZClassicd(const QStringList& extraArgs) {
 // string to make the caller fall back (no payload / mismatch / macOS).
 QString ConnectionLoader::ensureDaemonExtracted() {
 #ifdef Q_OS_DARWIN
-    return QString();   // never extract+exec on macOS (notarization)
+    return QString();   // never extract+exec on macOS (hardened-runtime / signed build)
 #else
     static const QByteArray MAGIC = QByteArrayLiteral("ZQWDMON1");   // 8 bytes
     const qint64 LEN_BYTES   = 8;

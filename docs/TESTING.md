@@ -1,5 +1,9 @@
 # ZClassic wallet — automated testing & UX checklist
 
+> **Engineering doc — not user documentation.** Some checklist items reference Tier-0
+> privacy behaviors on `feature/privacy-by-default-tier0` that are not yet in the
+> released v2.1.2-beta5.
+
 How to prove the wallet (and its privacy-by-default UX) actually works, automatically.
 Designed + adversarially reviewed against the real code. The wallet's *only* network
 primitive is `Connection::doRPC` posting plain HTTP/Basic-auth to a `QNetworkAccessManager`

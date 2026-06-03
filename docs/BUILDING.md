@@ -622,8 +622,7 @@ In-repo and already tracked (reference, do **not** re-commit): `src/scripts/mkre
 ### Known open items
 - **Version is hard-coded** (`src/version.h` → `APP_VERSION "2.1.2-beta5"`); the
   proot release scripts also hard-code it and must be bumped together with a tag.
-- **README points at the wrong upstream** (`github.com/ZClassicFoundation/zclwallet`)
-  while the actual remote is `github.com/ZclassicCommunity/zcl-qt-wallet`. Fix README
-  links before publishing.
+- **Repo links verified** — the README and docs reference `github.com/ZclassicCommunity/zcl-qt-wallet`
+  throughout (the old `ZClassicFoundation/zclwallet` upstream references were removed).
 - The published `2.1.2-beta5` macOS `.dmg` sign/notarize details are owned by the mac
   maintainer and are not verifiable from the Linux box.
