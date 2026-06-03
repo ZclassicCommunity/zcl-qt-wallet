@@ -33,6 +33,17 @@ public:
 private:
     void updateAllData();
 
+    // PERF (Phase 4 Win 2): a cheap content fingerprint of an incoming list, so a
+    // setter whose data is byte-for-byte identical to what's already applied can
+    // early-out without rebuilding the model (no dataChanged/layoutChanged -> no
+    // flicker, no wasted CPU on every poll). The fingerprint folds in every field
+    // that affects rendering -- crucially `confirmations`, so a pending->confirmed
+    // transition changes the fingerprint and repaints.
+    static QByteArray fingerprint(const QList<TransactionItem>& data);
+    QByteArray lastTFingerprint;
+    QByteArray lastZrFingerprint;
+    QByteArray lastZsFingerprint;
+
     QList<TransactionItem>*  tTrans      = nullptr;
     QList<TransactionItem>*  zrTrans     = nullptr;     // Z received
     QList<TransactionItem>*  zsTrans     = nullptr;     // Z sent

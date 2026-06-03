@@ -4,13 +4,50 @@
 
 
 BalancesTableModel::BalancesTableModel(QObject *parent)
-    : QAbstractTableModel(parent) {    
+    : QAbstractTableModel(parent) {
 }
 
-void BalancesTableModel::setNewData(const QMap<QString, double>* balances, 
+// PERF (Phase 4 Win 2): fold the render-affecting inputs into a compact fingerprint.
+// The displayed rows are (address -> balance) for every positive balance; row COLOUR
+// additionally depends on whether ANY utxo for that address has confirmations==0. So
+// we hash both the (sorted) balances and each utxo's (address, confirmations). A
+// leading sentinel keeps an empty input distinct from a never-set (null) cache.
+QByteArray BalancesTableModel::fingerprint(const QMap<QString, double>* balances,
+                                           const QList<UnspentOutput>* outputs) {
+    QByteArray buf;
+    buf.append('v');   // sentinel: non-null even when both inputs are empty
+
+    // Balances: iterate in QMap's key order (deterministic) for a stable encoding.
+    buf.append('B');
+    for (auto it = balances->constBegin(); it != balances->constEnd(); ++it) {
+        buf.append(it.key().toUtf8());                       buf.append('\x1f');
+        buf.append(QByteArray::number(it.value(), 'f', 8));  buf.append('\x1e');
+    }
+
+    // UTXOs: only the fields that affect display/colour (address + confirmations).
+    buf.append('U');
+    for (const auto& u : *outputs) {
+        buf.append(u.address.toUtf8());                      buf.append('\x1f');
+        buf.append(QByteArray::number(u.confirmations));     buf.append('\x1e');
+    }
+
+    return QCryptographicHash::hash(buf, QCryptographicHash::Sha1);
+}
+
+void BalancesTableModel::setNewData(const QMap<QString, double>* balances,
     const QList<UnspentOutput>* outputs)
-{    
+{
     loading = false;
+
+    // PERF (Phase 4 Win 2): unchanged data -> skip the rebuild entirely (no
+    // dataChanged/layoutChanged, no flicker, no per-poll CPU). NOTE: `loading` is
+    // cleared above first, so the very first real call (which flips loading false and
+    // replaces the "Loading..." placeholder row) is never wrongly suppressed by a
+    // stale fingerprint.
+    QByteArray fp = fingerprint(balances, outputs);
+    if (fp == lastFingerprint)
+        return;
+    lastFingerprint = fp;
 
     int currentRows = rowCount(QModelIndex());
     // Copy over the utxos for our use

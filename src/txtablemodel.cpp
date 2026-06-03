@@ -7,6 +7,30 @@ TxTableModel::TxTableModel(QObject *parent)
     headers << QObject::tr("Type") << QObject::tr("Address") << QObject::tr("Date/Time") << QObject::tr("Amount");
 }
 
+// PERF (Phase 4 Win 2): fold the render-affecting fields of a transaction list into
+// a compact fingerprint. We hash a deterministic textual encoding of every item, in
+// order. `confirmations` IS included, so a pending(0)->confirmed transition flips the
+// fingerprint and forces a repaint. A leading sentinel byte makes the fingerprint of
+// an EMPTY list distinct from a never-yet-set (null) cached fingerprint, so the very
+// first (possibly empty) apply still runs once.
+QByteArray TxTableModel::fingerprint(const QList<TransactionItem>& data) {
+    QByteArray buf;
+    buf.append('v');                       // sentinel: non-null even for an empty list
+    buf.append(QByteArray::number(data.size()));
+    buf.append('|');
+    for (const auto& t : data) {
+        buf.append(t.type.toUtf8());                              buf.append('\x1f');
+        buf.append(QByteArray::number(t.datetime));              buf.append('\x1f');
+        buf.append(t.address.toUtf8());                           buf.append('\x1f');
+        buf.append(t.txid.toUtf8());                              buf.append('\x1f');
+        buf.append(QByteArray::number(t.amount, 'f', 8));        buf.append('\x1f');
+        buf.append(QByteArray::number((qulonglong)t.confirmations)); buf.append('\x1f');
+        buf.append(t.fromAddr.toUtf8());                          buf.append('\x1f');
+        buf.append(t.memo.toUtf8());                              buf.append('\x1e');
+    }
+    return QCryptographicHash::hash(buf, QCryptographicHash::Sha1);
+}
+
 TxTableModel::~TxTableModel() {
     delete modeldata;
     delete tTrans;
@@ -15,6 +39,13 @@ TxTableModel::~TxTableModel() {
 }
 
 void TxTableModel::addZSentData(const QList<TransactionItem>& data) {
+    // PERF (Phase 4 Win 2): if this source is byte-identical to what we last applied,
+    // skip the whole rebuild (no model signals -> no flicker, no per-poll CPU).
+    QByteArray fp = fingerprint(data);
+    if (fp == lastZsFingerprint)
+        return;
+    lastZsFingerprint = fp;
+
     delete zsTrans;
     zsTrans = new QList<TransactionItem>();
     std::copy(data.begin(), data.end(), std::back_inserter(*zsTrans));
@@ -23,6 +54,11 @@ void TxTableModel::addZSentData(const QList<TransactionItem>& data) {
 }
 
 void TxTableModel::addZRecvData(const QList<TransactionItem>& data) {
+    QByteArray fp = fingerprint(data);
+    if (fp == lastZrFingerprint)
+        return;
+    lastZrFingerprint = fp;
+
     delete zrTrans;
     zrTrans = new QList<TransactionItem>();
     std::copy(data.begin(), data.end(), std::back_inserter(*zrTrans));
@@ -32,6 +68,11 @@ void TxTableModel::addZRecvData(const QList<TransactionItem>& data) {
 
 
 void TxTableModel::addTData(const QList<TransactionItem>& data) {
+    QByteArray fp = fingerprint(data);
+    if (fp == lastTFingerprint)
+        return;
+    lastTFingerprint = fp;
+
     delete tTrans;
     tTrans = new QList<TransactionItem>();
     std::copy(data.begin(), data.end(), std::back_inserter(*tTrans));

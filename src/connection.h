@@ -283,43 +283,91 @@ public:
 
     void showTxError(const QString& error);
 
-    // Batch method. Note: Because of the template, it has to be in the header file. 
+    // Batch method. Note: Because of the template, it has to be in the header file.
     template<class T>
     void doBatchRPC(const QList<T>& payloads,
                      std::function<json(T)> payloadGenerator,
-                     std::function<void(QMap<T, json>*)> cb) {    
-        auto responses = new QMap<T, json>(); // zAddr -> list of responses for each call. 
+                     std::function<void(QMap<T, json>*)> cb) {
+        auto responses = new QMap<T, json>(); // zAddr -> list of responses for each call.
         int totalSize = payloads.size();
-        if (totalSize == 0)
+        if (totalSize == 0) {
+            // N==0: nothing to fetch. Honour the contract (caller still expects its
+            // cb with an allocated, empty map it then owns + deletes) and avoid a
+            // leak of `responses`. Queue it to the GUI thread so the call always
+            // returns to the caller first, exactly like the populated path below.
+            QTimer::singleShot(0, main, [=]() {
+                if (shutdownInProgress) {
+                    delete responses;
+                    return;
+                }
+                cb(responses);
+            });
             return;
+        }
 
-        // Keep track of all pending method calls, so as to prevent 
+        // PERF (Phase 4 Win 1): replace the old 100ms QTimer completion-poll with an
+        // atomic completion COUNTER. Every reply's finished() lambda increments it on
+        // BOTH the success AND the error branch; the lambda that takes the count to
+        // totalSize fires cb() exactly once. This removes up to 100ms of dead latency
+        // per batch (doubled where batches chain, e.g. refreshReceivedZTrans's
+        // z_listreceivedbyaddress -> gettransaction).
+        //
+        // THREAD-SAFETY: QNetworkAccessManager delivers every finished() signal on the
+        // GUI thread (the same thread this method runs on — `restclient` lives there and
+        // these are direct-connected auto signals), so these lambdas never run
+        // concurrently. A plain int behind a shared_ptr (captured by value, so it
+        // outlives this stack frame) is therefore sufficient; no real atomics needed.
+        auto completed = std::make_shared<int>(0);
+
+        // Keep track of all pending method calls, so as to prevent
         // any overlapping calls
         static QMap<QString, bool> inProgress;
 
         QString method = QString::fromStdString(payloadGenerator(payloads[0])["method"]);
-        //if (inProgress.value(method, false)) {
-        //    qDebug() << "In progress batch, skipping";
-        //    return;
-        //}
+        inProgress[method] = true;
+
+        // Single place that records one finished reply and, on the LAST one, fires cb.
+        // Must be called on EVERY terminal path of EVERY reply (success, network error,
+        // discarded body, shutdown) so the batch can never be left forever-incomplete.
+        auto finishOne = [=]() {
+            if (++(*completed) < totalSize)
+                return;
+
+            // Last reply just landed. Hand off to the caller. Queue to the GUI thread
+            // (singleShot(0)) so we first unwind out of this finished() slot before the
+            // caller's cb runs — cb may itself start another batch / delete objects,
+            // and leaving the slot first keeps that re-entrancy safe, matching the old
+            // timer-driven behaviour where cb never ran inside a reply's slot.
+            inProgress[method] = false;
+            QTimer::singleShot(0, main, [=]() {
+                if (shutdownInProgress) {
+                    delete responses;   // caller's cb would have owned + freed it
+                    return;
+                }
+                cb(responses);
+            });
+        };
 
         for (auto item: payloads) {
             json payload = payloadGenerator(item);
-            inProgress[method] = true;
-            
+
             QNetworkReply *reply = restclient->post(*request, QByteArray::fromStdString(payload.dump()));
 
             QObject::connect(reply, &QNetworkReply::finished, [=] {
                 reply->deleteLater();
                 if (shutdownInProgress) {
-                    // Ignoring callback because shutdown in progress
+                    // Shutdown in progress: still COUNT this reply so the batch can
+                    // complete (finishOne sees shutdownInProgress and frees the map
+                    // instead of calling cb). Without counting here a mid-shutdown
+                    // reply would strand the batch and leak `responses`.
+                    finishOne();
                     return;
                 }
-                
-                auto all = reply->readAll();            
+
+                auto all = reply->readAll();
                 auto parsed = json::parse(all.toStdString(), nullptr, false);
 
-                if (reply->error() != QNetworkReply::NoError) {            
+                if (reply->error() != QNetworkReply::NoError) {
                     qDebug() << QString::fromStdString(parsed.dump());
                     qDebug() << reply->errorString();
 
@@ -331,28 +379,13 @@ public:
                         (*responses)[item] = parsed["result"];
                     }
                 }
+
+                // CRITICAL: count this reply on EVERY non-shutdown path too (both the
+                // error and success branches above fall through to here). Missing this
+                // on any error branch would leave the batch one-short forever (hang).
+                finishOne();
             });
         }
-
-        auto waitTimer = new QTimer(main);
-        QObject::connect(waitTimer, &QTimer::timeout, [=]() {
-            if (shutdownInProgress) {
-                waitTimer->stop();
-                waitTimer->deleteLater();  
-                return;
-            }
-
-            // If all responses have arrived, return
-            if (responses->size() == totalSize) {
-                waitTimer->stop();
-                
-                cb(responses);
-                inProgress[method] = false;
-
-                waitTimer->deleteLater();            
-            }
-        });
-        waitTimer->start(100);    
     }
 
 private:
