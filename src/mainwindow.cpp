@@ -21,6 +21,14 @@
 #include <QSystemTrayIcon>
 #include <QCloseEvent>
 #include <QtNetwork/QTcpSocket>
+#include <QFrame>
+#include <QButtonGroup>
+#include <QAbstractButton>
+#include <QVBoxLayout>
+#include <QHBoxLayout>
+#include <QGridLayout>
+#include <QTabBar>
+#include <QSignalBlocker>
 
 using json = nlohmann::json;
 
@@ -129,6 +137,12 @@ MainWindow::MainWindow(QWidget *parent) :
     setupBalancesTab();
     setupTurnstileDialog();
     setupZClassicdTab();
+
+    // Phase-3a redesign (Quiet+): replace the top tab bar with a modern left
+    // nav rail. Built here, AFTER the tab pages are set up and the zclassicd tab
+    // has been removed (above), so the rail's primary destinations map to the
+    // live tab indices (Home/Balance 0, Send 1, Receive 2, Activity 3).
+    setupNavRail();
 
     rpc = new RPC(this);
 
@@ -577,6 +591,146 @@ void MainWindow::setupSyncBanner() {
 
     // Start in the neutral "connecting" state.
     setSyncStatusConnecting();
+}
+
+// Phase-3a redesign (Quiet+): the modern left vertical NAV RAIL.
+//
+// LOW-RISK, PROGRAMMATIC build — no .ui structural change. We DO NOT remove,
+// rename, or recreate any widget, and we DO NOT swap the QTabWidget for a
+// QStackedWidget. Instead:
+//   * The QTabWidget keeps all of its pages/objectNames; we only HIDE its
+//     tabBar(). Pages remain index-selectable (setCurrentIndex still works), so
+//     the L0/L1 harness — which drives Receive radios on tab_3 directly and
+//     never touches the now-hidden tabBar — stays green.
+//   * We build a QFrame#navRail of flat, checkable QPushButtons in an EXCLUSIVE
+//     QButtonGroup, each wired to ui->tabWidget->setCurrentIndex(idx).
+//   * We re-parent the central content into a horizontal layout
+//     [ navRail | tabWidget ] by inserting the rail at column 0 of the existing
+//     centralWidget grid (gridLayout_3) and moving the tabWidget to column 1.
+//   * syncBanner is a child of ui->tab (the Balance page) and sits ABOVE that
+//     page's content via gridLayout_2; it is unaffected and stays above the
+//     content, spanning the content column (not the rail), exactly as required.
+void MainWindow::setupNavRail() {
+    // 1) Hide the tab bar — pages stay; index selection still works.
+    ui->tabWidget->tabBar()->hide();
+    // The pane border/top-padding was sized for the (now hidden) tab strip; with
+    // the rail driving navigation, drop the document-mode chrome so page content
+    // sits flush against the rail.
+    ui->tabWidget->setDocumentMode(true);
+
+    // 2) Build the rail frame + its vertical layout.
+    auto* navRail = new QFrame(ui->centralWidget);
+    navRail->setObjectName("navRail");
+    navRail->setFrameShape(QFrame::NoFrame);
+    navRail->setFixedWidth(168);   // ~150-190px, on the 8px grid (21*8)
+
+    auto* railLayout = new QVBoxLayout(navRail);
+    railLayout->setContentsMargins(8, 16, 8, 16);
+    railLayout->setSpacing(6);
+
+    // 3) Exclusive group so exactly one destination is highlighted at a time.
+    navRailGroup = new QButtonGroup(this);
+    navRailGroup->setExclusive(true);
+
+    // Helper: a large, flat, checkable rail button bound to a tab index.
+    auto makeRailButton = [&](const QString& label, int tabIndex,
+                              const QString& extraObjName = QString()) -> QPushButton* {
+        auto* btn = new QPushButton(label, navRail);
+        btn->setObjectName(extraObjName.isEmpty() ? "navRailButton" : extraObjName);
+        btn->setCheckable(true);
+        btn->setFlat(true);
+        btn->setCursor(Qt::PointingHandCursor);
+        btn->setProperty("navrail", true);   // qss hook: QPushButton[navrail="true"]
+        btn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        navRailGroup->addButton(btn, tabIndex);
+        railLayout->addWidget(btn);
+        QObject::connect(btn, &QPushButton::clicked, [this, tabIndex]() {
+            ui->tabWidget->setCurrentIndex(tabIndex);
+        });
+        return btn;
+    };
+
+    // 4) Primary destinations, in human order. Indices are the LIVE tabWidget
+    //    indices at this point (zclassicd already removed): Balance 0, Send 1,
+    //    Receive 2, Transactions 3.
+    makeRailButton(tr("Home"),     0);   // Balance
+    makeRailButton(tr("Send"),     1);
+    makeRailButton(tr("Receive"),  2);
+    makeRailButton(tr("Activity"), 3);   // Transactions
+
+    // Spacer pushes the demoted "Advanced" gear to the BOTTOM of the rail.
+    railLayout->addStretch(1);
+
+    // 5) Demoted node-stats page ("zclassicd") as a small gear at the bottom.
+    //    That page is added to the tabWidget LATER (rpc.cpp, when the embedded
+    //    node starts) and lives at whatever index it then occupies, so resolve
+    //    its index dynamically on click. It is NOT in the exclusive primary
+    //    group's check-sync set above; we give it its own checkable button and
+    //    add it to the same group so selecting it clears the others.
+    auto* advBtn = new QPushButton(tr("⚙  Advanced"), navRail);
+    advBtn->setObjectName("navRailAdvanced");
+    advBtn->setCheckable(true);
+    advBtn->setFlat(true);
+    advBtn->setCursor(Qt::PointingHandCursor);
+    advBtn->setProperty("navrail", true);
+    advBtn->setProperty("navrailadv", true);   // qss hook for the smaller gear
+    advBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    // Use a high group id so it never collides with a primary tab index.
+    navRailGroup->addButton(advBtn, 1000);
+    railLayout->addWidget(advBtn);
+    QObject::connect(advBtn, &QPushButton::clicked, [this]() {
+        // Find the zclassicd page in the live tabWidget; switch to it if present.
+        int idx = ui->tabWidget->indexOf(zclassicdtab);
+        if (idx >= 0)
+            ui->tabWidget->setCurrentIndex(idx);
+    });
+
+    // 6) Keep the rail's checked state synced to the CURRENT tab index, from any
+    //    source (rail click, code-driven setCurrentIndex in sendButton/receive
+    //    flows, or the zclassicd tab being added/removed at runtime).
+    QObject::connect(ui->tabWidget, &QTabWidget::currentChanged, this, [this](int idx) {
+        if (!navRailGroup) return;
+        int advIdx = ui->tabWidget->indexOf(zclassicdtab);
+        QAbstractButton* match = nullptr;
+        if (advIdx >= 0 && idx == advIdx) {
+            match = navRailGroup->button(1000);          // Advanced
+        } else {
+            match = navRailGroup->button(idx);            // a primary destination
+        }
+        if (match && !match->isChecked()) {
+            // Toggle without re-emitting a navigation click.
+            QSignalBlocker block(navRailGroup);
+            match->setChecked(true);
+        }
+    });
+
+    // 7) Re-parent: make the central layout horizontal — [ navRail | tabWidget ].
+    //    gridLayout_3 currently holds tabWidget at (0,0). Move it to (0,1) and
+    //    drop the rail in at (0,0). We move the EXISTING tabWidget, not a copy.
+    auto* central = qobject_cast<QGridLayout*>(ui->centralWidget->layout());
+    if (central) {
+        central->removeWidget(ui->tabWidget);
+        central->setContentsMargins(0, 0, 0, 0);
+        central->setSpacing(0);
+        central->addWidget(navRail,       0, 0);
+        central->addWidget(ui->tabWidget, 0, 1);
+        central->setColumnStretch(0, 0);   // rail: fixed width
+        central->setColumnStretch(1, 1);   // content: takes the rest
+    } else {
+        // Fallback (shouldn't happen given the .ui): wrap in a fresh HBox.
+        auto* hbox = new QHBoxLayout(ui->centralWidget);
+        hbox->setContentsMargins(0, 0, 0, 0);
+        hbox->setSpacing(0);
+        hbox->addWidget(navRail);
+        hbox->addWidget(ui->tabWidget, 1);
+    }
+
+    // 8) Open on Home (Balance, index 0) — not Receive. Check the Home button to
+    //    match. (The .ui's currentIndex=2 default is overridden here and by the
+    //    ctor's setCurrentIndex(0).)
+    ui->tabWidget->setCurrentIndex(0);
+    if (auto* home = navRailGroup->button(0))
+        home->setChecked(true);
 }
 
 // P0-6: called from rpc.cpp's getblockchaininfo poll on every refresh.

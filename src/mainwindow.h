@@ -11,6 +11,8 @@
 class RPC;
 class Settings;
 class QSystemTrayIcon;
+class QButtonGroup;
+class QPushButton;
 
 using json = nlohmann::json;
 
@@ -164,6 +166,14 @@ private:
     void setupSettingsModal();
     void setupStatusBar();
     void setupSyncBanner();
+
+    // Phase-3a redesign (Quiet+): a modern left vertical NAV RAIL of large
+    // checkable buttons that drive ui->tabWidget->setCurrentIndex(). Built
+    // PROGRAMMATICALLY (no .ui structural change): the QTabWidget and all its
+    // pages/objectNames are kept intact underneath; only its tabBar is hidden,
+    // so every page stays index-selectable (L0/L1 tests untouched).
+    void setupNavRail();
+    QButtonGroup* navRailGroup = nullptr;
 
     // SINGLE destructive launch path shared by the Help -> Repair action and the
     // runtime stub auto-heal: stop the embedded node, then drive a fresh

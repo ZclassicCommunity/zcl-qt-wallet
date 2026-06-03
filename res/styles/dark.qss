@@ -132,6 +132,49 @@ QCheckBox::indicator:checked { background: #1f7a1f; border-color: #1f7a1f; }
 QRadioButton::indicator { border: 1px solid #3d4450; border-radius: 9px; background: #15171c; }
 QRadioButton::indicator:checked { background: #1f7a1f; border-color: #1f7a1f; }
 
+/* ============================================================================
+ * Phase 3a: modern left NAV RAIL (Quiet+).
+ * A slightly darker rail surface on the left, with large flat checkable buttons
+ * built programmatically (mainwindow.cpp setupNavRail). The selected button is
+ * highlighted with the green #1f7a1f accent via a left border + tinted surface.
+ * Tab bar itself is hidden in code; pages stay index-selectable.
+ * ============================================================================ */
+QFrame#navRail {
+    background-color: #101216;            /* a touch darker than the base surface */
+    border-right: 1px solid #2a2e37;
+}
+/* The QTabWidget content sits flush to the rail (documentMode is on in code). */
+QFrame#navRail QPushButton[navrail="true"] {
+    background: transparent;
+    color: #9aa0a6;
+    border: none;
+    border-left: 3px solid transparent;   /* reserve the accent gutter */
+    border-radius: 8px;
+    padding: 12px 12px 12px 13px;          /* 8px grid; left a touch tighter for the gutter */
+    margin: 0px;
+    text-align: left;
+    font-size: 13pt;
+    font-weight: 600;
+}
+QFrame#navRail QPushButton[navrail="true"]:hover {
+    background-color: #1a1d23;
+    color: #e6e6e6;
+}
+QFrame#navRail QPushButton[navrail="true"]:checked {
+    background-color: rgba(31, 122, 31, 0.18);   /* tinted green surface */
+    color: #ffffff;
+    border-left: 3px solid #1f7a1f;              /* green accent gutter */
+}
+/* The demoted "Advanced" gear: smaller + dimmer, bottom of the rail. */
+QFrame#navRail QPushButton[navrailadv="true"] {
+    font-size: 11pt;
+    font-weight: 500;
+    color: #6b7177;
+    padding: 9px 12px 9px 13px;
+}
+QFrame#navRail QPushButton[navrailadv="true"]:hover  { color: #9aa0a6; }
+QFrame#navRail QPushButton[navrailadv="true"]:checked { color: #e6e6e6; }
+
 /* ---- scrollbars ---- */
 QScrollBar:vertical   { background: transparent; width: 12px; margin: 2px; }
 QScrollBar:horizontal { background: transparent; height: 12px; margin: 2px; }
