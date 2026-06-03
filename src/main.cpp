@@ -9,6 +9,7 @@
 #include "version.h"
 
 #include <QtNetwork/QTcpSocket>
+#include <QPalette>   // Quiet+ redesign Phase 1: dark palette (pulls in QColor)
 
 // ----------------------------------------------------------------------------
 // Idiot-proof launch helpers (Wayland-survive + never-spawn-a-duplicate-node).
@@ -254,10 +255,53 @@ public:
         QIcon icon(":/icons/res/icon.ico");
         QApplication::setWindowIcon(icon);
 
-        #ifdef Q_OS_LINUX
-            QFontDatabase::addApplicationFont(":/fonts/res/Ubuntu-R.ttf");
-            qApp->setFont(QFont("Ubuntu", 11, QFont::Normal, false));
-        #endif
+        // ---- Modern theme (Quiet+ redesign, Phase 1) ----
+        // Fusion renders QSS consistently on Windows/macOS/static-Linux (the native
+        // styles ignore much of our stylesheet). Applied before MainWindow is built.
+        QApplication::setStyle("Fusion");
+
+        // Bundled Ubuntu face on ALL platforms now (was Linux-only) at a bigger 13pt
+        // base for a more readable, cross-platform-consistent type baseline. High-DPI
+        // scaling (enabled above) keeps point sizes crisp on every monitor.
+        QFontDatabase::addApplicationFont(":/fonts/res/Ubuntu-R.ttf");
+        {
+            QFont baseFont("Ubuntu", 13);
+            baseFont.setStyleStrategy(QFont::PreferAntialias);
+            qApp->setFont(baseFont);
+        }
+
+        // Dark palette (privacy-forward identity) for the non-QSS-styled bits
+        // (tooltips, disabled text, selection) so nothing falls back to a light look.
+        {
+            QPalette pal;
+            const QColor base("#15171c"), surface("#1d2027"), text("#e6e6e6"),
+                         dim("#9aa0a6"), accent("#1f7a1f");
+            pal.setColor(QPalette::Window,          base);
+            pal.setColor(QPalette::WindowText,      text);
+            pal.setColor(QPalette::Base,            surface);
+            pal.setColor(QPalette::AlternateBase,   base);
+            pal.setColor(QPalette::Text,            text);
+            pal.setColor(QPalette::Button,          surface);
+            pal.setColor(QPalette::ButtonText,      text);
+            pal.setColor(QPalette::BrightText,      QColor("#ffffff"));
+            pal.setColor(QPalette::ToolTipBase,     surface);
+            pal.setColor(QPalette::ToolTipText,     text);
+            pal.setColor(QPalette::Highlight,       accent);
+            pal.setColor(QPalette::HighlightedText, QColor("#ffffff"));
+            pal.setColor(QPalette::Link,            QColor("#5ea1e0"));
+            pal.setColor(QPalette::PlaceholderText, dim);
+            pal.setColor(QPalette::Disabled, QPalette::Text,       dim);
+            pal.setColor(QPalette::Disabled, QPalette::ButtonText, dim);
+            pal.setColor(QPalette::Disabled, QPalette::WindowText, dim);
+            qApp->setPalette(pal);
+        }
+
+        // Central stylesheet: single source of truth for the modern look + type scale.
+        {
+            QFile qssFile(":/styles/res/styles/dark.qss");
+            if (qssFile.open(QFile::ReadOnly | QFile::Text))
+                qApp->setStyleSheet(QString::fromUtf8(qssFile.readAll()));
+        }
 
         // QRandomGenerator generates a secure random number, which we use to seed.
     #if (QT_VERSION >= QT_VERSION_CHECK(5, 10, 0))
