@@ -581,8 +581,21 @@ void MainWindow::setupSyncBanner() {
     syncProgressBar->setMaximumWidth(300);
     syncProgressBar->setVisible(false);
 
+    // Polish P0-2: the QUIET "Synced" inline pill. At rest, green lives on the
+    // balance (the hero), not the chrome — so a fully-synced node shows this quiet
+    // 24px pill (green dot + "Synced" in dim text) and the full-width colored
+    // banner is hidden. The full-width banner is reserved for syncing/error
+    // states only. setSyncStatus() swaps between the two.
+    syncQuietPill = new QLabel(syncBanner);
+    syncQuietPill->setObjectName("syncQuietPill");
+    syncQuietPill->setTextFormat(Qt::RichText);
+    syncQuietPill->setText(tr("<span style=\"color:#34c759;\">●</span>&nbsp;&nbsp;Synced"));
+    syncQuietPill->setVisible(false);
+
     bannerLayout->addWidget(syncStatusLabel, 1);
     bannerLayout->addWidget(syncProgressBar, 0);
+    bannerLayout->addWidget(syncQuietPill, 0);
+    bannerLayout->addStretch(0);
 
     // Move the existing balances content (horizontalLayout_5) down to row 1 and
     // place the banner on row 0. takeAt(0) is safe: gridLayout_2 has one item.
@@ -650,9 +663,19 @@ void MainWindow::setupHomeDashboard() {
     homeHeroTotal = new QLabel(QString(), hero);
     homeHeroTotal->setObjectName("homeHeroTotal");
 
+    // Polish P1/UX-22: a one-line friendly helper, shown ONLY when the balance is
+    // zero ("Your private balance — receive ZCL to get started"). Hidden once the
+    // wallet is funded (updateHomeFixIt toggles it).
+    homeHeroHelper = new QLabel(
+        tr("Your private balance — receive ZCL to get started."), hero);
+    homeHeroHelper->setObjectName("homeHeroHelper");
+    homeHeroHelper->setWordWrap(true);
+    homeHeroHelper->setVisible(false);
+
     heroV->addWidget(heroCaption);
     heroV->addWidget(homeHeroPrivate);
     heroV->addWidget(homeHeroTotal);
+    heroV->addWidget(homeHeroHelper);
 
     summaryVBox->insertWidget(insertAt++, hero);
 
@@ -671,6 +694,7 @@ void MainWindow::setupHomeDashboard() {
     sendBtn->setAutoDefault(false);                   // don't steal Enter on other pages
     sendBtn->setCursor(Qt::PointingHandCursor);
     sendBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    homeSendBtn = sendBtn;
 
     auto* recvBtn = new QPushButton(tr("Receive"), actions);
     recvBtn->setObjectName("homeReceiveBtn");
@@ -678,6 +702,7 @@ void MainWindow::setupHomeDashboard() {
     recvBtn->setAutoDefault(false);
     recvBtn->setCursor(Qt::PointingHandCursor);
     recvBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    homeReceiveBtn = recvBtn;
 
     actV->addWidget(sendBtn);
     actV->addWidget(recvBtn);
@@ -724,6 +749,23 @@ void MainWindow::setupHomeDashboard() {
     homeFixItCard->setVisible(false);   // hidden until a positive transparent balance
 
     summaryVBox->insertWidget(insertAt++, homeFixItCard);
+
+    // ---- 4) COLLAPSE the redundant Summary breakdown (Polish P1) ------------
+    // The balance was shown up to 4x (hero + Total subline + these standalone
+    // Shielded/Transparent/Total rows + the Address Balances table). The hero now
+    // leads with Private + a dim Total subline, and the per-address detail lives
+    // badge-tagged in Address Balances. So HIDE the standalone breakdown rows +
+    // their divider. We do NOT delete the balSheilded/balTransparent/balTotal
+    // labels — rpc.cpp still writes them and updateHomeFixIt() reads them back into
+    // the hero; they simply become hidden data carriers.
+    auto hideIfPresent = [](QWidget* w) { if (w) w->setVisible(false); };
+    hideIfPresent(ui->label);            // "Shielded" caption
+    hideIfPresent(ui->balSheilded);
+    hideIfPresent(ui->label_2);          // "Transparent" caption
+    hideIfPresent(ui->balTransparent);
+    hideIfPresent(ui->label_3);          // "Total" caption
+    hideIfPresent(ui->balTotal);
+    hideIfPresent(ui->line);             // the divider above Total
 }
 
 // Phase-3b: keep the Home dashboard in step with the live balances. Called from
@@ -740,6 +782,29 @@ void MainWindow::updateHomeFixIt(double transparent) {
         homeHeroPrivate->setText(ui->balSheilded->text());
     if (homeHeroTotal)
         homeHeroTotal->setText(tr("Total %1").arg(ui->balTotal->text()));
+
+    // Polish P1/UX-22: friendly empty-state helper under the hero when the wallet
+    // has nothing yet. Parse the canonical Total label (e.g. "0 ZCL"); show the
+    // helper only at true-zero. Make Receive the primary action when balance == 0
+    // (see the quick-action swap below).
+    const bool isEmpty = ui->balTotal->text().trimmed().startsWith("0 ")
+                      || ui->balTotal->text().trimmed() == "0"
+                      || ui->balTotal->text().trimmed().isEmpty();
+    if (homeHeroHelper)
+        homeHeroHelper->setVisible(isEmpty);
+    if (homeSendBtn && homeReceiveBtn) {
+        // When empty, Receive becomes primary (green) and Send is demoted; once
+        // funded, Send leads again. Property "homeaction" drives the qss + default.
+        homeSendBtn->setDefault(!isEmpty);
+        homeReceiveBtn->setDefault(isEmpty);
+        homeSendBtn->setProperty("homeaction", isEmpty ? "secondary" : "primary");
+        homeReceiveBtn->setProperty("homeaction", isEmpty ? "primary" : "secondary");
+        // Re-polish so the property change repaints (Qt caches computed style).
+        homeSendBtn->style()->unpolish(homeSendBtn);
+        homeSendBtn->style()->polish(homeSendBtn);
+        homeReceiveBtn->style()->unpolish(homeReceiveBtn);
+        homeReceiveBtn->style()->polish(homeReceiveBtn);
+    }
 
     if (homeFixItCard == nullptr) return;
 
@@ -999,14 +1064,22 @@ void MainWindow::setSyncStatus(bool isSyncing, int blockNumber, int estimatedHei
     if (syncBanner == nullptr) return;
 
     if (!isSyncing) {
-        // Fully caught up: unmistakable green "ready" state.
+        // Fully caught up. Polish P0-2: DON'T shout a full-width green bar at rest.
+        // Hide the loud banner content + drop the colored fill (transparent), and
+        // show the quiet inline "● Synced" pill. Green lives on the balance hero.
         syncEtaStarted = false;
         syncProgressBar->setVisible(false);
         syncProgressBar->setRange(0, 100);   // reset in case it was indeterminate
-        syncStatusLabel->setText(tr("✓ Synced — Ready to use"));
-        syncBanner->setStyleSheet("QWidget { background-color: #1f7a1f; } QLabel { color: white; }");
+        syncStatusLabel->setVisible(false);
+        if (syncQuietPill) syncQuietPill->setVisible(true);
+        syncBanner->setStyleSheet("QWidget { background-color: transparent; }");
         return;
     }
+
+    // Any syncing/error/connecting state: the full-width colored banner is the
+    // indicator, so the quiet pill steps aside and the bold label comes back.
+    if (syncQuietPill) syncQuietPill->setVisible(false);
+    syncStatusLabel->setVisible(true);
 
     // Indeterminate: we are syncing but have no usable target yet (e.g. the node's
     // header height isn't known on the first poll). Show a busy bar and a friendly
@@ -1081,6 +1154,8 @@ void MainWindow::setSyncStatusConnecting() {
     if (syncBanner == nullptr) return;
     syncEtaStarted = false;
     syncProgressBar->setVisible(false);
+    if (syncQuietPill) syncQuietPill->setVisible(false);
+    syncStatusLabel->setVisible(true);
     syncStatusLabel->setText(tr("Connecting to your ZClassic node…"));
     syncBanner->setStyleSheet("QWidget { background-color: #555555; } QLabel { color: white; }");
 }
@@ -1091,6 +1166,8 @@ void MainWindow::setSyncStatusConnecting() {
 void MainWindow::setSyncStatusWaitingForPeers(bool longStretch) {
     if (syncBanner == nullptr) return;
     syncEtaStarted = false;
+    if (syncQuietPill) syncQuietPill->setVisible(false);
+    syncStatusLabel->setVisible(true);
     syncProgressBar->setVisible(false);
     syncProgressBar->setRange(0, 100);   // reset in case it was indeterminate
     if (longStretch)
@@ -1107,6 +1184,8 @@ void MainWindow::setSyncStatusWaitingForPeers(bool longStretch) {
 void MainWindow::setSyncStatusBootstrapSnapshot(int pct, qint64 received, qint64 total, double mbps) {
     if (syncBanner == nullptr) return;
     syncEtaStarted = false;
+    if (syncQuietPill) syncQuietPill->setVisible(false);
+    syncStatusLabel->setVisible(true);
     if (pct < 0)   pct = 0;
     if (pct > 100) pct = 100;
     syncProgressBar->setVisible(true);
@@ -1135,6 +1214,8 @@ void MainWindow::setBootstrapValidationBanner(const QString& msg) {
     if (syncBanner == nullptr) return;
     if (msg.isEmpty())
         return;   // nothing to show; leave whatever setSyncStatus painted this tick
+    if (syncQuietPill) syncQuietPill->setVisible(false);
+    syncStatusLabel->setVisible(true);
     syncProgressBar->setVisible(false);
     syncStatusLabel->setText(msg);
     syncBanner->setStyleSheet("QWidget { background-color: #2c5d8f; } QLabel { color: white; }");
@@ -2246,14 +2327,22 @@ void MainWindow::setupRecieveTab() {
             addNewTAddr();
         }
         if (checked) {
-            // Transparent addresses are PUBLIC -- make that impossible to miss.
-            // Reuses the existing red warning label (the Sapling/Sprout branches set
-            // their own text/visibility), so no new widget is needed.
+            // Transparent addresses are PUBLIC -- make that impossible to miss, but as
+            // a calm CALLOUT (Polish P1), not a red crash message. Amber = PUBLIC
+            // everywhere; red is reserved for de-shield. The qss [callout="public"]
+            // rule supplies the tinted bg + amber left-accent + lighter body color;
+            // a warning-triangle icon + a bold "PUBLIC" carry the emphasis. The copy
+            // ("Transparent address.", "PUBLIC", "permanently visible") is preserved
+            // for the D-series assertions.
+            ui->lblSproutWarning->setProperty("callout", "public");
+            ui->lblSproutWarning->setStyleSheet("");   // drop the legacy inline color:red
             ui->lblSproutWarning->setText(tr(
-                "<html><head/><body><p><b>Transparent address.</b> This address and any "
+                "<html><head/><body><p>⚠  <b>Transparent address.</b> This address and any "
                 "balance it holds are <b>PUBLIC</b> and permanently visible to everyone "
                 "on the blockchain. For privacy, receive to a shielded (z) address "
                 "instead.</p></body></html>"));
+            ui->lblSproutWarning->style()->unpolish(ui->lblSproutWarning);
+            ui->lblSproutWarning->style()->polish(ui->lblSproutWarning);
             ui->lblSproutWarning->setVisible(true);
         }
     });
@@ -2338,93 +2427,30 @@ void MainWindow::setupRecieveTab() {
         }
     });
 
-    // Validator for label
-    QRegExpValidator* v = new QRegExpValidator(QRegExp(Settings::labelRegExp), ui->rcvLabel);
-    ui->rcvLabel->setValidator(v);
-
-    // Select item in address list
-    QObject::connect(ui->listRecieveAddresses, 
+    // Select item in address list. Polish P0-3: the legacy lower form (the second
+    // Label/Update-Label row, the "Address balance" row, and the one-click Export
+    // Private Key button) is GONE — only the address text box + QR remain, folded
+    // into the "Receive privately" card. So this handler now only mirrors the
+    // selected address into txtRecieve + the QR.
+    QObject::connect(ui->listRecieveAddresses,
         QOverload<int>::of(&QComboBox::currentIndexChanged), [=] (int index) {
         QString addr = ui->listRecieveAddresses->itemText(index);
         if (addr.isEmpty()) {
-            // Draw empty stuff
-
-            ui->rcvLabel->clear();
-            ui->rcvBal->clear();
             ui->txtRecieve->clear();
             ui->qrcodeDisplay->clear();
             return;
         }
 
-        auto label = AddressBook::getInstance()->getLabelForAddress(addr);
-        if (label.isEmpty()) {
-            ui->rcvUpdateLabel->setText("Add Label");
-        }
-        else {
-            ui->rcvUpdateLabel->setText("Update Label");
-        }
-        
-        ui->rcvLabel->setText(label);
-        ui->rcvBal->setText(Settings::getZCLUSDDisplayFormat(rpc->getAllBalances()->value(addr)));
-        ui->txtRecieve->setPlainText(addr);       
+        ui->txtRecieve->setPlainText(addr);
         ui->qrcodeDisplay->setQrcodeString(addr);
-        if (rpc->getUsedAddresses()->value(addr, false)) {
-            ui->rcvBal->setToolTip(tr("Address has been previously used"));
-        } else {
-            ui->rcvBal->setToolTip(tr("Address is unused"));
-        }
-        
-    });    
-
-    // Receive tab add/update label
-    QObject::connect(ui->rcvUpdateLabel, &QPushButton::clicked, [=]() {
-        QString addr = ui->listRecieveAddresses->currentText();
-        if (addr.isEmpty())
-            return;
-
-        auto curLabel = AddressBook::getInstance()->getLabelForAddress(addr);
-        auto label = ui->rcvLabel->text().trimmed();
-
-        if (curLabel == label)  // Nothing to update
-            return;
-
-        QString info;
-
-        if (!curLabel.isEmpty() && label.isEmpty()) {
-            info = "Removed Label '" % curLabel % "'";
-            AddressBook::getInstance()->removeAddressLabel(curLabel, addr);
-        }
-        else if (!curLabel.isEmpty() && !label.isEmpty()) {
-            info = "Updated Label '" % curLabel % "' to '" % label % "'";
-            AddressBook::getInstance()->updateLabel(curLabel, addr, label);
-        }
-        else if (curLabel.isEmpty() && !label.isEmpty()) {
-            info = "Added Label '" % label % "'";
-            AddressBook::getInstance()->addAddressLabel(label, addr);
-        }
-
-        // Update labels everywhere on the UI
-        updateLabels();
-
-        // Show the user feedback
-        if (!info.isEmpty()) {
-            QMessageBox::information(this, "Label", info, QMessageBox::Ok);
-        }
-    });
-
-    // Recieve Export Key
-    QObject::connect(ui->exportKey, &QPushButton::clicked, [=]() {
-        QString addr = ui->listRecieveAddresses->currentText();
-        if (addr.isEmpty())
-            return;
-
-        this->exportKeys(addr);
     });
 
     // Phase-3c: private-by-default IA. Build the disclosure LAST so it can reparent
     // the now-fully-wired radios into the collapsible advanced panel and bring the
     // page to its private resting view. Done after all the toggle handlers above
-    // are connected so reparenting never drops a connection.
+    // are connected so reparenting never drops a connection. The disclosure setup
+    // also frames the QR (P0-5), adds the primary Copy button (P1/UX-24), and hangs
+    // the demoted "Export private key" action behind the advanced panel (P0-4).
     setupReceivePrivacyDisclosure();
 }
 
@@ -2495,6 +2521,11 @@ void MainWindow::setupReceivePrivacyDisclosure() {
     radiosRow->addWidget(ui->rdioZAddr);
     radiosRow->addStretch(1);
 
+    // Polish P1: the transparent (t-Addr) radio dot must be AMBER, not green — color
+    // always equals privacy state. The qss [public="true"] selector recolors it.
+    ui->rdioTAddr->setProperty("public", true);
+    ui->rdioTAddr->setText(tr("t-Addr (PUBLIC)"));
+
     // rdioZSAddr is reparented too (so it lives with its peers in one button group
     // container) but stays hidden — selecting it IS the private resting view.
     ui->rdioZSAddr->setParent(receiveAdvancedPanel);
@@ -2503,7 +2534,83 @@ void MainWindow::setupReceivePrivacyDisclosure() {
     panelV->addWidget(advCaption);
     panelV->addLayout(radiosRow);
 
+    // ---- Polish P0-4: EXPORT PRIVATE KEY lives ONLY here, behind the advanced
+    // disclosure, never on the resting Receive page (UX-19/KEY-1). It carries an
+    // explicit confirm (exportKeys() already pops a warning) for the currently
+    // selected address. Demoted styling (secondary button) + a clear caption.
+    auto* exportRow = new QHBoxLayout();
+    exportRow->setContentsMargins(0, 6, 0, 0);
+    exportRow->setSpacing(8);
+    auto* btnExportKey = new QPushButton(tr("Export private key…"), receiveAdvancedPanel);
+    btnExportKey->setObjectName("btnReceiveExportKey");
+    btnExportKey->setCursor(Qt::PointingHandCursor);
+    btnExportKey->setToolTip(tr(
+        "Reveals the spending key for the selected address. Anyone with this key can "
+        "spend its funds — only do this on a private screen."));
+    QObject::connect(btnExportKey, &QPushButton::clicked, [this]() {
+        QString addr = ui->listRecieveAddresses->currentText();
+        if (addr.isEmpty())
+            return;
+        this->exportKeys(addr);   // pops the explicit "these keys are the money" confirm
+    });
+    exportRow->addWidget(btnExportKey, 0, Qt::AlignLeft);
+    exportRow->addStretch(1);
+    panelV->addLayout(exportRow);
+
     receiveAdvancedPanel->setVisible(false);   // collapsed at rest
+
+    // ---- Polish P1/UX-24: a primary "Copy" button adjacent to the address, and
+    // New Address demoted to a secondary button. Copy is the most common Receive
+    // action. horizontalLayout_10 is [combo][New Address]; insert Copy before New
+    // Address and restyle New Address as secondary.
+    if (ui->btnRecieveNewAddr) {
+        auto* btnCopy = new QPushButton(tr("Copy"), ui->groupBox_6);
+        btnCopy->setObjectName("btnReceiveCopy");
+        btnCopy->setCursor(Qt::PointingHandCursor);
+        btnCopy->setToolTip(tr("Copy this address to the clipboard"));
+        QObject::connect(btnCopy, &QPushButton::clicked, [this]() {
+            QString addr = ui->txtRecieve->toPlainText().trimmed();
+            if (addr.isEmpty())
+                addr = ui->listRecieveAddresses->currentText();
+            if (addr.isEmpty())
+                return;
+            QGuiApplication::clipboard()->setText(addr);
+            ui->statusBar->showMessage(tr("Address copied to clipboard"), 3 * 1000);
+        });
+        if (auto* combaRow = qobject_cast<QHBoxLayout*>(ui->horizontalLayout_10)) {
+            // Insert Copy right after the combo (index 1), before New Address.
+            combaRow->insertWidget(1, btnCopy);
+        }
+        // Demote "New Address" to a secondary look (Copy is the primary action).
+        ui->btnRecieveNewAddr->setProperty("homeaction", "secondary");
+    }
+
+    // ---- Polish P0-5: FRAME the QR in a rounded card on the dark surface,
+    // instead of an edge-bleeding white slab. Wrap qrcodeDisplay in a #receiveQrCard
+    // QFrame (white bg, radius 12, 16px quiet-zone padding, 1px hairline) and center
+    // it in the right column with a fixed-ish footprint. The wrapper is spliced into
+    // horizontalLayout_11 in place of the bare qrcodeDisplay.
+    if (auto* recvRow = qobject_cast<QHBoxLayout*>(ui->horizontalLayout_11)) {
+        auto* qrCard = new QFrame(ui->groupBox_6);
+        qrCard->setObjectName("receiveQrCard");
+        qrCard->setFrameShape(QFrame::NoFrame);
+        qrCard->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+        auto* qrV = new QVBoxLayout(qrCard);
+        qrV->setContentsMargins(0, 0, 0, 0);
+        qrV->setSpacing(0);
+        ui->qrcodeDisplay->setParent(qrCard);
+        ui->qrcodeDisplay->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+        ui->qrcodeDisplay->setMinimumSize(200, 200);
+        ui->qrcodeDisplay->setMaximumSize(200, 200);
+        qrV->addWidget(ui->qrcodeDisplay);
+
+        // Wrap the card in a small column so it stays top-centered in the right side.
+        auto* qrCol = new QVBoxLayout();
+        qrCol->setContentsMargins(0, 0, 0, 0);
+        qrCol->addWidget(qrCard, 0, Qt::AlignHCenter | Qt::AlignTop);
+        qrCol->addStretch(1);
+        recvRow->addLayout(qrCol);
+    }
 
     // ---- 4) Splice everything in ABOVE the address-combo row ----------------
     // groupLayout currently: [0]=horizontalLayout_9 (now-empty radios row),

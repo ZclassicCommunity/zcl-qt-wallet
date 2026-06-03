@@ -113,6 +113,9 @@ public:
     QWidget*            syncBanner       = nullptr;
     QLabel*             syncStatusLabel  = nullptr;
     QProgressBar*       syncProgressBar  = nullptr;
+    // Polish P0-2: quiet inline "● Synced" pill shown at rest (full-width colored
+    // banner reserved for syncing/error). Swapped by setSyncStatus().
+    QLabel*             syncQuietPill    = nullptr;
 
     void setSyncStatus(bool isSyncing, int blockNumber, int estimatedHeight, double progress);
     void setSyncStatusConnecting();
@@ -235,8 +238,11 @@ private:
     void setupHomeDashboard();
     QLabel*      homeHeroPrivate   = nullptr;   // big private (shielded) number
     QLabel*      homeHeroTotal     = nullptr;   // secondary "Total NN ZCL"
+    QLabel*      homeHeroHelper    = nullptr;   // UX-22 zero-balance helper line
     QFrame*      homeFixItCard     = nullptr;   // amber card (hidden unless t>0)
     QLabel*      homeFixItText     = nullptr;   // "X ZCL is PUBLIC ..."
+    QPushButton* homeSendBtn       = nullptr;   // quick action (primary when funded)
+    QPushButton* homeReceiveBtn    = nullptr;   // quick action (primary when empty)
 
     // PRIV-18 — the REAL "Shield public funds" action, shared by the Home fix-it
     // card button and (conceptually) the balances context-menu "Shield balance to
