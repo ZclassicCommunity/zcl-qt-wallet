@@ -22,6 +22,9 @@
 #include <QCloseEvent>
 #include <QtNetwork/QTcpSocket>
 #include <QFrame>
+#include <QLabel>
+#include <QPushButton>
+#include <QFont>
 #include <QButtonGroup>
 #include <QAbstractButton>
 #include <QVBoxLayout>
@@ -173,6 +176,11 @@ void MainWindow::restoreSavedStates() {
         ui->balTransparent->setText(Settings::getZCLDisplayFormat(balT));
         ui->balSheilded   ->setText(Settings::getZCLDisplayFormat(balZ));
         ui->balTotal      ->setText(Settings::getZCLDisplayFormat(balTot));
+
+        // Phase-3b: paint the Home dashboard from the cached balances too, so the
+        // hero + fix-it card are correct during the warmup before the first live
+        // refresh (which calls this again via updateHomeFixIt).
+        updateHomeFixIt(balT);
 
         qint64 epoch = s.value("cache/lastSyncEpoch", (qint64) 0).toLongLong();
         if (epoch > 0) {
@@ -591,6 +599,155 @@ void MainWindow::setupSyncBanner() {
 
     // Start in the neutral "connecting" state.
     setSyncStatusConnecting();
+}
+
+// Phase-3b redesign (Quiet+): the modern Home DASHBOARD.
+//
+// LOW-RISK, PROGRAMMATIC build — no .ui structural change. We DO NOT remove,
+// rename, or recreate any widget; we ADD new widgets as children of the existing
+// Balance page (ui->tab) and prepend them into the Summary group's vertical
+// layout (verticalLayout, inside groupBox/gridLayout). The existing
+// balSheilded / balTransparent / balTotal labels (updated by rpc.cpp) are kept
+// intact and still drive everything: the HERO mirrors their text on each update.
+//
+// Three additive pieces, top-to-bottom inside the Summary group:
+//   1) a privacy-forward HERO — a big "Private balance NN ZCL" lead number with a
+//      smaller secondary "Total NN ZCL"; the private/shielded value is the visual
+//      lead (green accent), Total is dimmed.
+//   2) two large quick-action buttons — Send (green primary) + Receive (secondary)
+//      — that navigate via ui->tabWidget->setCurrentIndex (1 = Send, 2 = Receive);
+//      setupNavRail's currentChanged handler keeps the rail's checked state synced.
+//   3) an amber "Shield public funds" FIX-IT card, HIDDEN by default and surfaced
+//      only when transparent > 0 (see updateHomeFixIt). Its button navigates to the
+//      Send page for THIS phase (no auto-shield semantics here).
+void MainWindow::setupHomeDashboard() {
+    // The Summary group's content lives in verticalLayout (ui->verticalLayout),
+    // which holds the Shielded / Transparent / line / Total rows. We PREPEND our
+    // dashboard strip above those rows so the hero leads and the raw rows remain
+    // available below. If the layout can't be found (shouldn't happen given the
+    // .ui), bail out gracefully — the page still works with the original rows.
+    auto* summaryVBox = ui->verticalLayout;
+    if (summaryVBox == nullptr) return;
+
+    int insertAt = 0;   // prepend, in reverse order so the final order is correct
+
+    // ---- 1) HERO ------------------------------------------------------------
+    auto* hero = new QFrame(ui->tab);
+    hero->setObjectName("homeHero");
+    hero->setFrameShape(QFrame::NoFrame);
+    auto* heroV = new QVBoxLayout(hero);
+    heroV->setContentsMargins(16, 16, 16, 16);
+    heroV->setSpacing(4);
+
+    auto* heroCaption = new QLabel(tr("Private balance"), hero);
+    heroCaption->setObjectName("homeHeroCaption");
+
+    homeHeroPrivate = new QLabel(QString(), hero);
+    homeHeroPrivate->setObjectName("homeHeroPrivate");
+    homeHeroPrivate->setTextInteractionFlags(Qt::TextSelectableByMouse);
+
+    homeHeroTotal = new QLabel(QString(), hero);
+    homeHeroTotal->setObjectName("homeHeroTotal");
+
+    heroV->addWidget(heroCaption);
+    heroV->addWidget(homeHeroPrivate);
+    heroV->addWidget(homeHeroTotal);
+
+    summaryVBox->insertWidget(insertAt++, hero);
+
+    // ---- 2) QUICK ACTIONS ---------------------------------------------------
+    auto* actions = new QFrame(ui->tab);
+    actions->setObjectName("homeQuickActions");
+    actions->setFrameShape(QFrame::NoFrame);
+    auto* actV = new QHBoxLayout(actions);
+    actV->setContentsMargins(0, 0, 0, 8);
+    actV->setSpacing(8);
+
+    auto* sendBtn = new QPushButton(tr("Send"), actions);
+    sendBtn->setObjectName("homeSendBtn");
+    sendBtn->setProperty("homeaction", "primary");   // qss hook (green primary)
+    sendBtn->setDefault(true);                        // QPushButton:default look
+    sendBtn->setAutoDefault(false);                   // don't steal Enter on other pages
+    sendBtn->setCursor(Qt::PointingHandCursor);
+    sendBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+
+    auto* recvBtn = new QPushButton(tr("Receive"), actions);
+    recvBtn->setObjectName("homeReceiveBtn");
+    recvBtn->setProperty("homeaction", "secondary");  // qss hook (secondary)
+    recvBtn->setAutoDefault(false);
+    recvBtn->setCursor(Qt::PointingHandCursor);
+    recvBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+
+    actV->addWidget(sendBtn);
+    actV->addWidget(recvBtn);
+
+    // Nav rail maps Send = index 1, Receive = index 2. setCurrentIndex fires the
+    // tabWidget currentChanged handler installed by setupNavRail(), which re-syncs
+    // the rail's checked button — so the rail highlight follows automatically.
+    QObject::connect(sendBtn, &QPushButton::clicked, [this]() {
+        ui->tabWidget->setCurrentIndex(1);
+    });
+    QObject::connect(recvBtn, &QPushButton::clicked, [this]() {
+        ui->tabWidget->setCurrentIndex(2);
+    });
+
+    summaryVBox->insertWidget(insertAt++, actions);
+
+    // ---- 3) FIX-IT CARD (amber; hidden unless transparent > 0) --------------
+    homeFixItCard = new QFrame(ui->tab);
+    homeFixItCard->setObjectName("homeFixItCard");
+    homeFixItCard->setFrameShape(QFrame::NoFrame);
+    auto* cardV = new QVBoxLayout(homeFixItCard);
+    cardV->setContentsMargins(12, 12, 12, 12);
+    cardV->setSpacing(8);
+
+    homeFixItText = new QLabel(QString(), homeFixItCard);
+    homeFixItText->setObjectName("homeFixItText");
+    homeFixItText->setWordWrap(true);
+
+    auto* fixItBtn = new QPushButton(tr("Shield my public funds → private"), homeFixItCard);
+    fixItBtn->setObjectName("homeFixItBtn");
+    fixItBtn->setAutoDefault(false);
+    fixItBtn->setCursor(Qt::PointingHandCursor);
+    // THIS phase: navigate to Send only. NO auto-shield semantics here (that is a
+    // later, separately-tested phase) — do NOT wire getAutoShield/confirm here.
+    QObject::connect(fixItBtn, &QPushButton::clicked, [this]() {
+        ui->tabWidget->setCurrentIndex(1);
+    });
+
+    cardV->addWidget(homeFixItText);
+    cardV->addWidget(fixItBtn, 0, Qt::AlignLeft);
+
+    homeFixItCard->setVisible(false);   // hidden until a positive transparent balance
+
+    summaryVBox->insertWidget(insertAt++, homeFixItCard);
+}
+
+// Phase-3b: keep the Home dashboard in step with the live balances. Called from
+// rpc.cpp's refreshBalances() (and the cached-balance restore) right after the
+// balSheilded/balTransparent/balTotal labels are set, mirroring that pattern.
+//   * HERO: read back the freshly-set balSheilded (private) + balTotal label text
+//     so the big number always matches the canonical labels with no re-format.
+//   * FIX-IT card: visible ONLY when transparent > 0; the message names the exact
+//     public amount. A tiny epsilon guards against float dust below a displayable
+//     unit so a true-zero never shows the card.
+void MainWindow::updateHomeFixIt(double transparent) {
+    // Mirror the canonical labels into the hero (no-op if the dashboard isn't built).
+    if (homeHeroPrivate)
+        homeHeroPrivate->setText(ui->balSheilded->text());
+    if (homeHeroTotal)
+        homeHeroTotal->setText(tr("Total %1").arg(ui->balTotal->text()));
+
+    if (homeFixItCard == nullptr) return;
+
+    const bool hasPublic = transparent > 0.0000001;   // below a displayable unit => zero
+    if (hasPublic) {
+        if (homeFixItText)
+            homeFixItText->setText(
+                tr("%1 is PUBLIC and visible to everyone.")
+                    .arg(Settings::getZCLDisplayFormat(transparent)));
+    }
+    homeFixItCard->setVisible(hasPublic);
 }
 
 // Phase-3a redesign (Quiet+): the modern left vertical NAV RAIL.
@@ -1707,6 +1864,12 @@ void MainWindow::setupBalancesTab() {
 
     // P0-6: build the prominent sync banner that sits above the balances.
     setupSyncBanner();
+
+    // Phase-3b redesign (Quiet+): build the modern Home dashboard (hero + quick
+    // actions + hidden fix-it card) on this page, above the Summary rows. Purely
+    // additive (no .ui change); the fix-it card stays hidden until updateHomeFixIt
+    // is called from rpc.cpp with a positive transparent balance.
+    setupHomeDashboard();
 
     // Phase-2 redesign (privacy badges): install the PrivacyBadgeDelegate on the
     // balances table WITHOUT any .ui change. BalancesTableModel column layout

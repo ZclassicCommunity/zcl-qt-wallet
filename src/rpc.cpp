@@ -534,6 +534,10 @@ void RPC::noConnection() {
     ui->balTransparent->setToolTip("");
     ui->balTotal->setToolTip("");
 
+    // Phase-3b: with no connection there is no public balance to surface — clear the
+    // hero and hide the amber fix-it card (transparent == 0 hides it).
+    main->updateHomeFixIt(0.0);
+
     // Clear send tab from address
     ui->inputsCombo->clear();
 }
@@ -1101,6 +1105,12 @@ void RPC::refreshBalances() {
         ui->balSheilded   ->setToolTip(Settings::getUSDFormat(balZ));
         ui->balTransparent->setToolTip(Settings::getUSDFormat(balT));
         ui->balTotal      ->setToolTip(Settings::getUSDFormat(balTotal));
+
+        // Phase-3b: refresh the Home dashboard hero + amber "shield public funds"
+        // fix-it card from these same freshly-set balances. We pass the transparent
+        // amount we already have (balT) rather than re-querying; the hero reads the
+        // labels just set above. The card shows only when balT > 0, hides at 0.
+        main->updateHomeFixIt(balT);
 
         // Remember the last-known balances so the next launch can paint them
         // instantly while the node warms up (see MainWindow::restoreSavedStates).

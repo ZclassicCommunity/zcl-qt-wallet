@@ -82,6 +82,18 @@ public:
 
     void setSyncStatus(bool isSyncing, int blockNumber, int estimatedHeight, double progress);
     void setSyncStatusConnecting();
+
+    // Phase-3b redesign (Quiet+): the modern Home DASHBOARD on the Balance page.
+    // updateHomeFixIt() is called from rpc.cpp's refreshBalances() (and the cached-
+    // balance restore) on every balance update, mirroring the existing balSheilded/
+    // balTransparent/balTotal label-update pattern. It:
+    //   * refreshes the privacy-forward HERO (the big "Private balance" number,
+    //     read back from balSheilded, with the Total shown secondary), and
+    //   * shows/hides the amber "Shield public funds" FIX-IT card: visible ONLY when
+    //     transparent > 0, hidden when transparent == 0. The caller already has the
+    //     transparent amount (balT) and passes it here rather than re-querying.
+    // Public so the RPC poller can call it. No-op until setupHomeDashboard() has run.
+    void updateHomeFixIt(double transparent);
     // longStretch=true after a LONG peerless stretch (~3min): adds a stronger
     // "check your internet / try again later" hint (SELF-HEAL SYNCED-ZERO-PEERS).
     void setSyncStatusWaitingForPeers(bool longStretch = false);
@@ -174,6 +186,17 @@ private:
     // so every page stays index-selectable (L0/L1 tests untouched).
     void setupNavRail();
     QButtonGroup* navRailGroup = nullptr;
+
+    // Phase-3b redesign (Quiet+): build the Home DASHBOARD programmatically on the
+    // existing Balance page (no .ui change). Adds, above the existing Summary rows:
+    // a privacy-forward HERO ("Private balance" big + Total secondary), two large
+    // quick-action buttons (Send/Receive -> setCurrentIndex), and a hidden amber
+    // "Shield public funds" fix-it card surfaced by updateHomeFixIt() when t>0.
+    void setupHomeDashboard();
+    QLabel*      homeHeroPrivate   = nullptr;   // big private (shielded) number
+    QLabel*      homeHeroTotal     = nullptr;   // secondary "Total NN ZCL"
+    QFrame*      homeFixItCard     = nullptr;   // amber card (hidden unless t>0)
+    QLabel*      homeFixItText     = nullptr;   // "X ZCL is PUBLIC ..."
 
     // SINGLE destructive launch path shared by the Help -> Repair action and the
     // runtime stub auto-heal: stop the embedded node, then drive a fresh
