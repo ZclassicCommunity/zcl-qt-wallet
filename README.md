@@ -1,88 +1,47 @@
-ZclWallet is a z-Addr first, Sapling compatible wallet and full node for zclassicd that runs on Linux, Windows and macOS.
+ZClassic wallet — a z-addr-first, Sapling-compatible wallet with a **full ZClassic node built in**, for **Linux, Windows, and macOS**. One self-contained file: no separate node to install, no config, no command line.
 
 ![Screenshot](docs/screenshot-main.png?raw=true)
 ![Screenshots](docs/screenshot-sub.png?raw=true)
-# Installation
 
-Head over to the releases page and grab the latest installers or binary. https://github.com/ZClassicFoundation/zclwallet/releases
+# Download & run
 
-### Linux
+Grab the latest release: **https://github.com/ZclassicCommunity/zcl-qt-wallet/releases/latest**
 
-If you are on Debian/Ubuntu, please download the `.deb` package and install it.
+Download the **one** file for your computer and open it:
+
+| Your computer | Download | First-time open |
+|---|---|---|
+| **Windows** | `zclwallet-…-win64.exe` | Double-click. If you see **"Windows protected your PC"**, click **More info → Run anyway**. |
+| **macOS** (Apple Silicon) | `macOS-zclwallet-…dmg` | Open the `.dmg`, drag **ZclWallet** out, then **right-click the app → Open**. On **macOS 15+** if there's no "Open" button, go to **System Settings → Privacy & Security → Open Anyway**. (Signed ad-hoc, not Apple-notarized.) |
+| **Linux** | `linux-zclwallet-…` | `chmod +x linux-zclwallet-… && ./linux-zclwallet-…` — or right-click → Properties → *Allow executing as program*, then double-click. (glibc ≥ 2.29; no Qt install needed.) |
+
+On the **first launch** the wallet automatically downloads the zk-security-parameters and a blockchain snapshot (a few GB) from the network, showing a progress bar, then opens to your wallet. **That's the entire setup.** Your coins live in `wallet.dat`, which the app only ever *backs up* — never modifies.
+
+Verify a download against `SHA256SUMS.txt`: `sha256sum <file>` (Linux), `shasum -a 256 <file>` (macOS), `certutil -hashfile <file> SHA256` (Windows).
+
+# The node (`zclassicd`)
+
+The wallet runs its **embedded** `zclassicd` automatically — you don't need to install or configure anything. If you already run a ZClassic node, the wallet connects to it instead. To run a **node only** (no GUI, e.g. a server), download `zclassicd` from the [zclassic release](https://github.com/ZclassicCommunity/zclassic/releases/latest) and run it — **no flags or config needed**; it fetches params + a snapshot and syncs by itself.
+
+Pass `--headless` to run the wallet without the GUI.
+
+# Build from source
+
+This wallet is C++17 + Qt 5.15. Full, current, copy-pasteable build instructions for **all three platforms** (native + cross-compile, the single-file packaging, code-signing notes) are in:
+
+- **`docs/BUILDING.md`** — the wallet (GUI + single-file).
+- **`AGENTS.md`** — the cross-repo build quickstart (also in the [zclassic](https://github.com/ZclassicCommunity/zclassic) node repo, with `doc/building-daemon-from-source.md`).
+
+Quick Linux dev build:
 ```
-sudo dpkg -i linux-deb-zclwallet-v0.6.3.deb
-sudo apt install -f
+git clone https://github.com/ZclassicCommunity/zcl-qt-wallet.git
+cd zcl-qt-wallet
+/path/to/qt5/bin/qmake zcl-qt-wallet.pro CONFIG+=release && make -j$(nproc)
 ```
+(Building from source produces the GUI without an embedded node by default — run an external `zclassicd`, or use `contrib/make-allinone.sh` to embed one. See `docs/BUILDING.md`.)
 
-Or you can download and run the binaries directly.
-```
-tar -xvf zclwallet-v0.6.3.tar.gz
-./zclwallet-v0.6.3/zclwallet
-```
+# Help
 
-### Windows
-Download and run the `.msi` installer and follow the prompts. Alternately, you can download the release binary, unzip it and double click on `zclwallet.exe` to start.
+[File an issue](https://github.com/ZclassicCommunity/zcl-qt-wallet/issues) for support or bug reports.
 
-### macOS
-Double-click on the `.dmg` file to open it, and drag `zclwallet` on to the Applications link to install.
-
-## zclassicd
-ZclWallet needs a ZClassic node running zclassicd. If you already have a zclassicd node running, ZclWallet will connect to it. 
-
-If you don't have one, ZclWallet will start its embedded zclassicd node. 
-
-Additionally, if this is the first time you're running ZclWallet or a zclassicd daemon, ZclWallet will download the zclassic params (~1.7 GB) and configure `zclassic.conf` for you. 
-
-Pass `--no-embedded` to disable the embedded zclassicd and force ZclWallet to connect to an external node.
-
-## Compiling from source
-ZclWallet is written in C++ 14, and can be compiled with g++/clang++/visual c++. It also depends on Qt5, which you can get from [here](https://www.qt.io/download). Note that if you are compiling from source, you won't get the embedded zclassicd by default. You can either run an external zclassicd, or compile zclassicd as well. 
-
-See detailed build instructions [on the wiki](https://github.com/ZClassicFoundation/zclwallet/wiki/Compiling-from-source-code)
-
-### Building on Linux
-
-```
-git clone https://github.com/ZClassicFoundation/zclwallet.git
-cd zclwallet
-/path/to/qt5/bin/qmake zcl-qt-wallet.pro CONFIG+=debug
-make -j$(nproc)
-
-./zclwallet
-```
-
-### Building on Windows
-You need Visual Studio 2017 (The free C++ Community Edition works just fine). 
-
-From the VS Tools command prompt
-```
-git clone  https://github.com/ZClassicFoundation/zclwallet.git
-cd zclwallet
-c:\Qt5\bin\qmake.exe zcl-qt-wallet.pro -spec win32-msvc CONFIG+=debug
-nmake
-
-debug\zclwallet.exe
-```
-
-To create the Visual Studio project files so you can compile and run from Visual Studio:
-```
-c:\Qt5\bin\qmake.exe zcl-qt-wallet.pro -tp vc CONFIG+=debug
-```
-
-### Building on macOS
-You need to install the Xcode app or the Xcode command line tools first, and then install Qt. 
-
-```
-git clone https://github.com/ZClassicFoundation/zclwallet.git
-cd zclwallet
-/path/to/qt5/bin/qmake zcl-qt-wallet.pro CONFIG+=debug
-make
-
-./zclwallet.app/Contents/MacOS/zclwallet
-```
-
-### [Troubleshooting Guide & FAQ](https://github.com/ZClassicFoundation/zclwallet/wiki/Troubleshooting-&-FAQ)
-Please read the [troubleshooting guide](https://github.com/ZClassicFoundation/zclwallet/wiki/Troubleshooting-&-FAQ) for common problems and solutions.
-For support or other questions, tweet at [@zclwallet](https://twitter.com/zclwallet) or [file an issue](https://github.com/ZClassicFoundation/zclwallet/issues).
-
-_PS: ZclWallet is NOT an official wallet, and is not affiliated with the Electric Coin Company in any way._
+_ZclWallet is a community wallet and is not affiliated with the Electric Coin Company._
