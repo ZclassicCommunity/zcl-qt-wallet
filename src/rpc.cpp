@@ -1178,11 +1178,21 @@ void RPC::refreshAddresses() {
 }
 
 // Function to create the data model and update the views, used below.
-void RPC::updateUI(bool anyUnconfirmed) {    
+void RPC::updateUI(bool anyUnconfirmed) {
     ui->unconfirmedWarning->setVisible(anyUnconfirmed);
 
     // Update balances model data, which will update the table too
+#ifdef ZCL_WIDGET_TEST
+    // PERF harness (perf16_modelJank): time ONLY the balances-model rebuild — the
+    // pure-CPU hot path the perf slot asserts on. Zero cost when ZCL_WIDGET_TEST is
+    // undefined (the entire block compiles out).
+    QElapsedTimer _perfTimer;
+    _perfTimer.start();
     balancesTableModel->setNewData(allBalances, utxos);
+    balanceModelSamplesNs.push_back(_perfTimer.nsecsElapsed());
+#else
+    balancesTableModel->setNewData(allBalances, utxos);
+#endif
 
     // Update from address
     main->updateFromCombo();

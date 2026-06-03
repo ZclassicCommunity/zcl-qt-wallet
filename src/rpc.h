@@ -102,6 +102,16 @@ public:
     // (not a stand-in) so a regression in the production wiring is caught.
     void testFireNotifyPush() { onNotifyPush(); }
     bool testNotifyDebounceActive() const { return notifyDebounce && notifyDebounce->isActive(); }
+
+    // PERF harness seam (perf16_modelJank). Each call to updateUI() (under
+    // ZCL_WIDGET_TEST) appends the wall-clock nanoseconds the balances-model
+    // setNewData() rebuild took to this vector; the perf slot reads it to compute
+    // p50/p95/p100. Entirely absent from the shipped app build (guard is compile-time).
+    QVector<qint64>& testBalanceModelSamplesNs() { return balanceModelSamplesNs; }
+    // Drive the REAL updateUI() path directly (no daemon) so the perf harness can
+    // repeatedly re-run the balances-model rebuild over a seeded large dataset. The
+    // anyUnconfirmed arg is forwarded straight through.
+    void testUpdateUI(bool anyUnconfirmed) { updateUI(anyUnconfirmed); }
 #endif
 
     void newZaddr(bool sapling, const std::function<void(json)>& cb);
@@ -325,6 +335,10 @@ private:
     // (one-shot). Empty => the sync-create fails (fail-closed path). Never present
     // in the shipped app build.
     QString                     testNextZaddrResult;
+    // PERF harness backing store: per-update nanoseconds spent in the balances-model
+    // rebuild inside updateUI(). Filled only under ZCL_WIDGET_TEST; read by
+    // perf16_modelJank. Never present in the shipped build.
+    QVector<qint64>             balanceModelSamplesNs;
 #endif
 };
 

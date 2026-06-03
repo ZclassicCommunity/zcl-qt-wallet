@@ -806,16 +806,22 @@ void MainWindow::updateHomeFixIt(double transparent) {
         homeReceiveBtn->style()->polish(homeReceiveBtn);
     }
 
-    if (homeFixItCard == nullptr) return;
-
-    const bool hasPublic = transparent > 0.0000001;   // below a displayable unit => zero
-    if (hasPublic) {
-        if (homeFixItText)
-            homeFixItText->setText(
-                tr("%1 is PUBLIC and visible to everyone.")
-                    .arg(Settings::getZCLDisplayFormat(transparent)));
+    if (homeFixItCard != nullptr) {
+        const bool hasPublic = transparent > 0.0000001;   // below a displayable unit => zero
+        if (hasPublic) {
+            if (homeFixItText)
+                homeFixItText->setText(
+                    tr("%1 is PUBLIC and visible to everyone.")
+                        .arg(Settings::getZCLDisplayFormat(transparent)));
+        }
+        homeFixItCard->setVisible(hasPublic);
     }
-    homeFixItCard->setVisible(hasPublic);
+
+    // PERF warm-latency t1 marker: the hero balance labels above are now set, i.e.
+    // the user-visible balance has been (re)painted. Emitted unconditionally (after
+    // the hero is updated) on EVERY balance update so the perf22 harness can time the
+    // onNotifyPush -> painted latency. No-op in the shipped app (no listeners).
+    emit heroBalancesPainted();
 }
 
 // PRIV-18 — the REAL "Shield public funds" action behind the Home fix-it button.

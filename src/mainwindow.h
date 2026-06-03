@@ -87,6 +87,16 @@ public:
     void balancesReady();
     void payZClassicURI(QString uri = "");
 
+    // PERF (warm-latency harness, t1 marker). Emitted at the END of
+    // updateHomeFixIt() once the privacy-forward HERO labels have been (re)set, i.e.
+    // the exact instant the user-visible balance is painted. Production-trivial: a
+    // single emit on a signal nobody listens to in the shipped app (zero cost). The
+    // L1 perf22 slot connects to it to time t0(onNotifyPush) -> t1(painted).
+signals:
+    void heroBalancesPainted();
+
+public:
+
     void updateLabels();
     void updateTAddrCombo(bool checked);
     void updateFromCombo();
