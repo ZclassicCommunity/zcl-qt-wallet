@@ -7,6 +7,11 @@
 #include <QRegularExpression>
 #include <QSharedPointer>
 #include <QPointer>
+#include <QStandardPaths>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QCoreApplication>
 
 #ifndef Q_OS_WIN
 #include <sys/stat.h>       // umask() so the unix socket is born owner-only
@@ -71,6 +76,9 @@ void NotifyServer::stop() {
     if (server) {
         server->close();
         QLocalServer::removeServer(path);
+        // Invalidate the session token on disk too (the connector can no longer
+        // read it; the in-memory token dies with this object).
+        QFile::remove(defaultTokenPath());
         // deleteLater (not delete): stop() may be reached from inside a slot driven
         // by one of this server's child sockets (e.g. a future notified() handler
         // that tears the server down) — a synchronous delete there would free the
@@ -102,7 +110,7 @@ void NotifyServer::onNewConnection() {
         // A peer that hangs up before sending a full line is cleaned up.
         connect(c, &QLocalSocket::disconnected, c, &QLocalSocket::deleteLater);
 
-        connect(c, &QLocalSocket::readyRead, this, [this, c, buf, reaper]() {
+        auto onData = [this, c, buf, reaper]() {
             // Read with a hard per-drain cap so `buf` can never exceed kMaxBytes+1
             // even if the kernel delivers a huge single chunk (readAll() would copy
             // it all). A peer that floods without a newline is then dropped.
@@ -144,7 +152,15 @@ void NotifyServer::onNewConnection() {
             // this connection. Only on a validated notify.
             if (!id.isEmpty())
                 emit notified(id);
-        });
+        };
+
+        connect(c, &QLocalSocket::readyRead, this, onData);
+        // The payload can arrive BETWEEN accept() and the connect() above; readyRead
+        // does NOT re-fire for bytes already buffered, so drain them now or the
+        // connection would stall until the idle reaper (and the connector would see
+        // no ack). Deterministic regardless of accept/data ordering.
+        if (c->bytesAvailable() > 0)
+            onData();
     }
 }
 
@@ -178,4 +194,81 @@ bool NotifyServer::tokenMatches(const QByteArray& candidate) const {
         diff |= (cc ^ tok.at(i));
     }
     return diff == 0;
+}
+
+// ---- Connector / shared-path plumbing --------------------------------------
+
+static QString notifyRuntimeDir() {
+    // Per-user + stable across the GUI and the connector process (same user => same
+    // QStandardPaths). Prefer the OS runtime dir (Linux: /run/user/UID, a 0700
+    // tmpfs); fall back to the temp dir where that is unavailable (macOS/Windows or
+    // a session with no XDG_RUNTIME_DIR).
+    QString d = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
+    if (d.isEmpty())
+        d = QStandardPaths::writableLocation(QStandardPaths::TempLocation);
+    return d;
+}
+
+QString NotifyServer::defaultSocketPath() {
+    return QDir(notifyRuntimeDir()).filePath("zqw-notify.sock");
+}
+
+QString NotifyServer::defaultTokenPath() {
+    return QDir(notifyRuntimeDir()).filePath("zqw-notify.token");
+}
+
+QString NotifyServer::readTokenFile(const QString& path) {
+    QFile f(path.isEmpty() ? defaultTokenPath() : path);
+    if (!f.open(QIODevice::ReadOnly))
+        return QString();
+    // The token is 64 bytes; bound the read so a tampered/huge file can't blow up.
+    const QByteArray b = f.read(128);
+    return QString::fromLatin1(b).trimmed();
+}
+
+bool NotifyServer::writeTokenFile() const {
+    const QString p = defaultTokenPath();
+    QDir().mkpath(QFileInfo(p).absolutePath());
+#ifndef Q_OS_WIN
+    mode_t oldMask = ::umask(0077);   // born 0600 (no group/other), no TOCTOU window
+#endif
+    QFile f(p);
+    bool ok = f.open(QIODevice::WriteOnly | QIODevice::Truncate);
+#ifndef Q_OS_WIN
+    ::umask(oldMask);
+#endif
+    if (!ok)
+        return false;
+    f.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);   // narrows a pre-existing file too
+    f.write(sessionToken.toLatin1());
+    f.close();
+    return true;
+}
+
+int NotifyServer::sendNotify(const QString& socketPath, const QString& token, const QString& id) {
+    if (token.isEmpty())
+        return 3;   // no token provisioned (GUI not running / not the owner)
+    static const QRegularExpression hex64("^[0-9a-f]{64}$");
+    if (!hex64.match(id).hasMatch())
+        return 2;   // garbage id — fail fast (the server would reject it anyway)
+
+    QLocalSocket s;
+    s.connectToServer(socketPath);
+    if (!s.waitForConnected(800))
+        return 4;   // nobody listening (foreign daemon, or GUI closed)
+
+    s.write(token.toLatin1() + ' ' + id.toLatin1() + '\n');
+    s.flush();
+    s.waitForBytesWritten(800);
+    s.waitForReadyRead(800);
+    const QByteArray ack = s.readAll();
+    s.disconnectFromServer();
+    return (ack == "OK\n") ? 0 : 5;   // 0 only when the server acknowledged
+}
+
+int NotifyServer::runConnector(int argc, char** argv, const QString& id) {
+    // Headless: a QCoreApplication (no GUI/QPA) just to drive QLocalSocket's
+    // synchronous waitFor* calls. Reads the token from the 0600 file (never argv).
+    QCoreApplication app(argc, argv);
+    return sendNotify(defaultSocketPath(), readTokenFile(), id);
 }

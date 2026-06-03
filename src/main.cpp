@@ -5,6 +5,7 @@
 #include "rpc.h"
 #include "settings.h"
 #include "turnstile.h"
+#include "notifyserver.h"   // NOTIFY-SRV connector mode (--notify)
 
 #include "version.h"
 
@@ -450,6 +451,19 @@ int main(int argc, char* argv[])
 {
     // Install the noise filter before anything can log.
     qInstallMessageHandler(zclMessageFilter);
+
+    // NOTIFY-SRV connector mode: `<self> --notify <id>`, invoked by zclassicd's
+    // -walletnotify/-blocknotify. A tiny headless mode that connects to the GUI's
+    // token-gated notify socket, sends the per-session token + the txid/blockhash,
+    // and exits. Handled HERE — before the GUI/QPA platform setup and before
+    // SingleApplication — so it needs no display and is never mistaken for a second
+    // GUI instance trying to forward a URI.
+    for (int i = 1; i < argc; i++) {
+        if (qstrcmp(argv[i], "--notify") == 0) {
+            const QString id = (i + 1 < argc) ? QString::fromLocal8Bit(argv[i + 1]) : QString();
+            return NotifyServer::runConnector(argc, argv, id);
+        }
+    }
 #ifdef Q_OS_LINUX
     // ROOT-CAUSE FIX for bob's silent exit on a Wayland session.
     //

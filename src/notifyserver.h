@@ -52,6 +52,31 @@ public:
     QString token() const { return sessionToken; }   // the per-session secret (64 hex)
     QString socketPath() const { return path; }
 
+    // Write the current session token to defaultTokenPath() as a 0600 file the
+    // connector reads. Keeping the token in a 0600 file (NOT in -walletnotify's
+    // command line) keeps it out of argv / `ps` for any co-resident process.
+    // Returns false on failure. Removed again by stop().
+    bool writeTokenFile() const;
+
+    // --- Connector / shared-path plumbing (NOTIFY-SRV) --------------------------
+    // Per-user paths the GUI (server) and the `--notify` connector BOTH derive from
+    // QStandardPaths, so they agree without parsing the conf or the (custom) datadir.
+    // The socket lives in the per-user runtime dir (Linux: /run/user/UID, 0700 tmpfs).
+    static QString defaultSocketPath();
+    static QString defaultTokenPath();
+    // Read a token file (default path when `path` empty); "" if absent/unreadable.
+    static QString readTokenFile(const QString& path = QString());
+
+    // The connector wire (pure + testable): connect to `socketPath`, send
+    // "<token> <id>\n", return 0 IFF the server acked "OK" (a validated notify).
+    // Non-zero: 2 bad id, 3 empty token, 4 not listening, 5 no/!OK ack.
+    static int sendNotify(const QString& socketPath, const QString& token, const QString& id);
+
+    // Process entry for `<self> --notify <id>` (invoked by zclassicd's
+    // -walletnotify/-blocknotify): a tiny headless QCoreApplication that reads the
+    // token file and sendNotify()s the default socket. Returns the exit code.
+    static int runConnector(int argc, char** argv, const QString& id);
+
     // Hard limits (also asserted by the L1 tests).
     static constexpr int kMaxBytes = 4096;   // per-connection read cap
     static constexpr int kIdleMs   = 2000;   // reap a connection that dribbles

@@ -943,6 +943,43 @@ private slots:
         c->deleteLater();
     }
 
+    void n9_connectorTokenFileAndGates() {
+        NotifyServer srv;
+        const QString p = notifySockPath("n9");
+        QVERIFY(srv.start(p));
+
+        // Token file: written 0600, and reads back EXACTLY the session token (the
+        // connector reads the token from here, never from argv/ps).
+        QVERIFY2(srv.writeTokenFile(), "writeTokenFile() failed");
+        const QString fileTok = NotifyServer::readTokenFile();
+        QCOMPARE(fileTok, srv.token());
+        QFile tf(NotifyServer::defaultTokenPath());
+        QVERIFY(tf.exists());
+        const QFile::Permissions groupOther =
+            QFileDevice::ReadGroup  | QFileDevice::WriteGroup |
+            QFileDevice::ReadOther  | QFileDevice::WriteOther;
+        QVERIFY2((tf.permissions() & groupOther) == 0, "token file must be 0600 (no group/other)");
+
+        // sendNotify input gates — these return BEFORE any socket I/O, so they are
+        // deterministic single-threaded:
+        const QString id(64, 'a');
+        QCOMPARE(NotifyServer::sendNotify(p, QString(), id),     3);   // no token provisioned
+        QCOMPARE(NotifyServer::sendNotify(p, fileTok, "nothex"), 2);   // non-hex id rejected
+        // Nothing listening on a fresh path -> not-connected.
+        QCOMPARE(NotifyServer::sendNotify(notifySockPath("n9_nobody"), fileTok, id), 4);
+
+        // NOTE: the full token->OK->notified round-trip is proven by n2 (async, via
+        // the server's real token). sendNotify's synchronous waitForReadyRead cannot
+        // be driven single-threaded in-process (it does not pump the SERVER's event
+        // loop); the real cross-process connector is exercised by the L2 E2E with a
+        // live daemon firing -walletnotify.
+
+        // stop() invalidates the token on disk (connector can no longer read it).
+        srv.stop();
+        QVERIFY2(!QFile::exists(NotifyServer::defaultTokenPath()),
+                 "stop() must remove the token file");
+    }
+
     // ---- POLISH: production-dark-theme page screenshots -------------------------
     // VISUAL POLISH pass evidence. Loads the SHIPPED res/styles/dark.qss (so the
     // shots show the PRODUCTION dark theme, not the default light Fusion look),
