@@ -741,7 +741,7 @@ void MainWindow::setupHomeDashboard() {
     homeFixItText->setObjectName("homeFixItText");
     homeFixItText->setWordWrap(true);
 
-    auto* fixItBtn = new QPushButton(tr("Shield my public funds → private"), homeFixItCard);
+    auto* fixItBtn = new QPushButton(tr("Shield my funds"), homeFixItCard);
     fixItBtn->setObjectName("homeFixItBtn");
     fixItBtn->setAutoDefault(false);
     fixItBtn->setCursor(Qt::PointingHandCursor);
@@ -891,7 +891,7 @@ void MainWindow::updateHomeFixIt(double transparent) {
     if (homeHeroPrivate)
         homeHeroPrivate->setText(ui->balSheilded->text());
     if (homeHeroTotal)
-        homeHeroTotal->setText(tr("Total %1").arg(ui->balTotal->text()));
+        homeHeroTotal->setText(tr("Total: %1").arg(ui->balTotal->text()));
 
     // Polish P1/UX-22: friendly empty-state helper under the hero when the wallet
     // has nothing yet. Parse the canonical Total label (e.g. "0 ZCL"); show the

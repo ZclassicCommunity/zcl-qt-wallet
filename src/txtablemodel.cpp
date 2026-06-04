@@ -149,16 +149,15 @@ void TxTableModel::updateAllData() {
     if (role == Qt::TextAlignmentRole && index.column() == 3) return QVariant(Qt::AlignRight | Qt::AlignVCenter);
     
     if (role == Qt::ForegroundRole) {
-        if (modeldata->at(index.row()).confirmations == 0) {
-            QBrush b;
-            b.setColor(Qt::red);
-            return b;
-        }
-
-        // Else, just return the default brush
         QBrush b;
-        b.setColor(Qt::black);
-        return b;        
+        // Pending (0-conf): amber = not-yet-final, matching the PUBLIC/amber token.
+        // Confirmed: normal dark-theme text. NEVER Qt::black here — it is invisible
+        // on the dark Type/Date columns (the default-delegate columns honor this).
+        if (modeldata->at(index.row()).confirmations == 0)
+            b.setColor(QColor("#d9822b"));
+        else
+            b.setColor(QColor("#e6e6e6"));
+        return b;
     }
 
     auto dat = modeldata->at(index.row());
@@ -172,7 +171,8 @@ void TxTableModel::updateAllData() {
                     else 
                         return addr;
                 }
-        case 2: return QDateTime::fromMSecsSinceEpoch(modeldata->at(index.row()).datetime *  (qint64)1000).toLocalTime().toString();
+        case 2: return QDateTime::fromMSecsSinceEpoch(modeldata->at(index.row()).datetime * (qint64)1000)
+                        .toLocalTime().toString("yyyy-MM-dd hh:mm");   // compact, scannable, sorts right; full ts in tooltip
         case 3: return Settings::getZCLDisplayFormat(modeldata->at(index.row()).amount);
         }
     } 

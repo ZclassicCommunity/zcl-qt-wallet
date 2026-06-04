@@ -295,9 +295,25 @@ void MainWindow::addAddressSection() {
     QTimer::singleShot(10, this, [this] () {ui->sendToScrollArea->ensureWidgetVisible(ui->addAddressButton);});
 }
 
-void MainWindow::addressChanged(int itemNumber, const QString& text) {   
+void MainWindow::addressChanged(int itemNumber, const QString& text) {
     auto addr = AddressBook::addressFromAddressLabel(text);
     setMemoEnabled(itemNumber, addr.startsWith("z"));
+
+    // Live validation affordance: green border the instant a typed/resolved address
+    // parses, red when it clearly won't, neutral while empty — so an invalid address
+    // is caught as you type, not as a surprise failure at Send. isValidAddress is
+    // static and touches no daemon, so it is safe on every keystroke. Single writer
+    // of the field's "validation" property; the qss border rules do the rest.
+    auto* fld = ui->sendToWidgets->findChild<QLineEdit*>(QString("Address") + QString::number(itemNumber));
+    if (fld) {
+        const char* state = text.trimmed().isEmpty() ? "empty"
+                          : (Settings::isValidAddress(addr) ? "valid" : "invalid");
+        if (fld->property("validation").toString() != QString(state)) {
+            fld->setProperty("validation", state);
+            fld->style()->unpolish(fld);   // property selectors need a re-polish
+            fld->style()->polish(fld);
+        }
+    }
 }
 
 void MainWindow::amountChanged(int item, const QString& text) {
