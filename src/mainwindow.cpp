@@ -2138,17 +2138,19 @@ void MainWindow::exportAllKeys() {
 void MainWindow::exportKeys(QString addr) {
     bool allKeys = addr.isEmpty() ? true : false;
 
-    // P1-6: private keys ARE the money — anyone who sees this text can spend your funds, so confirm intent first.
-    if (QMessageBox::warning(this, tr("Export Private Keys"),
-            tr("Anyone who has these private keys can spend all the funds in these addresses. Only export them if you are sure no one else can see your screen or the saved file."),
-            QMessageBox::Ok | QMessageBox::Cancel, QMessageBox::Cancel) != QMessageBox::Ok) {
-        return;
-    }
-
+    // Don't-make-me-think: the user explicitly chose to view their keys — don't
+    // interrupt with a blocking scare popup. The calm safety framing lives INSIDE
+    // the dialog (helpLbl below), read in context, not as a nag in the way.
     QDialog d(this);
     Ui_PrivKey pui;
     pui.setupUi(&d);
-    
+
+    // objectNames so dark.qss can give this the premium, readable treatment
+    // (no .ui regeneration — same objectName->qss idiom used across the app).
+    d.setObjectName("PrivKey");
+    pui.helpLbl->setObjectName("privKeySecurity");
+    pui.privKeyTxt->setObjectName("privKeyTextEdit");
+
     // Make the window big by default
     auto ps = this->geometry();
     QMargins margin = QMargins() + 50;
@@ -2160,14 +2162,30 @@ void MainWindow::exportKeys(QString addr) {
     pui.privKeyTxt->setReadOnly(true);
     pui.privKeyTxt->setLineWrapMode(QPlainTextEdit::LineWrapMode::NoWrap);
 
+    const QString securityNote = tr("These are your secret keys — anyone who has them controls these funds. "
+                                    "Keep this screen private and store any saved file somewhere safe.");
     if (allKeys)
-        pui.helpLbl->setText(tr("These are all the private keys for all the addresses in your wallet"));
+        pui.helpLbl->setText(securityNote + tr("\n\nShowing the keys for every address in your wallet."));
     else
-        pui.helpLbl->setText(tr("Private key for ") + addr);
+        pui.helpLbl->setText(securityNote + tr("\n\nShowing the key for: ") + addr);
+    pui.helpLbl->setWordWrap(true);
 
     // Disable the save button until it finishes loading
     pui.buttonBox->button(QDialogButtonBox::Save)->setEnabled(false);
     pui.buttonBox->button(QDialogButtonBox::Ok)->setVisible(false);
+
+    // One-click Copy All — the user shouldn't have to select-all + Ctrl-C. Added in
+    // C++ (no .ui change); enabled once keys load (see fnUpdateUIWithKeys). The
+    // 1.5s "Copied!" reset uses copyBtn as the singleShot context, so Qt auto-cancels
+    // it if the dialog closes first (no use-after-free on fast quit).
+    auto* copyBtn = pui.buttonBox->addButton(tr("Copy All"), QDialogButtonBox::ActionRole);
+    copyBtn->setObjectName("privKeyCopyBtn");
+    copyBtn->setEnabled(false);
+    QObject::connect(copyBtn, &QPushButton::clicked, [&pui, copyBtn]() {
+        QApplication::clipboard()->setText(pui.privKeyTxt->toPlainText());
+        copyBtn->setText(tr("Copied!"));
+        QTimer::singleShot(1500, copyBtn, [copyBtn]() { copyBtn->setText(tr("Copy All")); });
+    });
 
     // Wire up save button
     QObject::connect(pui.buttonBox->button(QDialogButtonBox::Save), &QPushButton::clicked, [=] () {

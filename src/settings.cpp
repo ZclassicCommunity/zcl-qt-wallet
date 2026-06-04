@@ -292,8 +292,12 @@ void Settings::setSaveZtxs(bool save) {
 }
 
 bool Settings::getKeepInTray() {
-    // Default OFF: closing the window stops the node, exactly as before.
-    return QSettings().value("options/keepintray", false).toBool();
+    // Default ON: closing the window keeps the node warm in the tray so RE-OPENING
+    // is instant (attaches to the already-loaded daemon) instead of paying the
+    // ~1-min cold block-index/chainstate load every launch. Opt-out via the wired
+    // Settings checkbox; closeEvent falls back to a real shutdown when no system
+    // tray is available, so headless desktops never orphan the node.
+    return QSettings().value("options/keepintray", true).toBool();
 }
 
 void Settings::setKeepInTray(bool keep) {

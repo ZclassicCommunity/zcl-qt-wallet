@@ -484,3 +484,34 @@ QDialog QGroupBox::title { font-size: 14pt; font-weight: 700; }
  * ============================================================================ */
 QLineEdit[validation="valid"]   { border: 1px solid #34c759; }
 QLineEdit[validation="invalid"] { border: 1px solid #c0392b; }
+
+/* ============================================================================
+ * PRIVATE-KEY / EXPORT dialog — calm, premium, readable (objectNames set in
+ * mainwindow.cpp exportKeys()). The keys are monospace green on the inset
+ * surface; the security note is calm dim guidance, not an alarm; Copy is a clear
+ * primary action. No blocking scare popup precedes this anymore.
+ * ============================================================================ */
+QDialog#PrivKey { background-color: #0f1115; }
+QLabel#privKeySecurity {
+    color: #b0b5bc;
+    font-size: 13pt;
+    font-weight: 500;
+    padding: 4px 2px 10px 2px;
+}
+QPlainTextEdit#privKeyTextEdit {
+    background-color: #1d2027;
+    color: #34c759;                       /* keys in private/green monospace */
+    border: 1px solid #2a2d35;
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-family: "DejaVu Sans Mono", "Liberation Mono", "Courier New", monospace;
+    font-size: 12pt;
+    selection-background-color: #1f7a1f;
+}
+QPushButton#privKeyCopyBtn {
+    background-color: #1f7a1f; color: #ffffff;
+    border: 1px solid #1f7a1f; border-radius: 8px;
+    padding: 8px 18px; font-size: 12pt; font-weight: 700;
+}
+QPushButton#privKeyCopyBtn:hover   { background-color: #2a9d2a; border-color: #2a9d2a; }
+QPushButton#privKeyCopyBtn:pressed { background-color: #1a6b1a; }
