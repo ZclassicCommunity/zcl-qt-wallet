@@ -966,9 +966,28 @@ void MainWindow::sendButton() {
     // incomplete, so a send can silently fail. Make the user explicitly accept
     // that risk (default No) instead of relying only on the soft confirm label.
     if (Settings::getInstance()->isSyncing()) {
-        auto res = QMessageBox::warning(this, tr("Wallet still syncing"),
-            tr("Your wallet is still catching up with the network, so your balance "
-               "may be incomplete and this transaction could fail.\n\nSend anyway?"),
+        const qint64 now  = QDateTime::currentSecsSinceEpoch();
+        const qint64 last = Settings::getInstance()->getLastSyncPollEpoch();
+        const bool   stale = Settings::syncGateIsStale(now, last);
+        // Distinguish the user's OWN import/rescan (homeImportCard visible) from a
+        // network catch-up, and soften when the flag looks stale (no live poll refreshed
+        // it recently) — but keep it a SOFT Yes/No warning (default No) so even a wedged
+        // flag can never hard-block a send.
+        const bool importBusy = (homeImportCard != nullptr && homeImportCard->isVisible());
+        QString title = tr("Wallet still syncing");
+        QString body;
+        if (importBusy) {
+            title = tr("Still importing your keys");
+            body  = tr("Your wallet is still importing and rescanning, so your balance "
+                       "may be incomplete and this transaction could fail.\n\nSend anyway?");
+        } else if (stale) {
+            body  = tr("Your wallet hasn't reported sync progress recently. Your balance "
+                       "may be up to date, or syncing may have paused.\n\nSend anyway?");
+        } else {
+            body  = tr("Your wallet is still catching up with the network, so your balance "
+                       "may be incomplete and this transaction could fail.\n\nSend anyway?");
+        }
+        auto res = QMessageBox::warning(this, title, body,
             QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
         if (res != QMessageBox::Yes)
             return;

@@ -957,6 +957,9 @@ void RPC::getInfoThenRefresh(bool force) {
             bool targetKnown = (target > 0);
 
             Settings::getInstance()->setSyncing(isSyncing);
+            // Stamp the time of this live poll so the send gate can ignore a frozen
+            // isSyncing flag (single writer: this poll, beside the flag it stamps).
+            Settings::getInstance()->setLastSyncPollEpoch(QDateTime::currentSecsSinceEpoch());
             Settings::getInstance()->setBlockNumber(blockNumber);
 
             // G6: clear the warmup-wedge cap (heal/attempts.warmupRestart) only on

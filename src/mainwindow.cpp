@@ -829,6 +829,37 @@ void MainWindow::setupHomeDashboard() {
     homeBackupCard->setVisible(false);   // hidden until showBackupNag() surfaces it
     summaryVBox->insertWidget(insertAt++, homeBackupCard);
 
+    // ---- 3c) IMPORT / RESCAN CARD (amber; hidden unless importing) ----------
+    // First-run trust: after "Import private keys" the daemon rescans the chain
+    // silently (no runtime status string, no %). This non-blocking card makes that
+    // wait VISIBLE and calm with an indeterminate busy bar + accurate copy, instead
+    // of a frozen-looking balance. Reuses the same amber QSS objectNames.
+    homeImportCard = new QFrame(ui->tab);
+    homeImportCard->setObjectName("homeFixItCard");   // reuse amber-card qss rule
+    homeImportCard->setFrameShape(QFrame::NoFrame);
+    auto* importV = new QVBoxLayout(homeImportCard);
+    importV->setContentsMargins(12, 12, 12, 12);
+    importV->setSpacing(8);
+
+    auto* importText = new QLabel(
+        tr("Importing your keys and rescanning the blockchain. This usually takes "
+           "10-20 minutes — your balance will update when it finishes. You can keep "
+           "using ZClassic; please leave it open."),
+        homeImportCard);
+    importText->setObjectName("homeFixItText");       // reuse amber-body qss rule
+    importText->setWordWrap(true);
+
+    homeImportBar = new QProgressBar(homeImportCard);
+    homeImportBar->setObjectName("homeImportBar");
+    homeImportBar->setRange(0, 0);                    // indeterminate / busy
+    homeImportBar->setTextVisible(false);
+
+    importV->addWidget(importText);
+    importV->addWidget(homeImportBar);
+
+    homeImportCard->setVisible(false);   // hidden until showImportProgress(true)
+    summaryVBox->insertWidget(insertAt++, homeImportCard);
+
     // ---- 4) COLLAPSE the redundant Summary breakdown (Polish P1) ------------
     // The balance was shown up to 4x (hero + Total subline + these standalone
     // Shielded/Transparent/Total rows + the Address Balances table). The hero now
@@ -1706,12 +1737,16 @@ void MainWindow::addressBook() {
 void MainWindow::doImport(QSharedPointer<QList<QString>> keys) {
     if (rpc->getConnection() == nullptr) {
         // No connection, just return (keys is freed when the last reference drops).
+        showImportProgress(false);   // don't strand the card on a dropped connection
         return;
     }
 
     if (keys->isEmpty()) {
         // keys is a QSharedPointer now — it frees itself; no explicit delete.
+        // This branch is re-entered only AFTER the final rescan=true RPC's rescan
+        // completes, so hiding the card here clears it exactly when the rescan ends.
         ui->statusBar->showMessage(tr("Private key import rescan finished"));
+        showImportProgress(false);
         return;
     }
 
@@ -1768,6 +1803,14 @@ void MainWindow::showBackupNag() {
         return;   // already backed up -> never nag again
     if (homeBackupCard != nullptr)
         homeBackupCard->setVisible(true);
+}
+
+void MainWindow::showImportProgress(bool active) {
+    // No-op if the dashboard card wasn't built (e.g. headless tests). Single writer:
+    // only the import flow toggles this. The bar is permanently indeterminate, so
+    // showing/hiding the card is the whole behaviour.
+    if (homeImportCard != nullptr)
+        homeImportCard->setVisible(active);
 }
 
 void MainWindow::promptWalletBackup() {
@@ -2011,6 +2054,10 @@ void MainWindow::importPrivKey() {
         std::transform(keysTmp.begin(), keysTmp.end(), std::back_inserter(*keys), [=](auto key) {
             return key.trimmed().split(" ")[0];
         });
+
+        // Show the non-blocking import/rescan Home card now; doImport() hides it on
+        // completion (or on a dropped connection). Outlives the dismissed info box.
+        showImportProgress(true);
 
         // Start the import. Context 'this': Qt auto-cancels the timer if the window
         // is destroyed before it fires, so the lambda never touches a freed MainWindow.

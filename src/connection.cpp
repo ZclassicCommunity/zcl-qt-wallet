@@ -2310,20 +2310,32 @@ void ConnectionLoader::showInformation(QString info, QString detail) {
     if (info.contains(QObject::tr("Step 3")) && ezCard && ezCard->isVisible())
         ezCard->setVisible(false);
 
-    static int rescanCount = 0;
-    if (detail.toLower().startsWith("rescan")) {
-        rescanCount++;
+    // First-run trust: the daemon's warmup rescan status ("Rescanning...") has NO
+    // ETA, so we add ONE calm, accurate hint once a rescan is detected, instead of
+    // appending the old context-less "several hours" to every poll after the 10th
+    // (the static counter never reset, so it stuck on for the whole session and
+    // contradicted the import dialog's "several minutes" wording). The hint is a
+    // stable constant string appended each rescan poll, so the label never flickers.
+    static bool rescanHintShown = false;
+    static int  rescanLogged    = 0;
+    const bool  isRescan = detail.toLower().startsWith("rescan");
+    if (isRescan && !rescanHintShown) {
+        rescanHintShown = true;
     }
-    
-    if (rescanCount > 10) {
-        detail = detail + "\n" + QObject::tr("This may take several hours");
+    if (isRescan && rescanHintShown) {
+        detail = detail + "\n" + QObject::tr("Rescanning your wallet — this usually "
+            "takes 10-20 minutes. Your balance will update when it finishes.");
     }
 
     connD->status->setText(info);
     connD->statusDetail->setText(detail);
 
-    if (rescanCount < 10)
+    // Log the first few status transitions, then go quiet (avoids one log line per
+    // ~1s rescan poll, matching the old rescanCount<10 intent).
+    if (rescanLogged < 10) {
         main->logger->write(info + ":" + detail);
+        rescanLogged++;
+    }
 }
 
 /**

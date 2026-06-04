@@ -192,6 +192,13 @@ public:
     // No-op when already backed up (options/walletbackedup) or when the card isn't built.
     void showBackupNag();
 
+    // First-run trust: show/hide the NON-blocking import/rescan Home card. active=true
+    // shows a busy card while a user-initiated key import + wallet rescan runs (the
+    // daemon emits no runtime rescan %, so it is an indeterminate spinner, not a fake
+    // percent); false hides it. No-op until setupHomeDashboard() has built it. Single
+    // writer: only the import flow toggles it (importPrivKeys start, doImport finish).
+    void showImportProgress(bool active);
+
     // RUNTIME actionable dialog (edit #5). Reached from the sync poller (rpc.cpp) when an
     // ATTACHED FOREIGN node (one this wallet did NOT start: rpc->isEmbedded()==false) has
     // been peerless/stuck for a sustained window. The wallet can only download/repair the
@@ -270,6 +277,14 @@ private:
     // backup/export handlers. promptWalletBackup() stays reachable from Help.
     QFrame*      homeBackupCard    = nullptr;   // amber card (hidden unless un-backed-up + funded)
     QLabel*      homeBackupText    = nullptr;   // "Back up your wallet ..."
+
+    // First-run trust (import/rescan): a NON-blocking amber Home card with an
+    // INDETERMINATE busy bar, shown while a user-initiated key import + wallet rescan
+    // runs. The daemon provides no runtime rescan %, so this is a busy spinner + calm
+    // copy (not a fake percent). Single writer: showImportProgress(), called only by
+    // the import flow (start) and doImport() (both completion paths).
+    QFrame*       homeImportCard   = nullptr;   // amber card (hidden unless importing)
+    QProgressBar* homeImportBar    = nullptr;   // indeterminate (range 0,0) busy bar
 
     // PRIV-18 — the REAL "Shield public funds" action, shared by the Home fix-it
     // card button and (conceptually) the balances context-menu "Shield balance to

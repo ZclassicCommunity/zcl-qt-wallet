@@ -31,6 +31,18 @@ public:
     bool    isSyncing();
     void    setSyncing(bool syncing);
 
+    // Send-gate staleness: epoch (secs) of the last successful sync poll, plus a PURE
+    // predicate deciding whether a still-true isSyncing flag is stale (no poll refreshed
+    // it within the window) and so must NOT block a send. now/last are passed in so the
+    // decision is unit-testable with no clock (mirrors RPC::desiredPollMs).
+    void    setLastSyncPollEpoch(qint64 e) { _lastSyncPollEpoch = e; }
+    qint64  getLastSyncPollEpoch() { return _lastSyncPollEpoch; }
+    static const qint64 kSyncGateStaleSecs = 180;   // 3 min with no live poll => stale
+    static bool syncGateIsStale(qint64 nowEpoch, qint64 lastPollEpoch) {
+        if (lastPollEpoch == 0) return false;       // never polled yet -> let normal gate run
+        return (nowEpoch - lastPollEpoch) > kSyncGateStaleSecs;
+    }
+
     int     getZClassicdVersion();
     void    setZClassicdVersion(int version);
     
@@ -137,6 +149,7 @@ private:
     QString _executable;
     bool    _isTestnet        = false;
     bool    _isSyncing        = false;
+    qint64  _lastSyncPollEpoch = 0;   // secs-since-epoch of last successful sync poll (send-gate staleness)
     int     _blockNumber      = 0;
     int     _zclassicdVersion    = 0;
     bool    _useEmbedded      = false;
