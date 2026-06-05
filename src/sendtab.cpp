@@ -38,8 +38,13 @@ void MainWindow::setupSendTab() {
     // Hook up add address button click
     QObject::connect(ui->addAddressButton, &QPushButton::clicked, this, &MainWindow::addAddressSection);
 
-    // Max available Checkbox
-    QObject::connect(ui->Max1, &QCheckBox::stateChanged, this, &MainWindow::maxAmountChecked);
+    // "Send all" — now a checkable button (was a bare checkbox). It stays checkable so
+    // recomputeMaxIfChecked()/setChecked(false) keep working; toggled(bool) is adapted to
+    // the existing maxAmountChecked(int) slot so the max math (recomputeMaxIfChecked) is
+    // entirely unchanged.
+    QObject::connect(ui->Max1, &QPushButton::toggled, this, [this](bool on) {
+        maxAmountChecked(on ? Qt::Checked : Qt::Unchecked);
+    });
 
     // The first Address button
     QObject::connect(ui->Address1, &QLineEdit::textChanged, [=] (auto text) {
@@ -78,23 +83,38 @@ void MainWindow::setupSendTab() {
         ui->lblMinerFeeUSD->setText(Settings::getUSDFormat(txt.toDouble()));
         recomputeMaxIfChecked();   // fee changed -> the "Send max" amount must follow
     });
-    ui->minerFeeAmt->setText(Settings::getDecimalString(Settings::getMinerFee()));    
+    ui->minerFeeAmt->setText(Settings::getDecimalString(Settings::getMinerFee()));
+    // Network-fee read-only hint (custom fees default OFF): explain the greyed field
+    // instead of leaving a mysterious dead control.
+    if (!Settings::getInstance()->getAllowCustomFees()) {
+        QString feeHint = tr("Default network fee. Turn on “Allow custom fees” in Settings to change it.");
+        ui->minerFeeAmt->setToolTip(feeHint);
+        ui->minerFeeLabel->setToolTip(feeHint);
+    }
+    // Keep the running totals line current when the fee changes.
+    QObject::connect(ui->minerFeeAmt, &QLineEdit::textChanged, [=](auto) { updateSendTotals(); });
 
      // Set up focus enter to set fees
     QObject::connect(ui->tabWidget, &QTabWidget::currentChanged, [=] (int pos) {
         if (pos == 1) {
             QString txt = ui->minerFeeAmt->text();
             ui->lblMinerFeeUSD->setText(Settings::getUSDFormat(txt.toDouble()));
+            // Re-sync the read-only state + hint each time Send is shown, so toggling
+            // "Allow custom fees" in Settings is reflected without a restart.
+            bool custom = Settings::getInstance()->getAllowCustomFees();
+            ui->minerFeeAmt->setReadOnly(!custom);
+            QString feeHint = custom ? QString()
+                : tr("Default network fee. Turn on “Allow custom fees” in Settings to change it.");
+            ui->minerFeeAmt->setToolTip(feeHint);
+            ui->minerFeeLabel->setToolTip(feeHint);
         }
     });
     //Fees validator
     auto feesValidator = new QRegExpValidator(QRegExp("[0-9]{0,8}\\.?[0-9]{0,8}")); 
     ui->minerFeeAmt->setValidator(feesValidator);
 
-    // Font for the first Memo label
-    QFont f = ui->Address1->font();
-    f.setPointSize(f.pointSize() - 1);
-    ui->MemoTxt1->setFont(f);
+    // The first Memo label uses the base font (no shrink) so an entered private note
+    // is readable, not a tiny afterthought.
 
     // Recurring button
     QObject::connect(ui->chkRecurring, &QCheckBox::stateChanged, [=] (int checked) {
@@ -219,6 +239,8 @@ void MainWindow::inputComboTextChanged(int index) {
     ui->sendAddressBalance->setText(balFmt);
     ui->sendAddressBalanceUSD->setText(Settings::getUSDFormat(spendable));
     recomputeMaxIfChecked();   // from-address changed -> its balance drives the "Send max" amount
+    updateSendPrivacyBadge();  // from-address private/public-ness feeds the verdict
+    updateSendTotals();
 }
 
     
@@ -235,12 +257,12 @@ void MainWindow::addAddressSection() {
     auto horizontalLayout_12 = new QHBoxLayout();
     horizontalLayout_12->setSpacing(6);
     auto label_4 = new QLabel(verticalGroupBox);
-    label_4->setText(tr("Address"));
+    label_4->setText(tr("Pay to"));
     horizontalLayout_12->addWidget(label_4);
 
     auto Address1 = new QLineEdit(verticalGroupBox);
-    Address1->setObjectName(QString("Address") % QString::number(itemNumber)); 
-    Address1->setPlaceholderText(tr("Address"));
+    Address1->setObjectName(QString("Address") % QString::number(itemNumber));
+    Address1->setPlaceholderText(tr("Paste a z-address (private) or t-address (public)"));
     QObject::connect(Address1, &QLineEdit::textChanged, [=] (auto text) {
         this->addressChanged(itemNumber, text);
     });
@@ -267,18 +289,24 @@ void MainWindow::addAddressSection() {
     horizontalLayout_13->addWidget(label_6);
 
     auto Amount1 = new QLineEdit(verticalGroupBox);
-    Amount1->setPlaceholderText(tr("Amount"));    
-    Amount1->setObjectName(QString("Amount") % QString::number(itemNumber));   
+    Amount1->setPlaceholderText(tr("0.00"));
+    Amount1->setObjectName(QString("Amount") % QString::number(itemNumber));
     Amount1->setBaseSize(QSize(200, 0));
-    Amount1->setAlignment(Qt::AlignRight);    
+    Amount1->setAlignment(Qt::AlignRight);
     // Create the validator for send to/amount fields
-    auto amtValidator = new QRegExpValidator(QRegExp("[0-9]{0,8}\\.?[0-9]{0,8}")); 
+    auto amtValidator = new QRegExpValidator(QRegExp("[0-9]{0,8}\\.?[0-9]{0,8}"));
     Amount1->setValidator(amtValidator);
     QObject::connect(Amount1, &QLineEdit::textChanged, [=] (auto text) {
         this->amountChanged(itemNumber, text);
     });
 
     horizontalLayout_13->addWidget(Amount1);
+
+    // Always-on "ZCL" unit so the amount field's currency is clear before typing.
+    auto amountUnit = new QLabel(verticalGroupBox);
+    amountUnit->setObjectName(QString("amountUnit") % QString::number(itemNumber));
+    amountUnit->setText(tr("ZCL"));
+    horizontalLayout_13->addWidget(amountUnit);
 
     auto AmtUSD1 = new QLabel(verticalGroupBox);
     AmtUSD1->setObjectName(QString("AmtUSD") % QString::number(itemNumber));   
@@ -289,7 +317,7 @@ void MainWindow::addAddressSection() {
 
     auto MemoBtn1 = new QPushButton(verticalGroupBox);
     MemoBtn1->setObjectName(QString("MemoBtn") % QString::number(itemNumber));
-    MemoBtn1->setText(tr("Memo"));    
+    MemoBtn1->setText(tr("Add private note"));
     // Connect Memo Clicked button
     QObject::connect(MemoBtn1, &QPushButton::clicked, [=] () {
         this->memoButtonClicked(itemNumber);
@@ -301,9 +329,7 @@ void MainWindow::addAddressSection() {
 
     auto MemoTxt1 = new QLabel(verticalGroupBox);
     MemoTxt1->setObjectName(QString("MemoTxt") % QString::number(itemNumber));
-    QFont font1 = Address1->font();
-    font1.setPointSize(font1.pointSize()-1);
-    MemoTxt1->setFont(font1);
+    // Base font (no shrink) so an entered private note is readable.
     MemoTxt1->setWordWrap(true);
     sendAddressLayout->addWidget(MemoTxt1);
 
@@ -338,11 +364,32 @@ void MainWindow::addressChanged(int itemNumber, const QString& text) {
             fld->style()->polish(fld);
         }
     }
+
+    updateSendPrivacyBadge();   // recipient changed -> the private/public verdict may change
+    updateSendTotals();
 }
 
 void MainWindow::amountChanged(int item, const QString& text) {
     auto usd = ui->sendToWidgets->findChild<QLabel*>(QString("AmtUSD") % QString::number(item));
     usd->setText(Settings::getUSDFormat(text.toDouble()));
+
+    // Live amount affordance, mirroring the address border: neutral while empty, green
+    // once it's a positive number, red if it parses to zero/negative. This is a LOCAL
+    // format check only (>0) — it does NOT compare against the balance and does NOT call
+    // doSendTxValidations; the authoritative overspend check stays at Send time.
+    auto* fld = ui->sendToWidgets->findChild<QLineEdit*>(QString("Amount") % QString::number(item));
+    if (fld) {
+        const char* state = text.trimmed().isEmpty() ? "empty"
+                          : (text.toDouble() > 0 ? "valid" : "invalid");
+        if (fld->property("validation").toString() != QString(state)) {
+            fld->setProperty("validation", state);
+            fld->style()->unpolish(fld);
+            fld->style()->polish(fld);
+        }
+    }
+
+    updateSendTotals();   // any amount change updates the running "You will send …" line
+
     // A change to ANOTHER recipient's amount (item != 1) shrinks the max available for
     // recipient 1; recompute it. Guard on item != 1 to avoid recursing on our own setText
     // of Amount1 (which would re-emit amountChanged(1)).
@@ -354,10 +401,10 @@ void MainWindow::setMemoEnabled(int number, bool enabled) {
     auto memoBtn = ui->sendToWidgets->findChild<QPushButton*>(QString("MemoBtn") % QString::number(number));
      if (enabled) {
         memoBtn->setEnabled(true);
-        memoBtn->setToolTip("");
+        memoBtn->setToolTip(tr("Attach an encrypted message only the recipient can read"));
     } else {
         memoBtn->setEnabled(false);
-        memoBtn->setToolTip(tr("Only z-addresses can have memos"));
+        memoBtn->setToolTip(tr("Private notes are only available for z-addresses (private)"));
     }
 }
 
@@ -451,6 +498,11 @@ void MainWindow::memoButtonClicked(int number, bool includeReplyTo) {
         fnAddReplyTo();
 
     if (dialog.exec() == QDialog::Accepted) {
+        // MONEY-SAFETY: store the RAW memo only. createTxFromSendPage reads this exact
+        // QLabel verbatim as the on-chain memo (and hex-encodes it), so ANY decoration
+        // here would be SENT on-chain, accumulate on re-edit, and escape the 512-byte
+        // dialog limit. The "private note" framing lives in the button label + tooltips,
+        // never in the payload text.
         memoTxt->setText(memoDialog.memoTxt->toPlainText());
     }
 }
@@ -466,8 +518,10 @@ void MainWindow::removeExtraAddresses() {
     amt->clear();
     auto amtUSD  = ui->sendToWidgets->findChild<QLabel*>(QString("AmtUSD1"));
     amtUSD->clear();
-    auto max  = ui->sendToWidgets->findChild<QCheckBox*>(QString("Max1"));
-    max->setChecked(false);
+    // "Send all" is now a checkable QPushButton (was a QCheckBox) — cast accordingly or
+    // findChild returns null and this null-derefs.
+    auto max  = ui->sendToWidgets->findChild<QPushButton*>(QString("Max1"));
+    if (max) max->setChecked(false);
     auto memo = ui->sendToWidgets->findChild<QLabel*>(QString("MemoTxt1"));
     memo->clear();
 
@@ -488,6 +542,10 @@ void MainWindow::removeExtraAddresses() {
     ui->chkRecurring->setCheckState(Qt::Unchecked);
     ui->btnRecurSchedule->setEnabled(false);
     ui->lblRecurDesc->setText("");
+
+    // Clear the live privacy badge + running totals back to their resting state.
+    updateSendPrivacyBadge();
+    updateSendTotals();
 }
 
 void MainWindow::maxAmountChecked(int checked) {
@@ -1400,7 +1458,96 @@ QString MainWindow::doSendTxValidations(Tx tx) {
 }
 
 void MainWindow::cancelButton() {
+    // Forgiving: don't silently destroy typed work. If the user has started a payment
+    // (a recipient or amount is entered), confirm before clearing the form. An empty
+    // form clears silently. removeExtraAddresses() itself is unchanged.
+    auto* addr = ui->sendToWidgets->findChild<QLineEdit*>("Address1");
+    auto* amt  = ui->sendToWidgets->findChild<QLineEdit*>("Amount1");
+    bool hasInput = (addr && !addr->text().trimmed().isEmpty())
+                 || (amt  && !amt->text().trimmed().isEmpty());
+    if (hasInput) {
+        auto r = QMessageBox::question(this, tr("Discard this payment?"),
+            tr("Your typed recipients and amounts will be cleared."),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (r != QMessageBox::Yes)
+            return;
+    }
     removeExtraAddresses();
+}
+
+// PRESENTATION-ONLY: drive the live private/public verdict badge above the Send form
+// from the wallet's own daemon-free classifier (sendCategoryOf, sendcategory.h). It
+// builds a lightweight ECHO Tx from the on-screen From + recipient addresses and reads
+// the category — it never sends, never touches the spendable/zatoshi math, and the
+// classifier errs toward the stronger public/de-shield verdict on an unparseable
+// address, so it can only over-warn, never under-warn.
+void MainWindow::updateSendPrivacyBadge() {
+    auto* badge = ui->sendPrivacyBadge;
+    if (!badge) return;
+
+    // Gather resolved recipient addresses currently on screen.
+    Tx tx;
+    tx.fromAddr = ui->inputsCombo->currentText();
+    bool anyRecipient = false;
+    QRegExp re("Address[0-9]+", Qt::CaseInsensitive);
+    for (auto* fld : ui->sendToWidgets->findChildren<QLineEdit*>(re)) {
+        QString a = AddressBook::addressFromAddressLabel(fld->text().trimmed());
+        if (a.isEmpty()) continue;
+        anyRecipient = true;
+        ToFields t; t.addr = a; t.amount = 0; tx.toAddrs.push_back(t);
+    }
+
+    QString text, tone;
+    if (!anyRecipient || tx.fromAddr.isEmpty()) {
+        text = tr("Set who you are paying to see if this send is private");
+        tone = QString();   // neutral
+    } else {
+        switch (sendCategoryOf(tx)) {
+        case SendCategory::ZToZ_private:
+            text = tr("● Private — only you and the recipient can see this"); tone = "private"; break;
+        case SendCategory::TToZ_shielding:
+            text = tr("● Shielding — this becomes private"); tone = "private"; break;
+        case SendCategory::TToT_public:
+            text = tr("● Public — the amount and recipient are visible to everyone"); tone = "public"; break;
+        case SendCategory::ZToT_deshield:
+            text = tr("● De-shield — this leaves your private balance and becomes public forever"); tone = "deshield"; break;
+        }
+    }
+    badge->setText(text);
+    badge->setProperty("badge", tone.isEmpty() ? QVariant() : QVariant("true"));
+    badge->setProperty("tone", tone.isEmpty() ? QVariant() : QVariant(tone));
+    badge->style()->unpolish(badge);
+    badge->style()->polish(badge);
+}
+
+// PRESENTATION-ONLY: the running "You will send X + fee Y = Z" line under the fee row.
+// It only AGGREGATES values already on screen (the same read-only findChild loop the
+// max math uses) — it writes nothing, computes no spendable/zatoshi math, and the
+// authoritative total still comes from confirmTx. Hidden until an amount is entered.
+void MainWindow::updateSendTotals() {
+    auto* line = ui->sendTotalsLine;
+    if (!line) return;
+
+    double sum = 0; bool any = false;
+    QRegExp re("Amount[0-9]+", Qt::CaseInsensitive);
+    for (auto* fld : ui->sendToWidgets->findChildren<QLineEdit*>(re)) {
+        QString t = fld->text().trimmed();
+        if (t.isEmpty()) continue;
+        double v = t.toDouble();
+        if (v > 0) { sum += v; any = true; }
+    }
+    if (!any) { line->clear(); return; }
+
+    double fee = ui->minerFeeAmt->text().trimmed().toDouble();
+    double total = sum + fee;
+    QString usd = Settings::getUSDFormat(total);
+    QString msg = tr("You'll send %1 + %2 fee = %3 ZCL")
+                    .arg(Settings::getZCLDisplayFormat(sum))
+                    .arg(Settings::getZCLDisplayFormat(fee))
+                    .arg(Settings::getZCLDisplayFormat(total));
+    if (!usd.isEmpty())
+        msg = msg % "  (~" % usd % ")";
+    line->setText(msg);
 }
 
 // Item 2: calm, NON-blocking "you did it" affirmation shown once a send confirms.
