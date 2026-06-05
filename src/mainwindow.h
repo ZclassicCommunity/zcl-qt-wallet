@@ -466,6 +466,11 @@ private:
 
     void addressChanged(int number, const QString& text);
     void amountChanged (int number, const QString& text);
+    // PRESENTATION-ONLY helpers (no money/zatoshi math): the live private/public verdict
+    // badge above the Send form (echoes sendCategoryOf), and the running "You'll send X +
+    // fee = Z" totals line (aggregates on-screen amounts only).
+    void updateSendPrivacyBadge();
+    void updateSendTotals();
 
     void addNewZaddr(bool sapling);
     std::function<void(bool)> addZAddrsToComboList(bool sapling);
