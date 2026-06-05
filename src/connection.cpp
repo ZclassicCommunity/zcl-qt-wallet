@@ -1911,10 +1911,20 @@ void ConnectionLoader::refreshZClassicdState(Connection* connection, std::functi
                 refused();
             } else if (err == QNetworkReply::NetworkError::AuthenticationRequiredError) {
                 main->logger->write("Authentication failed");
-                QString explanation = QString() % 
-                        QObject::tr("ZClassic couldn't sign in to its node.\n\n"
-                        "The saved username or password wasn't accepted. "
-                        "You can correct it under Edit → Settings.");
+                // By the time we reach here the cookie + embedded-node paths have already
+                // been tried (autoDetectZClassicConf falls back to the node's .cookie on
+                // every autoconnect tick), so this only fires for a node running a CUSTOM
+                // rpcpassword that isn't saved here. Tell the user EXACTLY how to fix it
+                // (the conf path + the two lines to add) instead of a vague "check Settings".
+                QString explanation =
+                        QObject::tr("ZClassic found your node but couldn't sign in to it.\n\n"
+                        "Your node is using a custom RPC username/password that isn't saved "
+                        "here. Add these two lines to:\n%1\n\n"
+                        "    rpcuser=<your node's rpcuser>\n"
+                        "    rpcpassword=<your node's rpcpassword>\n\n"
+                        "then open ZClassic again. (A node started without a custom password "
+                        "needs no setup — ZClassic signs in automatically.)")
+                        .arg(Settings::getInstance()->getZClassicdConfLocation());
 
                 this->showError(explanation);
             } else if (err == QNetworkReply::NetworkError::InternalServerError && 
@@ -2381,6 +2391,11 @@ std::shared_ptr<ConnectionConfig> ConnectionLoader::autoDetectZClassicConf() {
 
     Settings::getInstance()->setUsingZClassicConf(confLocation);
 
+    // The RPC cookie lives in the DATADIR, which defaults to the conf's own folder but can
+    // be redirected by a `datadir=` line; track it so the cookie lookup below is correct.
+    QString confDataDir = zclassicconf->zclassicDir;
+    bool    isTestnet   = false;
+
     while (!in.atEnd()) {
         QString line = in.readLine();
         auto s = line.indexOf("=");
@@ -2402,9 +2417,12 @@ std::shared_ptr<ConnectionConfig> ConnectionLoader::autoDetectZClassicConf() {
         if (name == "proxy") {
             zclassicconf->proxy = value;
         }
-        if (name == "testnet" &&
-            value == "1"  &&
-            zclassicconf->port.isEmpty()) {
+        if (name == "datadir" && !value.isEmpty()) {
+            confDataDir = value;
+        }
+        if (name == "testnet" && value == "1") {
+            isTestnet = true;
+            if (zclassicconf->port.isEmpty())
                 zclassicconf->port = "18023";
         }
     }
@@ -2413,7 +2431,30 @@ std::shared_ptr<ConnectionConfig> ConnectionLoader::autoDetectZClassicConf() {
     if (zclassicconf->port.isEmpty()) zclassicconf->port = "8023";
     file.close();
 
-    // In addition to the zclassic.conf file, also double check the params. 
+    // IDIOT-PROOF RPC AUTH: a conf with no rpcpassword still authenticates if the node was
+    // started without one -- zclassicd then writes a per-session cookie ("__cookie__:<hex>")
+    // to <datadir>/.cookie, the standard zero-config RPC credential. Read it so a vanilla
+    // `zclassicd`, AND our own embedded node (which runs password-less and writes the cookie
+    // shortly after launch), connect with NO user setup and no dead-end "couldn't sign in".
+    // autoDetectZClassicConf() re-runs on every warmup autoconnect tick, so a cookie that
+    // appears just after the node starts is picked up on the next poll. (testnet keeps its
+    // cookie under the testnet3 subdir.)
+    if (zclassicconf->rpcpassword.isEmpty() && !confDataDir.isEmpty()) {
+        QDir dataDir(confDataDir);
+        QString cookiePath = isTestnet ? dataDir.filePath("testnet3/.cookie")
+                                       : dataDir.filePath(".cookie");
+        QFile cookie(cookiePath);
+        if (cookie.open(QIODevice::ReadOnly)) {
+            const QString tok   = QString::fromUtf8(cookie.readAll()).trimmed();
+            const int     colon = tok.indexOf(':');
+            if (colon > 0) {
+                zclassicconf->rpcuser     = tok.left(colon);
+                zclassicconf->rpcpassword = tok.mid(colon + 1);
+                main->logger->write("Using the node's RPC cookie for sign-in (no rpcpassword in conf)");
+            }
+            cookie.close();
+        }
+    }
 
     return std::shared_ptr<ConnectionConfig>(zclassicconf);
 }
