@@ -15,8 +15,8 @@ Legend: ✅ done · 🔵 in progress · ⏳ blocked/waiting · ⬜ not started
 | 4 | **Live funded `t→z` send-with-change** (3 cases; change lands shielded; shown==sent) | **you** | ⏳ see `BETA6_LIVE_SEND_TEST.md` |
 | 5 | **Bob fresh-install end-to-end** (start → connect → balance → first send) on a clean machine | you/bob | 🔵 Send form already confirmed launching on bob@Arch |
 | 6 | **Linux** beta6 bundle (proot builder, version-stamped) | me | 🔵 building (builder bumped to beta6) |
-| 7 | **Windows** `.exe` rebuilt from `04dba01` + tagged daemon (currently STALE) | me/dev | ⬜ after daemon tag |
-| 8 | **macOS** arm64 `.dmg` (ABSENT) — `macdeployqt` + ad-hoc re-sign | **Mac dev** | ⬜ |
+| 7 | **Windows** `.exe` rebuilt (beta6 GUI; needed a qtsvg cross-module build) | me | 🔵 GUI cross-building; embeds current win daemon (refresh to getwalletsummary-capable for parity when daemon is tagged) |
+| 8 | **macOS** arm64 `.dmg` — `macdeployqt` + ad-hoc re-sign | **Mac dev** | ⬜ instructions ready: `docs/BETA6_MACOS_HANDOFF.md` (note: their static Qt needs qtsvg too) |
 | 9 | **Windows runtime smoke-test** (fresh install + daemon-extract + sync) | you/tester | ⬜ |
 | 10 | **GUI master merge** (ff `feature/wallet-redesign` → master, *after* version bump) + **daemon master merge** | dev | ⬜ |
 | 11 | **SHA256SUMS + GPG signatures + release notes**, then tag + publish pre-release | me/dev | 🔵 notes drafted (`RELEASE_NOTES_v2.1.2-beta6.md`) |
