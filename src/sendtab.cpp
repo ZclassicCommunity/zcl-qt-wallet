@@ -1345,11 +1345,20 @@ QString MainWindow::doSendTxValidations(Tx tx) {
     if (!Settings::getInstance()->isSyncing()) {
         auto bals = rpc ? rpc->getAllBalances() : nullptr;
         if (bals && bals->contains(tx.fromAddr)) {
-            double displayed = bals->value(tx.fromAddr);          // minconf=0 total (incl. 0-conf)
-            double confirmed = spendableOrFallback(tx.fromAddr);  // confirmed-spendable, fails open
-            double total     = tx.fee;
-            for (auto toAddr : tx.toAddrs)
-                total += toAddr.amount;
+            // INTEGER-ZATOSHI affordability. This MUST be integer math, not double: an
+            // exact-max shield sizes the amount as (spendable - fee), so amount + fee should
+            // equal spendable EXACTLY -- but in floating point (spendable - fee) + fee drifts
+            // a few 1e-17 above spendable, so `confirmed >= total` is falsely false and the
+            // user is dead-ended with "Not enough funds. You're trying to send 0.12 ... but
+            // this address only holds 0.12" (both render identically -- the classic float
+            // false-positive). Every amount is <=8dp (the send/fee validators guarantee it),
+            // so toZat (llround) is exact and integer comparisons cannot drift. This mirrors
+            // PR#15's integer-zatoshi fix in createTxFromSendPage for the auto-shield path.
+            const qint64 displayedZat = toZat(bals->value(tx.fromAddr));          // minconf=0 total (incl. 0-conf)
+            const qint64 confirmedZat = toZat(spendableOrFallback(tx.fromAddr));  // confirmed-spendable, fails open
+            qint64 totalZat = toZat(tx.fee);
+            for (const auto& toAddr : tx.toAddrs)
+                totalZat += toZat(toAddr.amount);
 
             // Three-way guard so the user is never dead-ended:
             //  1) confirmed >= total            -> PASS (proceed exactly as today). NEVER
@@ -1361,21 +1370,21 @@ QString MainWindow::doSendTxValidations(Tx tx) {
             //                                       today's "only holds %2" message.
             // The daemon's own insufficient-funds rejection (mapped by humaneSendError)
             // remains the final backstop; this is just an EARLIER, friendlier check.
-            if (confirmed >= total) {
+            if (confirmedZat >= totalZat) {
                 // ok -- fall through, do not block
             }
-            else if (displayed >= total) {
-                double stillConfirming = total - confirmed;
-                if (stillConfirming < 0) stillConfirming = 0;
+            else if (displayedZat >= totalZat) {
+                qint64 stillConfirmingZat = totalZat - confirmedZat;
+                if (stillConfirmingZat < 0) stillConfirmingZat = 0;
                 return tr("%1 of these funds is still confirming (about a few minutes). "
                           "You can shield or send it as soon as it confirms.")
-                       .arg(Settings::getZCLDisplayFormat(stillConfirming));
+                       .arg(Settings::getZCLDisplayFormat((double)stillConfirmingZat / 1e8));
             }
             else {
                 return tr("Not enough funds. You're trying to send %1 (including the fee), "
                           "but this address only holds %2.")
-                       .arg(Settings::getZCLDisplayFormat(total))
-                       .arg(Settings::getZCLDisplayFormat(displayed));
+                       .arg(Settings::getZCLDisplayFormat((double)totalZat / 1e8))
+                       .arg(Settings::getZCLDisplayFormat((double)displayedZat / 1e8));
             }
         }
     }
