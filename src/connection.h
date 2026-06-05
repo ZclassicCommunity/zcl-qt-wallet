@@ -27,6 +27,18 @@ struct ConnectionConfig {
     QString proxy;
 
     ConnectionType connType;
+
+    // COOKIE-AUTH: when the GUI-owned conf carries no rpcpassword, the daemon
+    // auto-generates a .cookie and the GUI authenticates from it. cookieAuth==true
+    // means rpcuser/rpcpassword above were populated by READING that cookie file on
+    // THIS connect attempt (so a late-appearing cookie is picked up next poll), not
+    // from a persisted shared secret. dataDirOverride holds a conf `datadir=` line so
+    // the cookie path is computed under the daemon's real datadir, not the conf dir.
+    // NOTE: declared LAST (after connType) on purpose — loadFromSettings() uses a
+    // positional aggregate-init of the first 9 fields, so these two MUST stay trailing
+    // (they take their defaults there). Do not reorder.
+    bool    cookieAuth = false;
+    QString dataDirOverride;
 };
 
 class Connection;
@@ -58,6 +70,55 @@ public:
 private:
     std::shared_ptr<ConnectionConfig> autoDetectZClassicConf();
     std::shared_ptr<ConnectionConfig> loadFromSettings();
+
+    // ============ COOKIE-AUTH (structural 401 elimination) ============
+    // The daemon auto-generates <datadir>/.cookie ("__cookie__:<base64(32 rnd)>")
+    // whenever it is started with no rpcpassword (httprpc.cpp InitRPCAuthentication:
+    // gate is mapArgs["-rpcpassword"]==""). We force an ABSOLUTE -rpccookiefile on the
+    // embedded launch so the GUI reads the EXACT file it dictated — removing all
+    // net-specific (testnet3/) and custom-datadir= path guessing.
+    //
+    // cookieFilePathForConf(): the absolute path we pass to -rpccookiefile AND read.
+    // Base is the conf's datadir= override when present, else the conf's directory.
+    QString cookieFilePathForConf(const std::shared_ptr<ConnectionConfig>& cfg);
+    // readAuthCookie(): mirrors the daemon's GetAuthCookie (single getline of the raw
+    // "__cookie__:<b64>" line). Returns an EMPTY QString when the file is absent/empty
+    // (the daemon is still pre-RPC and has not written it yet); a valid cookie line is
+    // never empty, so empty is an unambiguous "absent" sentinel (the codebase is C++14,
+    // so no std::optional). The returned line is a SECRET and is NEVER logged (CONF-3).
+    // Re-read on EVERY connect attempt, never cached.
+    QString readAuthCookie(const std::shared_ptr<ConnectionConfig>& cfg);
+    // FOREIGN-NODE CREDENTIAL DISCOVERY (zero user action). When a conf carries no
+    // rpcpassword AND no cookie was readable, the only remaining zero-action source for a
+    // node WE DID NOT LAUNCH is the daemon's OWN command line (e.g. a hand-rolled node
+    // started with -rpcuser=/-rpcpassword= or -rpccookiefile= and no conf creds). We find
+    // it via the standard pidfile <datadir>/zclassicd.pid -> /proc/<pid>/cmdline (same-user
+    // readable; strictly less exposure than `ps`). The daemon's datadir base is resolved
+    // EXACTLY as cookieFilePathForConf (dataDirOverride else zclassicDir) so we target the
+    // RIGHT process: the cmdline's program name must contain "zclassicd" AND any -datadir=
+    // it carries must match OUR base (else we fall back rather than send another node's
+    // creds). If the cmdline carries -rpccookiefile= we follow it via readAuthCookie's
+    // single-getline. Returns the password (or EMPTY on any miss) and fills outUser; the
+    // returned password + cmdline bytes are SECRETS and are NEVER logged (CONF-3) — we log
+    // only that creds were found, at most once per process. Linux-only: the whole body is
+    // #ifdef Q_OS_LINUX and returns EMPTY elsewhere (macOS/Windows fall through to the
+    // QSettings creds, then the editable Settings prompt). NEVER kills/restarts the node.
+    QString discoverCredsFromRunningDaemon(const std::shared_ptr<ConnectionConfig>& cfg, QString& outUser);
+    // PROACTIVE migration of an existing GUI-owned conf that still carries the legacy
+    // rpcuser=/rpcpassword= (so an upgrader switches to cookie auth on next launch and
+    // an already-desynced conf is healed). Headless, in-place: strips ONLY those two
+    // lines, preserves datadir=/proxy=/testnet=/server= verbatim, re-asserts 0600. Runs
+    // at most once (QSettings conf/cookieMigrated). Gated to a GUI-owned, embedded,
+    // non-external (daemon=1 absent) conf so a user's external-node creds are untouched.
+    void migrateConfToCookie();
+    // REACTIVE 401 self-heal for an OWNED embedded node (belt to the cookie suspenders:
+    // covers a hand-edited/partial-write conf the proactive pass could not reach, and a
+    // cookie-not-yet-rewritten race). Bounded by heal/attempts.authRestart (cap 1):
+    // strip the conf to cookie-only, fully stop + drop the QProcess, relaunch ONCE, and
+    // resume the poll loop; on cap-exceed latchNeedsManual(). NEVER touches an external
+    // node. Returns true if a heal was started/handled (caller must not fall through to
+    // any showError); false to let the caller take the external-node path.
+    bool handleEmbeddedAuthFailure();
 
     Connection* makeConnection(std::shared_ptr<ConnectionConfig> config);
 
@@ -128,6 +189,14 @@ private:
     QString     ezStdErr;                          // accumulated node stderr this run
     QString     ezDataDir;                         // datadir holding blocks/chainstate/debug.log/wallet.dat
 
+    // Item 3 (legible first-run param wait). The daemon peer-fetches ~1.7GB of zk-params
+    // in ZC_LoadParams BEFORE it binds its RPC port, so for 10-20 min on a fresh install
+    // the port is fully REFUSING and getbootstrapinfo can't answer yet. We latch this the
+    // moment verifyParams() reports the params missing (doAutoConnect), so the refused-
+    // connection warmup branch can paint the accurate "one-time 1.7GB" copy instead of a
+    // frozen "Almost ready" line. Single-run advisory flag; no persistence needed.
+    bool        ezParamFetchLikely      = false;  // params were missing at connect -> a peer-fetch is in progress
+
     void    handleStartupFailure();                       // detect + classify + route
     bool    looksLikeDbCorruption(const QString& text);   // marker scan
     // W4: true if `text` carries ANY marker handleStartupFailure() classifies on; lets
@@ -185,6 +254,14 @@ private:
     // redownloadChain(); consulted in the watchdog fire condition. Cleared on a clean
     // RPC (doRPCSetConnection) so a later non-repair run re-arms the watchdog.
     bool    ezRepairRelaunchActive = false;
+
+    // MANUAL-REPAIR entry flag. True ONLY when offerCorruptionRepair() was reached via the
+    // user-initiated Help -> Repair path (startManualRepair), NOT via a startup failure. In
+    // that case the node was healthy and was stopped by launchBlockchainRepair() BEFORE the
+    // dialog, so "Not now" means "I changed my mind" — we must relaunch the node, never show
+    // the startup-failure "couldn't finish starting up" message (which would be a lie + a
+    // dead-end on a node the user deliberately had running).
+    bool    ezManualRepair = false;
 
     // USER-QUIT-DURING-SPLASH guard. While the ApplicationModal connect dialog 'd'
     // is up (slow pre-connect startup), the main window's WM-close is swallowed by

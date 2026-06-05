@@ -71,6 +71,14 @@ private:
     // display never silently fails on an address Settings can't checksum-verify.
     static Kind classify(const QString& displayText);
 
+    // SP-1: the original classify() body, factored out so classify() above can be
+    // a thin memoized wrapper. Kept STATIC so the existing test seams
+    // (testClassify/testClassifyForIndex) and the static classifyForIndex() keep
+    // calling classify() exactly as before -- no signature or static-ness change
+    // anywhere the tests or paint() touch. classify() runs only on the GUI thread
+    // (the delegate paint path), so its function-local static memo needs no lock.
+    static Kind classifyUncached(const QString& displayText);
+
     // Context-aware upgrade: in the transactions table a *send* to a public
     // (transparent) recipient is a privacy-leaking DE-SHIELD; promote that one
     // case to the red variant. Reads the sibling Type cell (column 0) of the

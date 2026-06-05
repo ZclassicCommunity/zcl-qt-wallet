@@ -6,6 +6,7 @@
 #include "settings.h"
 #include "turnstile.h"
 #include "notifyserver.h"   // NOTIFY-SRV connector mode (--notify)
+#include "guistartup.h"     // [gui-startup] client-side startup timing milestones
 
 #include "version.h"
 
@@ -174,6 +175,7 @@ public:
         QCoreApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
 
         SingleApplication a(argc, argv, true);
+        GuiStartup::markQAppConstructed();   // [gui-startup] QApplication built
 
         // Command line parser
         QCommandLineParser parser;
@@ -386,6 +388,7 @@ public:
             // flag, so a Settings-OK can no longer re-arm the trap (see mainwindow.cpp).
             a.setQuitOnLastWindowClosed(false);
             w->show();
+            GuiStartup::markWindowShown();   // [gui-startup] first MainWindow show requested
             w->raise();
             w->activateWindow();
         }
@@ -449,6 +452,10 @@ static void zclMessageFilter(QtMsgType type, const QMessageLogContext&, const QS
 
 int main(int argc, char* argv[])
 {
+    // [gui-startup] Start the process clock at the very first instruction so the
+    // mirror of the daemon's [startup] log measures from true process entry.
+    GuiStartup::begin();
+
     // Install the noise filter before anything can log.
     qInstallMessageHandler(zclMessageFilter);
 

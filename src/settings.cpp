@@ -292,8 +292,12 @@ void Settings::setSaveZtxs(bool save) {
 }
 
 bool Settings::getKeepInTray() {
-    // Default OFF: closing the window stops the node, exactly as before.
-    return QSettings().value("options/keepintray", false).toBool();
+    // Default ON: closing the window keeps the node warm in the tray so RE-OPENING
+    // is instant (attaches to the already-loaded daemon) instead of paying the
+    // ~1-min cold block-index/chainstate load every launch. Opt-out via the wired
+    // Settings checkbox; closeEvent falls back to a real shutdown when no system
+    // tray is available, so headless desktops never orphan the node.
+    return QSettings().value("options/keepintray", true).toBool();
 }
 
 void Settings::setKeepInTray(bool keep) {
@@ -309,6 +313,28 @@ bool Settings::getShowCachedBalance() {
 
 void Settings::setShowCachedBalance(bool show) {
     QSettings().setValue("options/showcachedbalance", show);
+}
+
+bool Settings::getNonModalStartup() {
+    // W1-1 default ON: the MainWindow appears at once (already painting cached
+    // balances pre-RPC) and the warmup splash is a non-blocking, dismissible
+    // overlay rather than a UI-blocking nested d->exec() modal loop.
+    return QSettings().value("options/nonmodalstartup", true).toBool();
+}
+
+void Settings::setNonModalStartup(bool on) {
+    QSettings().setValue("options/nonmodalstartup", on);
+}
+
+bool Settings::getOpenPortNatpmp() {
+    // Default OFF for the first beta. When enabled, the embedded daemon is
+    // launched with -natpmp=1 and asks the router (via NAT-PMP/PCP, never UPnP)
+    // to forward our own P2P listen port so inbound peers can reach us.
+    return QSettings().value("options/openportnatpmp", false).toBool();
+}
+
+void Settings::setOpenPortNatpmp(bool on) {
+    QSettings().setValue("options/openportnatpmp", on);
 }
 
 void Settings::setPeers(int peers) {
@@ -346,6 +372,12 @@ QString Settings::getDecimalString(double amt) {
         f = "0";
 
     return f;
+}
+
+QString Settings::getHeightString(qint64 height) {
+    // Locale-aware grouping so the height reads naturally for the user's region
+    // (e.g. "1,700,000" or "1.700.000"). Negative/unknown heights pass through.
+    return QLocale::system().toString((qlonglong) height);
 }
 
 QString Settings::getZCLDisplayFormat(double bal) {
@@ -467,10 +499,18 @@ bool Settings::isValidAddress(QString addr) {
     // Structural pre-filter (same shapes the wallet has always accepted). This
     // bounds length/charset cheaply; the checksum gate below then verifies the
     // address is actually self-consistent so typos are caught.
-    QRegExp zcexp("^z[a-z0-9]{94}$",  Qt::CaseInsensitive);   // Sprout  (zc.. / ztn..)
-    QRegExp zsexp("^z[a-z0-9]{77}$",  Qt::CaseInsensitive);   // Sapling (zs1..)
-    QRegExp ztsexp("^ztestsapling[a-z0-9]{76}", Qt::CaseInsensitive); // testnet Sapling
-    QRegExp texp("^t[a-z0-9]{34}$", Qt::CaseInsensitive);     // transparent (t1.. / t3..)
+    // SP-1: these patterns are immutable, so compile them ONCE (function-local
+    // statics) instead of re-parsing four QRegExp on every call. isValidAddress
+    // is hit ~4x per privacy-badge classify() and classify() runs per address
+    // cell per paint -> this was ~16 pattern recompiles per cell per frame on
+    // scroll/resize. C++11 guarantees thread-safe init of these statics, and
+    // QRegExp::exactMatch is const; every isValidAddress() caller runs on the
+    // single GUI thread (addressbook/sendtab/mainwindow/settings/delegate-paint),
+    // so the shared QRegExp match state is never touched concurrently.
+    static const QRegExp zcexp("^z[a-z0-9]{94}$",  Qt::CaseInsensitive);   // Sprout  (zc.. / ztn..)
+    static const QRegExp zsexp("^z[a-z0-9]{77}$",  Qt::CaseInsensitive);   // Sapling (zs1..)
+    static const QRegExp ztsexp("^ztestsapling[a-z0-9]{76}", Qt::CaseInsensitive); // testnet Sapling
+    static const QRegExp texp("^t[a-z0-9]{34}$", Qt::CaseInsensitive);     // transparent (t1.. / t3..)
 
     // Sapling addresses are bech32 -> verify the bech32 polymod checksum.
     // Note: the testnet-Sapling regex is a prefix match (matches the broader

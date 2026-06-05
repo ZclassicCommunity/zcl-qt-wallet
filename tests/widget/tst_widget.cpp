@@ -38,6 +38,11 @@
 #include <QToolButton>
 #include <QLabel>
 #include <QPushButton>
+#include <QComboBox>
+#include <QLineEdit>
+#include <QProgressBar>
+#include <QVBoxLayout>
+#include <QFontMetrics>
 #include <QWidget>
 #include <QDialog>
 #include <QTimer>
@@ -56,6 +61,20 @@
 
 #include <QLocalSocket>
 #include <QSignalSpy>
+
+// PERF harness (perf16/perf22) extra includes.
+#include <QElapsedTimer>
+#include <QVector>
+#include <QProcess>
+#include <QProcessEnvironment>
+#include <QTcpSocket>
+#include <QHostAddress>
+#include <QRandomGenerator>
+#include <QNetworkAccessManager>
+#include <QNetworkRequest>
+#include <QUrl>
+#include <algorithm>
+#include <cmath>
 
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
@@ -124,6 +143,85 @@ private slots:
         ++_modalGen;
         _ackSeen = false;
         _confirmAccepted = false;
+    }
+
+    // ---- STANDARDIZATION GUARD: text controls must never be shorter than their
+    // own line box. This is the regression guard for the Receive-tab "Export
+    // private key…" clip and the removed badge max-height:22px clamp. It loads the
+    // SHIPPED res/styles/dark.qss (exactly as main.cpp does) and asserts every
+    // representative text-bearing control sizes from its font metrics. The
+    // invariant is RELATIVE to each widget's own font, so it is robust across
+    // platforms / DPI. Any future rule that floors a control below its text — or
+    // re-introduces a max-height clamp on a text control — fails HERE in CI.
+    // See the control-height tokens + conventions in res/styles/dark.qss.
+    void controlSizing_textControlsNeverClipBelowLineBox() {
+        const QString prevSheet = qApp->styleSheet();
+        QFile qssFile(":/styles/res/styles/dark.qss");
+        QVERIFY2(qssFile.open(QFile::ReadOnly),
+                 "shipped res/styles/dark.qss must be loadable from the qrc");
+        qApp->setStyleSheet(QString::fromUtf8(qssFile.readAll()));
+
+        QWidget host;                       // parents the throwaway controls
+        QVBoxLayout hostLayout(&host);
+
+        auto fits = [&](QWidget* w, const char* name) {
+            w->ensurePolished();
+            const int lineBox = QFontMetrics(w->font()).height();
+            QVERIFY2(w->sizeHint().height() >= lineBox,
+                     qPrintable(QStringLiteral(
+                         "%1: styled height (%2px) is below its own font line box (%3px) — "
+                         "text will clip. Size text controls from font metrics (min-height + "
+                         "symmetric padding); never clamp a text control with max-height.")
+                         .arg(name).arg(w->sizeHint().height()).arg(lineBox)));
+        };
+
+        auto* btnExport = new QPushButton(tr("Export private key…"), &host);
+        btnExport->setObjectName("btnReceiveExportKey");
+        hostLayout.addWidget(btnExport);
+
+        auto* btnCopy = new QPushButton(tr("Copy"), &host);
+        btnCopy->setObjectName("btnReceiveCopy");
+        hostLayout.addWidget(btnCopy);
+
+        auto* btnPlain = new QPushButton(tr("New Address"), &host);
+        hostLayout.addWidget(btnPlain);
+
+        auto* combo = new QComboBox(&host);
+        combo->addItem(QStringLiteral("t1ExampleTransparentAddress pqgjy"));
+        hostLayout.addWidget(combo);
+
+        auto* edit = new QLineEdit(QStringLiteral("zs1descenders pqgjy"), &host);
+        hostLayout.addWidget(edit);
+
+        auto* bar = new QProgressBar(&host);
+        bar->setTextVisible(true);
+        bar->setFormat(QStringLiteral("Scanning pgy %p%"));
+        bar->setValue(42);
+        hostLayout.addWidget(bar);
+
+        auto* badge = new QLabel(QStringLiteral("PUBLIC pgy"), &host);
+        badge->setProperty("badge", true);
+        badge->setProperty("tone", "public");
+        hostLayout.addWidget(badge);
+
+        host.show();
+
+        fits(btnExport, "btnReceiveExportKey");
+        fits(btnCopy,   "btnReceiveCopy");
+        fits(btnPlain,  "QPushButton (generic)");
+        fits(combo,     "QComboBox");
+        fits(edit,      "QLineEdit");
+        fits(bar,       "QProgressBar");
+        fits(badge,     "QLabel[badge=true]");
+
+        // The badge was the one true hard-clamp (max-height:22px). Guard the class
+        // directly: its styled height must clear its line box with breathing room,
+        // proving no max-height clamp near the line box can creep back in.
+        QVERIFY2(badge->sizeHint().height() >= QFontMetrics(badge->font()).height() + 4,
+                 "QLabel[badge=true] must not be clamped near its line box "
+                 "(regression guard for the removed max-height:22px clip).");
+
+        qApp->setStyleSheet(prevSheet);     // never leak the sheet to later tests
     }
 
     // NOTE on visibility throughout the D-series: the Receive widgets live on tab
@@ -1646,10 +1744,291 @@ private slots:
                      qPrintable("polish screenshot not written: " + f));
         }
     }
+
+    // ======================================================================
+    // PERF / LATENCY HARNESS  (instant-update path)
+    // ----------------------------------------------------------------------
+    // perf16_modelJank  — THE GUARANTEED, fully-deterministic deliverable. Pure
+    //   CPU, no daemon, no event loop: seed a synthetic LARGE wallet (~5,000
+    //   address->balance entries + matching UTXOs) into the REAL RPC via the
+    //   testSetBalances/testSetUTXOs seams, then drive the REAL updateUI() path
+    //   N times. The production updateUI() (under ZCL_WIDGET_TEST) times each
+    //   balances-model setNewData() rebuild into testBalanceModelSamplesNs(); we
+    //   compute p50/p95/p100 across those samples. Soft assert (QWARN if p95 >
+    //   16ms — a dropped 60Hz frame); HARD fail only if p100 > 50ms (egregious
+    //   jank). Always PRINTS a single parseable "PERF perf16 ..." line so the
+    //   baseline is recorded run-to-run.
+    //
+    //   NOTE the setNewData() fingerprint short-circuit: identical inputs early-out
+    //   without a rebuild. To measure the REAL rebuild cost on every iteration we
+    //   alternate between two distinct datasets (A/B) so each call sees changed
+    //   data and actually does the work.
+    void perf16_modelJank() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+
+        const int N_ENTRIES = 5000;
+
+        // Build two distinct large datasets so consecutive updates never hit the
+        // model's unchanged-data fingerprint short-circuit (which would measure a
+        // no-op instead of the rebuild). Dataset B perturbs every balance.
+        auto makeDataset = [N_ENTRIES](double salt,
+                                       QMap<QString, double>** balsOut,
+                                       QList<UnspentOutput>** utxoOut) {
+            auto* bals = new QMap<QString, double>();
+            auto* utxos = new QList<UnspentOutput>();
+            for (int i = 0; i < N_ENTRIES; ++i) {
+                // A realistic-length transparent address keyed by index.
+                QString addr = QString("t1Perf%1Addr000000000000000000000")
+                                   .arg(i, 8, 10, QChar('0'));
+                double bal = (double)(i + 1) + salt;
+                (*bals)[addr] = bal;
+                // One matching UTXO per address (the model copies + scans these).
+                utxos->push_back(UnspentOutput{
+                    addr,
+                    QString("%1txid000000000000000000000000000000000000000000000000000000")
+                        .arg(i, 8, 10, QChar('0')),
+                    QString::number(bal, 'f', 8),
+                    (i % 7 == 0) ? 0 : 10,   // ~1/7 unconfirmed -> red-row scan work
+                    true });
+            }
+            *balsOut = bals;
+            *utxoOut = utxos;
+        };
+
+        QMap<QString, double>* balsA; QList<UnspentOutput>* utxoA;
+        QMap<QString, double>* balsB; QList<UnspentOutput>* utxoB;
+        makeDataset(0.0, &balsA, &utxoA);
+        makeDataset(0.5, &balsB, &utxoB);
+
+        rpc->testBalanceModelSamplesNs().clear();
+
+        // One untimed warm-up update to fault in code paths / allocate the model,
+        // then alternate A/B so every measured call does a real rebuild.
+        rpc->testSetBalances(new QMap<QString, double>(*balsA));
+        rpc->testSetUTXOs(new QList<UnspentOutput>(*utxoA));
+        rpc->testUpdateUI(true);
+        rpc->testBalanceModelSamplesNs().clear();   // discard the warm-up sample
+
+        const int ITERS = 30;
+        for (int i = 0; i < ITERS; ++i) {
+            const bool useA = (i % 2 == 0);
+            rpc->testSetBalances(new QMap<QString, double>(useA ? *balsA : *balsB));
+            rpc->testSetUTXOs(new QList<UnspentOutput>(useA ? *utxoA : *utxoB));
+            rpc->testUpdateUI(true);
+        }
+
+        QVector<qint64> samples = rpc->testBalanceModelSamplesNs();
+        QVERIFY2(samples.size() == ITERS,
+                 qPrintable(QString("expected %1 model samples, got %2 — the "
+                                    "updateUI timing seam did not fill")
+                                .arg(ITERS).arg(samples.size())));
+
+        std::sort(samples.begin(), samples.end());
+        auto pct = [&samples](double p) -> qint64 {
+            if (samples.isEmpty()) return 0;
+            int idx = (int)std::ceil(p / 100.0 * samples.size()) - 1;
+            idx = qBound(0, idx, samples.size() - 1);
+            return samples[idx];
+        };
+        const qint64 p50 = pct(50), p95 = pct(95), p100 = samples.last();
+        const double p50ms = p50 / 1e6, p95ms = p95 / 1e6, p100ms = p100 / 1e6;
+
+        // Single parseable perf-log line (ns + ms) so the baseline is recorded.
+        qInfo().noquote() << QString(
+            "PERF perf16 balances entries=%1 iters=%2 "
+            "p50=%3ns(%4ms) p95=%5ns(%6ms) p100=%7ns(%8ms)")
+            .arg(N_ENTRIES).arg(ITERS)
+            .arg(p50).arg(p50ms, 0, 'f', 3)
+            .arg(p95).arg(p95ms, 0, 'f', 3)
+            .arg(p100).arg(p100ms, 0, 'f', 3);
+
+        // Soft: a single balances-model rebuild should stay under one 60Hz frame.
+        if (p95ms > 16.0)
+            QWARN(qPrintable(QString("perf16: p95 balances-model rebuild %1ms > 16ms "
+                                     "(dropped-frame budget)").arg(p95ms, 0, 'f', 3)));
+        // Hard: egregious jank (>50ms = visibly stuttery) fails the build.
+        QVERIFY2(p100ms <= 50.0,
+                 qPrintable(QString("perf16: p100 balances-model rebuild %1ms > 50ms "
+                                    "(egregious jank)").arg(p100ms, 0, 'f', 3)));
+
+        delete balsA; delete utxoA; delete balsB; delete utxoB;
+        settleAndDelete(w);
+    }
+
+    // perf22_warmLatency — BEST-EFFORT warm end-to-end latency: the wall time from
+    //   t0 = RPC::onNotifyPush() (driven via testFireNotifyPush) to
+    //   t1 = MainWindow::heroBalancesPainted() (emitted at the end of
+    //   updateHomeFixIt once the hero repaints), across N notify cycles. The
+    //   mandatory 200ms notify debounce (RPC::kNotifyDebounceMs) is the HARD FLOOR,
+    //   so a healthy number would be ~debounce + a few ms of rebuild.
+    //
+    //   *** DEFERRED in this environment (the harness QSKIPs it). ***
+    //   Measuring t0->t1 requires refresh() to actually run end-to-end, which needs a
+    //   live Connection to a daemon. A tests/mock/mockrpc.py subprocess on an isolated
+    //   loopback port (the helpers findPython/waitForMockHealth/installMockConnection/
+    //   shutdownMock below mirror tests/e2e/mocke2e.sh) DOES wire up cleanly and the
+    //   first refresh fires ("Payment UI now ready!"), but under QT_QPA_PLATFORM=
+    //   offscreen in proot the notify->debounce->refresh->paint cycle does not settle
+    //   deterministically inside a bounded QTest::qWait: setConnection()'s cascade of
+    //   async getinfo/getblockchaininfo/balance polls keeps the event loop churning so
+    //   the loop neither observes a clean heroBalancesPainted nor reaches its skip in
+    //   bounded time (it WEDGED the whole suite for minutes in testing). Per the design
+    //   brief — "Prefer a reliable perf16 number over a flaky perf22" — perf22 is
+    //   DEFERRED rather than allowed to flake/hang the L1 run. perf16_modelJank() is the
+    //   robust, deterministic deliverable and records the real model-rebuild baseline.
+    //
+    //   The production t0/t1 seams (heroBalancesPainted signal + testFireNotifyPush)
+    //   AND the mock-orchestration helpers are all in place, so finishing perf22 later
+    //   is purely a matter of making the refresh-settle loop robust (e.g. drive a
+    //   single-shot refresh against a static balance fixture and a QSignalSpy on
+    //   heroBalancesPainted with a hard wall-clock cap), not new wiring.
+    void perf22_warmLatency() {
+        QSKIP("perf22 DEFERRED: warm t0(onNotifyPush)->t1(heroBalancesPainted) latency "
+              "needs a settled refresh() cycle; the mock wires up but the async poll "
+              "cascade does not settle deterministically under offscreen/proot within a "
+              "bounded wait. perf16_modelJank is the reliable deliverable. See the slot "
+              "comment for the exact reason and the path to finishing it.");
+
+        // --- Reference implementation kept (compiled, but unreachable after QSKIP) so
+        // the t0/t1 wiring is documented in code and trivially re-enabled. ---
+        const QString py = findPython();
+        if (py.isEmpty()) return;
+        const QString mockScript =
+            QDir(QCoreApplication::applicationDirPath()).filePath("../mock/mockrpc.py");
+        if (!QFile::exists(mockScript)) return;
+
+        const int port = 31900 + (QRandomGenerator::global()->bounded(500));
+        QProcess mock;
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        env.insert("MOCK_PORT", QString::number(port));
+        env.insert("MOCK_SCENARIO", "funded-synced");
+        env.insert("MOCK_LOG", QDir::tempPath() + "/zqw_perf22_mock.log");
+        mock.setProcessEnvironment(env);
+        mock.start(py, { mockScript });
+        if (!mock.waitForStarted(3000)) return;
+        if (!waitForMockHealth(port, 3000)) { shutdownMock(mock, port); return; }
+
+        auto* S = Settings::getInstance();
+        const bool savedHeadless = S->isHeadless();
+        S->setUseEmbedded(false);
+        S->setHeadless(false);
+        S->setSyncing(false);
+        S->setPeers(8);
+        S->setZClassicdVersion(2001250);
+        MainWindow* w = new MainWindow(nullptr);
+        w->show();
+        RPC* rpc = w->getRPC();
+        installMockConnection(w, port);
+
+        QElapsedTimer t;
+        QVector<qint64> latNs;
+        bool armed = false;
+        QObject::connect(w, &MainWindow::heroBalancesPainted, w, [&]() {
+            if (armed) { latNs.push_back(t.nsecsElapsed()); armed = false; }
+        });
+
+        const int CYCLES = 6;
+        for (int c = 0; c < CYCLES; ++c) {
+            armed = true;
+            t.restart();
+            rpc->testFireNotifyPush();                 // t0
+            QElapsedTimer budget; budget.start();
+            while (armed && budget.elapsed() < 5000)
+                QTest::qWait(20);
+        }
+        shutdownMock(mock, port);
+
+        if (!latNs.isEmpty()) {
+            std::sort(latNs.begin(), latNs.end());
+            auto pct = [&latNs](double p) -> qint64 {
+                int idx = (int)std::ceil(p / 100.0 * latNs.size()) - 1;
+                idx = qBound(0, idx, latNs.size() - 1);
+                return latNs[idx];
+            };
+            qInfo().noquote() << QString(
+                "PERF perf22 warmLatency cycles=%1 floor=%2ms p50=%3ms p95=%4ms")
+                .arg(latNs.size()).arg(RPC::kNotifyDebounceMs)
+                .arg(pct(50) / 1e6, 0, 'f', 3).arg(pct(95) / 1e6, 0, 'f', 3);
+        }
+        settleAndDelete(w);
+        S->setHeadless(savedHeadless);
+    }
 #endif
 
 private:
 #ifdef ZCL_WIDGET_TEST
+    // ---- perf22 helpers (mock orchestration; mirror tests/e2e/mocke2e.sh) ----
+    // Locate a python3 interpreter on PATH (proot maps /usr/bin/python3).
+    QString findPython() {
+        for (const QString& cand : { "/usr/bin/python3", "/usr/local/bin/python3",
+                                     "python3" }) {
+            if (cand.startsWith('/')) {
+                if (QFile::exists(cand)) return cand;
+            } else {
+                return cand;   // rely on PATH lookup
+            }
+        }
+        return QString();
+    }
+
+    // GET http://127.0.0.1:<port>/ and return true once it answers 200 within budget.
+    bool waitForMockHealth(int port, int budgetMs) {
+        QElapsedTimer budget; budget.start();
+        while (budget.elapsed() < budgetMs) {
+            QTcpSocket sock;
+            sock.connectToHost(QHostAddress::LocalHost, port);
+            if (sock.waitForConnected(200)) {
+                sock.write(QString("GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+                               .toUtf8());
+                sock.flush();
+                if (sock.waitForReadyRead(500)) {
+                    QByteArray resp = sock.readAll();
+                    if (resp.contains("200") || resp.contains("\"ok\""))
+                        return true;
+                }
+            }
+            QTest::qWait(50);
+        }
+        return false;
+    }
+
+    // GET /__shutdown then terminate as a fallback so no mock leaks across runs.
+    void shutdownMock(QProcess& mock, int port) {
+        QTcpSocket sock;
+        sock.connectToHost(QHostAddress::LocalHost, port);
+        if (sock.waitForConnected(300)) {
+            sock.write(QString("GET /__shutdown HTTP/1.0\r\nHost: localhost\r\n\r\n")
+                           .toUtf8());
+            sock.flush();
+            sock.waitForReadyRead(300);
+        }
+        if (mock.state() != QProcess::NotRunning) {
+            mock.terminate();
+            if (!mock.waitForFinished(1500)) { mock.kill(); mock.waitForFinished(1000); }
+        }
+    }
+
+    // Build a REAL Connection pointed at the mock's loopback port and install it on
+    // the RPC so refresh()/getInfoThenRefresh() actually issue RPC and repaint.
+    void installMockConnection(MainWindow* w, int port) {
+        auto cfg = std::make_shared<ConnectionConfig>();
+        cfg->host  = "127.0.0.1";
+        cfg->port  = QString::number(port);
+        cfg->rpcuser = "test";
+        cfg->rpcpassword = "test";
+        cfg->zclassicDir = QDir::tempPath();
+        auto* nam = new QNetworkAccessManager(w);
+        auto* req = new QNetworkRequest();
+        QString userpass = cfg->rpcuser + ":" + cfg->rpcpassword;
+        QString headerData = "Basic " + userpass.toUtf8().toBase64();
+        req->setUrl(QUrl(QString("http://127.0.0.1:%1/").arg(port)));
+        req->setRawHeader("Authorization", headerData.toLocal8Bit());
+        req->setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+        auto* c = new Connection(w, nam, req, cfg);
+        w->getRPC()->setConnection(c);
+    }
+
     // Apply the SHIPPED production dark theme (Fusion + dark palette + dark.qss from
     // the qrc) to the running QApplication so grabbed shots match production, not the
     // default light Fusion look. Mirrors src/main.cpp's theme setup.

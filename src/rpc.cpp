@@ -5,6 +5,7 @@
 #include "senttxstore.h"
 #include "turnstile.h"
 #include "version.h"
+#include "guistartup.h"     // [gui-startup] first-balance milestone + summary line
 
 #include <QEventLoop>
 #include <QElapsedTimer>
@@ -270,6 +271,30 @@ void RPC::setConnection(Connection* c) {
     delete conn;
     this->conn = c;
 
+    // ADVANCED-TAB-FIX: the node-stats ("zclassicd") page is held aside at startup
+    // (MainWindow ctor: widget(4) + removeTab(4)) and must be re-added once we are
+    // attached to a LIVE node so the nav-rail "⚙ Advanced" button has somewhere to
+    // land. setConnection is the universal attach instant: doRPCSetConnection calls
+    // it for BOTH the embedded (owned-QProcess) path AND the foreign/already-running
+    // node path, and it has already early-returned above when c == nullptr, so it
+    // never fires on teardown/showError. Previously the tab was added only inside
+    // setEZClassicd behind an `ezclassicd != nullptr` gate, so a foreign node (the
+    // now-common path, ezclassicd stays null) never got the tab and Advanced was a
+    // silent no-op. All fields on the page are RPC-derived (getinfo connections,
+    // getnetworksolps, getblockchaininfo, getpeerinfo) and valid for any node; none
+    // read the QProcess. Keep the widget(4)==nullptr guard — it is the genuine
+    // no-double-add sentinel (tab_5/index 4 is the only widget at index>=4, the sole
+    // removeTab is the ctor, the sole adds are here + the now-redundant setEZClassicd
+    // path) and also honors "do not re-add after close" if a close path is ever added.
+    if (main->zclassicdtab != nullptr && ui->tabWidget->widget(4) == nullptr) {
+        ui->tabWidget->addTab(main->zclassicdtab, "zclassicd");
+    }
+
+    // W1-6: a new connection may be a different node/chain, so drop the sent-z
+    // confirmation cache; we must never carry stale deep-conf counts across a reconnect.
+    sentZConfCache.clear();
+    sentZConfCacheHeight = 0;
+
     // Don't claim "Ready!" here -- we've only just connected to the node; it may
     // still be syncing. The real status (Syncing %/Connected) is set by the
     // getblockchaininfo poll a moment later.
@@ -280,13 +305,22 @@ void RPC::setConnection(Connection* c) {
     Settings::removeFromZClassicConf(zclassicConfLocation, "rescan");
     Settings::removeFromZClassicConf(zclassicConfLocation, "reindex");
 
-    // Refresh the UI
-    refreshZCLPrice();    
-    checkForUpdate();
-
-    // Force update, because this might be coming from a settings update
-    // where we need to immediately refresh
+    // W1-3: get the wallet UI onto the screen FIRST. The forced refresh (balances/
+    // transactions) is the critical path the user is waiting on after connect; do it
+    // immediately. This might also be coming from a settings update where we need to
+    // immediately refresh.
     refresh(true);
+
+    // The price ticker and the GitHub update check are NOT on the connect critical
+    // path — they hit the network and (the update check) can pop a modal. Defer them a
+    // few seconds so they never stall the freshly-connected UI. 'main' is the context
+    // object (RPC is not a QObject); since `delete rpc` runs inside ~MainWindow, if the
+    // window is torn down before this fires Qt auto-cancels the singleShot so the
+    // lambda never runs against a freed RPC (UAF-safety, per the line-31 idiom).
+    QTimer::singleShot(4000, main, [this]() {
+        refreshZCLPrice();
+        checkForUpdate();
+    });
 }
 
 void RPC::getTAddresses(const std::function<void(json)>& cb) {
@@ -310,7 +344,7 @@ void RPC::getZAddresses(const std::function<void(json)>& cb) {
     conn->doRPCWithDefaultErrorHandling(payload, cb);
 }
 
-void RPC::getTransparentUnspent(const std::function<void(json)>& cb) {
+void RPC::getTransparentUnspent(const std::function<void(json)>& cb, const std::function<void(void)>& err) {
     json payload = {
         {"jsonrpc", "1.0"},
         {"id", "someid"},
@@ -318,10 +352,14 @@ void RPC::getTransparentUnspent(const std::function<void(json)>& cb) {
         {"params", {0}}             // Get UTXOs with 0 confirmations as well.
     };
 
-    conn->doRPCWithDefaultErrorHandling(payload, cb);
+    // W1-5: use the error-AWARE doRPC (not the default dialog handler) so a failed
+    // unspent query still notifies the caller — otherwise the count==2 join latch in
+    // refreshBalances would hang forever. We swallow the dialog here (no popup during
+    // warmup) and let the caller settle the join; the next refresh retries.
+    conn->doRPC(payload, cb, [=] (QNetworkReply*, const json&) { err(); });
 }
 
-void RPC::getZUnspent(const std::function<void(json)>& cb) {
+void RPC::getZUnspent(const std::function<void(json)>& cb, const std::function<void(void)>& err) {
     json payload = {
         {"jsonrpc", "1.0"},
         {"id", "someid"},
@@ -329,7 +367,7 @@ void RPC::getZUnspent(const std::function<void(json)>& cb) {
         {"params", {0}}             // Get UTXOs with 0 confirmations as well.
     };
 
-    conn->doRPCWithDefaultErrorHandling(payload, cb);
+    conn->doRPC(payload, cb, [=] (QNetworkReply*, const json&) { err(); });
 }
 
 void RPC::newZaddr(bool sapling, const std::function<void(json)>& cb) {
@@ -425,6 +463,37 @@ void RPC::getBalance(const std::function<void(json)>& cb) {
     };
 
     conn->doRPCWithDefaultErrorHandling(payload, cb);
+}
+
+// INSTANT-BALANCE fast path. getwalletsummary returns the wallet's transparent and
+// private (shielded) totals in ONE round-trip from the daemon's cached note-value
+// accessors (no per-note re-decrypt, no per-address listunspent join), so the hero
+// balance paints instantly on connect — this REPLACES the slow z_gettotalbalance
+// hero query when the daemon supports it (see refreshBalances).
+//
+// MONEY-CORRECTNESS: we pass minconf=0 to match getBalance()'s z_gettotalbalance {0}
+// to the satoshi — daemon-side getwalletsummary(0).transparent == getBalanceTaddr("",0)
+// (the very call z_gettotalbalance uses) and .private == cached Sprout+Sapling at
+// minconf 0 (proven equal to the slow scan), so .total == z_gettotalbalance(0).total.
+// minconf=0 includes 0-conf funds, exactly as the legacy hero did, so the two paths
+// can never disagree and switching daemons never changes the displayed number.
+//
+// Amounts are FormatMoney decimal strings (identical representation to
+// z_gettotalbalance). We use the error-AWARE doRPC (not the default dialog handler)
+// and forward the parsed JSON-RPC body to the err cb so the caller can detect -32601
+// ("Method not found") on an OLD daemon and latch the capability off — no warmup/
+// transient error pops a dialog here. KEY-1: reads ONLY balance numbers; no key
+// material involved.
+void RPC::getWalletSummary(const std::function<void(json)>& cb,
+                           const std::function<void(const json&)>& err) {
+    json payload = {
+        {"jsonrpc", "1.0"},
+        {"id", "someid"},
+        {"method", "getwalletsummary"},
+        {"params", {0}}             // minconf=0: match z_gettotalbalance {0} exactly.
+    };
+
+    conn->doRPC(payload, cb, [=] (QNetworkReply*, const json& parsed) { err(parsed); });
 }
 
 void RPC::getTransactions(const std::function<void(json)>& cb) {
@@ -577,7 +646,7 @@ void RPC::fillTxJsonParams(json& params, Tx tx) {
 }
 
 
-void RPC::noConnection() {    
+void RPC::noConnection(bool preserveBalances) {
     QIcon i = QApplication::style()->standardIcon(QStyle::SP_MessageBoxCritical);
     main->statusIcon->setPixmap(i.pixmap(16, 16));
     main->statusIcon->setToolTip("");
@@ -587,6 +656,20 @@ void RPC::noConnection() {
 
     // P0-6: reflect the lost connection in the main-tab sync banner.
     main->setSyncStatusConnecting();
+
+    // transient-disconnect-zeroes-hero: a SOFT disconnect (one debounced getinfo
+    // error, connection still live) must NOT discard the last-known balances. Keep
+    // the labels/tables/send-inputs exactly as painted and only de-confidence the
+    // hero to WARMING grey with the "Last updated … · refreshing" qualifier
+    // (fromCache=true). Because the canonical labels stay non-blank, updateHomeFixIt
+    // reads haveNumber=true, so a funded wallet keeps Send primary and never flashes
+    // grey "0 ZCL". transparent=0.0 only hides the amber shield card for the blip; it
+    // re-appears on the next successful poll. The full teardown below runs only on a
+    // sustained outage (or any of the many conn==nullptr callers, which pass false).
+    if (preserveBalances) {
+        main->updateHomeFixIt(0.0, /*fromCache=*/true);
+        return;
+    }
 
     // Clear balances table.
     QMap<QString, double> emptyBalances;
@@ -766,6 +849,80 @@ void RPC::onNotifyPush() {
 }
 
 
+// Deliverable A: fill the "you're helping the network" panel from getpeerinfo.
+// 100% read-only (doRPCIgnoreError => an old/foreign daemon, a -28 warmup, or a
+// missing method just leaves the last text; never pops a dialog, never writes).
+// HONESTY: reachability is derived from the INBOUND peer count, NOT from
+// getnetworkinfo networks[].reachable -- that field is just !vfLimited[net]
+// (net.cpp), true by default even behind a NAT, so it would falsely tell a NAT'd
+// user they are reachable. inbound>0 is hard proof we actually accept incoming.
+void RPC::refreshNetworkHelpPanel(int connections) {
+    if (conn == nullptr || main == nullptr || main->netHelpStatusLabel == nullptr)
+        return;
+    // Honestly gate the panel's one-click NAT-PMP toggle: it only does anything
+    // with an embedded daemon (the -natpmp flag is a launch arg we pass only when
+    // WE start the node, connection.cpp). With a foreign/attached node, disable it
+    // and explain -- exactly like the Settings chkNatpmp (mainwindow.cpp). We do
+    // this here (not at build time) because setupNetworkHelpPanel() runs before
+    // `rpc = new RPC(this)`, so rpc->isEmbedded() is only knowable by this point.
+    if (main->netHelpNatpmpChk != nullptr) {
+        const bool embedded = isEmbedded();
+        main->netHelpNatpmpChk->setEnabled(embedded);
+        if (!embedded)
+            main->netHelpNatpmpChk->setToolTip(QObject::tr(
+                "Automatic port opening is available only when ZclWallet runs its own (embedded) node."));
+        // DESYNC FIX: the panel checkbox is set only at construction, so toggling the SAME
+        // setting from the Settings dialog left this control stale (and contradicting its own
+        // adjacent reach label, which is recomputed live). Re-sync the visual state each poll.
+        // QSignalBlocker is required: the toggled lambda pops a QMessageBox, which we must not
+        // fire from a programmatic re-sync.
+        {
+            QSignalBlocker b(main->netHelpNatpmpChk);
+            main->netHelpNatpmpChk->setChecked(Settings::getInstance()->getOpenPortNatpmp());
+        }
+    }
+    if (QSettings().value("net/helpPanelHidden", false).toBool())
+        return;   // user opted out of the nudge; skip the extra round-trip
+
+    const int port = Settings::getInstance()->isTestnet() ? 18033 : 8033;
+    json peerPayload = {
+        {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "getpeerinfo"}
+    };
+    conn->doRPCIgnoreError(peerPayload, [=](const json& reply) {
+        if (main == nullptr || main->netHelpStatusLabel == nullptr
+                || main->netHelpReachLabel == nullptr)
+            return;
+        int inbound = 0;
+        if (reply.is_array()) {
+            for (const auto& p : reply) {
+                if (p.find("inbound") != p.end() && !p["inbound"].is_null()
+                        && p["inbound"].get<json::boolean_t>())
+                    inbound++;
+            }
+        }
+        main->netHelpStatusLabel->setText(
+            QObject::tr("P2P: ON \xc2\xb7 port %1 \xc2\xb7 %2 peers (%3 inbound)")
+                .arg(port).arg(connections).arg(inbound));
+        if (inbound > 0)
+            main->netHelpReachLabel->setText(
+                QObject::tr("Inbound connections: reachable \xe2\x80\x94 thank you for serving!"));
+        else if (Settings::getInstance()->getOpenPortNatpmp())
+            // Toggle is ON but no inbound peer yet. This is an ACTION statement,
+            // NOT a reachability claim: a NAT-PMP/PCP mapping can succeed and the
+            // user still be unreachable behind double-NAT/CGNAT, and we never
+            // verify reachability -- inbound>0 above is the ONLY 'reachable' claim.
+            main->netHelpReachLabel->setText(
+                QObject::tr("Inbound connections: none yet \xe2\x80\x94 automatic port opening is on; "
+                            "waiting for the first inbound peer. (If your router doesn't "
+                            "support it, forward port %1 manually.)").arg(port));
+        else
+            main->netHelpReachLabel->setText(
+                QObject::tr("Inbound connections: none yet \xe2\x80\x94 you're still helping by "
+                            "relaying. Forward port %1 on your router to accept incoming "
+                            "connections.").arg(port));
+    });
+}
+
 void RPC::getInfoThenRefresh(bool force) {
     if  (conn == nullptr) 
         return noConnection();
@@ -779,6 +936,8 @@ void RPC::getInfoThenRefresh(bool force) {
     static bool prevCallSucceeded = false;
     conn->doRPC(payload, [=] (const json& reply) {
         prevCallSucceeded = true;
+        // A good poll clears the transient-disconnect debounce (see error cb below).
+        getInfoErrCount = 0;
         // F4: a successful getinfo means the node is back up and answering, so a
         // prior crash has been fully recovered. Reset the restart counter; the cap
         // therefore means "3 crashes without a successful recovery in between"
@@ -790,8 +949,20 @@ void RPC::getInfoThenRefresh(bool force) {
         };
 
         // Connected, so display checkmark.
-        QIcon i(":/icons/res/connected.gif");
-        main->statusIcon->setPixmap(i.pixmap(16, 16));
+        // PR-2: decode the checkmark pixmap exactly once (function-local static)
+        // instead of re-reading the GIF resource + rescaling to 16x16 through the
+        // image plugin on every poll tick. We still call setPixmap each tick (with
+        // the pre-decoded pixmap, which is cheap), and deliberately do NOT add a
+        // cross-tick "skip if unchanged" guard: noConnection() also writes
+        // main->statusIcon (the red SP_MessageBoxCritical icon) on every transient
+        // getinfo error without our knowledge, so such a guard would leave the stale
+        // red icon stuck after a reconnect. GUI-thread only: this lambda is
+        // delivered on the main thread (QNetworkReply::finished). The desired icon
+        // defaults to 'connected'; the no-peers check below may flip it to the
+        // warning icon, and we then apply it exactly once.
+        static const QPixmap connectedPm = QIcon(":/icons/res/connected.gif").pixmap(16, 16);
+        bool showWarningIcon = false;
+
 
         static int    lastBlock = 0;
         int curBlock  = reply["blocks"].get<json::number_integer_t>();
@@ -814,13 +985,45 @@ void RPC::getInfoThenRefresh(bool force) {
         Settings::getInstance()->setPeers(connections);
 
         if (connections == 0) {
-            // If there are no peers connected, then the internet is probably off or something else is wrong. 
-            QIcon i = QApplication::style()->standardIcon(QStyle::SP_MessageBoxWarning);
-            main->statusIcon->setPixmap(i.pixmap(16, 16));
+            // If there are no peers connected, then the internet is probably off or
+            // something else is wrong.
+            showWarningIcon = true;
+        }
+
+        // PR-2: apply the status icon exactly once per tick (the original set it here
+        // AND above on a zero-peer tick). The warning pixmap is cached in its own
+        // function-local static so QStyle::standardIcon + the 16x16 scale runs at
+        // most once for the whole process. We always setPixmap with the pre-decoded
+        // pixmap (no cross-tick skip) so a prior noConnection() critical icon is
+        // reliably cleared on recovery. connectedPm and showWarningIcon are declared
+        // earlier in this same lambda body. Main-thread only.
+        if (showWarningIcon) {
+            static const QPixmap warningPm =
+                QApplication::style()->standardIcon(QStyle::SP_MessageBoxWarning).pixmap(16, 16);
+            main->statusIcon->setPixmap(warningPm);
+        } else {
+            main->statusIcon->setPixmap(connectedPm);
         }
 
         // Get network sol/s
-        if (ezclassicd) {
+        // ADVANCED-TAB-FIX: gate on `conn` (a live connection), NOT on `ezclassicd`
+        // (the owned-QProcess pointer). numconnections + solrate are pure RPC data
+        // (getinfo `connections`, already in scope; getnetworksolps) valid for ANY
+        // connected node, so a foreign/already-running node must fill them too —
+        // otherwise the now-visible Advanced tab sits on its "Loading..." .ui
+        // placeholders. We are already inside the live getinfo doRPC reply (reached
+        // only after getInfoThenRefresh's early-return-on-conn==nullptr), and the
+        // node dying stops the polls, so `if (conn)` is crash-safe; do NOT introduce
+        // any unconditional ezclassicd deref here.
+        if (conn) {
+            // DECOUPLE FIX: the peer count is already known here (from the getinfo reply), so
+            // paint it NOW rather than only inside the getnetworksolps success callback. The
+            // old code set numconnections only on a successful getnetworksolps (doRPCIgnoreError
+            // = silent no-op on error), so on a node/build where getnetworksolps errors the
+            // Advanced page's prime stat (Connections) sat on "Loading…" forever even though we
+            // had the number. Sol/s stays in the callback (it genuinely needs that RPC).
+            ui->numconnections->setText(QString::number(connections));
+
             json payload = {
                 {"jsonrpc", "1.0"},
                 {"id", "someid"},
@@ -829,11 +1032,14 @@ void RPC::getInfoThenRefresh(bool force) {
 
             conn->doRPCIgnoreError(payload, [=](const json& reply) {
                 qint64 solrate = reply.get<json::number_unsigned_t>();
-
-                ui->numconnections->setText(QString::number(connections));
                 ui->solrate->setText(QString::number(solrate) % " Sol/s");
             });
-        } 
+        }
+
+        // Deliverable A: refresh the read-only "you're helping the network" panel.
+        // READ-ONLY: getnetworkinfo + getpeerinfo only; never mutates node state.
+        refreshNetworkHelpPanel(connections);
+
 
         // Call to see if the blockchain is syncing. 
         json payload = {
@@ -908,6 +1114,9 @@ void RPC::getInfoThenRefresh(bool force) {
             bool targetKnown = (target > 0);
 
             Settings::getInstance()->setSyncing(isSyncing);
+            // Stamp the time of this live poll so the send gate can ignore a frozen
+            // isSyncing flag (single writer: this poll, beside the flag it stamps).
+            Settings::getInstance()->setLastSyncPollEpoch(QDateTime::currentSecsSinceEpoch());
             Settings::getInstance()->setBlockNumber(blockNumber);
 
             // G6: clear the warmup-wedge cap (heal/attempts.warmupRestart) only on
@@ -945,7 +1154,7 @@ void RPC::getInfoThenRefresh(bool force) {
             // F6: debounce the peerless banner — a single connections==0 sample
             // shouldn't flip it. Require ~3 consecutive peerless polls (~15s at the
             // 5s sync cadence); a single peer resets the counter instantly.
-            if (connections == 0) ezNoPeerPolls++; else ezNoPeerPolls = 0;
+            if (connections == 0) ezNoPeerPolls++; else { ezNoPeerPolls = 0; ezForeignStuckSince.invalidate(); ezForeignStuckShown = false; }   // W1-4: peers back -> let the stuck dialog re-surface if it gets stuck again later
             if (isSyncing && connections == 0 && ezNoPeerPolls >= 3) {
                 // RUNTIME STUB AUTO-HEAL: a node that STARTED FINE but loaded a tiny
                 // non-genesis "stub" chain (e.g. an aborted P2P sync left ~17MB of
@@ -990,8 +1199,21 @@ void RPC::getInfoThenRefresh(bool force) {
                 // nullptr — it self-heals at its own startup and has bootstrap peers, so it
                 // is not peerless) NEVER reaches this branch; a foreign node WITH peers /
                 // syncing/synced never enters this peerless block at all (case C).
-                if (ezclassicd == nullptr && ezNoPeerPolls >= 36 && !ezForeignStuckShown) {
+                // W1-4: in addition to the poll-count gate, require a SUSTAINED
+                // wall-clock window (~120s) of being peerless before surfacing the
+                // actionable dialog, so a fast sync cadence can't false-fire it during
+                // a legitimate multi-minute first-run warmup. Start the timer on the
+                // first peerless sample seen here; it's invalidated below the moment a
+                // peer appears, and reset when the dialog is shown.
+                if (ezclassicd == nullptr && !ezForeignStuckSince.isValid())
+                    ezForeignStuckSince.start();
+                if (ezclassicd == nullptr && ezNoPeerPolls >= 36 && !ezForeignStuckShown &&
+                    ezForeignStuckSince.isValid() && ezForeignStuckSince.elapsed() >= 120000) {
                     ezForeignStuckShown = true;
+                    // W1-4: do NOT invalidate the timer here. ezForeignStuckShown already
+                    // suppresses a repeat while we stay peerless; both it and the timer are
+                    // reset the moment peers return (above), so the dialog can correctly
+                    // re-fire on a fresh stuck stretch rather than being silenced forever.
                     main->logger->write("Foreign node peerless/stuck past sustained window; "
                                         "surfacing actionable dialog (cannot heal a node we "
                                         "did not start)");
@@ -1040,7 +1262,14 @@ void RPC::getInfoThenRefresh(bool force) {
             }
 
             // Update zclassicd tab if it exists
-            if (ezclassicd) {
+            // ADVANCED-TAB-FIX: gate on `conn` (live connection), NOT on `ezclassicd`
+            // (owned QProcess). blockheight/heightLabel are derived purely from this
+            // getblockchaininfo reply (blockNumber/target/isSyncing) and are valid for
+            // any connected node, so a foreign node must fill them too instead of
+            // leaving the height field on its "Loading..." placeholder. This block
+            // already runs inside the live conn-guarded getblockchaininfo reply, so
+            // `if (conn)` is crash-safe; no unconditional ezclassicd deref is added.
+            if (conn) {
                 if (isSyncing) {
                     QString txt = QString::number(blockNumber);
                     if (targetKnown) {
@@ -1062,11 +1291,15 @@ void RPC::getInfoThenRefresh(bool force) {
 
             // Update the status bar. Only show a percent when the target is known;
             // a peerless/just-started sync has no meaningful % yet.
+            // P2-4: at rest, show a thousands-separated height ("Connected (1,700,000)")
+            // for readability; the syncing branch keeps its raw block/percent format.
+            QString heightStr = isSyncing ? QString::number(blockNumber)
+                                          : Settings::getHeightString(blockNumber);
             QString statusText = QString() %
                 (isSyncing ? QObject::tr("Syncing") : QObject::tr("Connected")) %
                 " (" %
                 (Settings::getInstance()->isTestnet() ? QObject::tr("testnet:") : "") %
-                QString::number(blockNumber) %
+                heightStr %
                 (isSyncing && targetKnown ? ("/" % QString::number(progress*100, 'f', 2) % "%") : QString()) %
                 ")";
             if (isSyncing && !targetKnown)
@@ -1081,7 +1314,17 @@ void RPC::getInfoThenRefresh(bool force) {
             else {
                 tooltip = QObject::tr("zclassicd has no peer connections");
             }
-            tooltip = tooltip % "(v " % QString::number(Settings::getInstance()->getZClassicdVersion()) % ")";
+            // FORMAT FIX: was "…zclassicd(v 2001225)" — no space before "(", and a raw
+            // CLIENT_VERSION integer. Add the space and decode the standard encoding
+            // (1000000*major + 10000*minor + 100*rev + build) to a dotted version.
+            {
+                int v = Settings::getInstance()->getZClassicdVersion();
+                QString vStr = (v > 0)
+                    ? QString("%1.%2.%3.%4").arg(v / 1000000).arg((v / 10000) % 100)
+                                            .arg((v / 100) % 100).arg(v % 100)
+                    : QString::number(v);
+                tooltip = tooltip % " (v" % vStr % ")";
+            }
 
             if (!zclPrice.isEmpty()) {
                 tooltip = "1 ZCL = " % zclPrice % "\n" % tooltip;
@@ -1111,7 +1354,20 @@ void RPC::getInfoThenRefresh(bool force) {
 
     }, [=](QNetworkReply* reply, const json&) {
         // zclassicd has probably disappeared.
-        this->noConnection();
+        // transient-disconnect-zeroes-hero: doRPC has no retry, so a SINGLE dropped
+        // getinfo reply (a momentary RPC stall, not a real teardown) used to blank
+        // the balance labels and reset the hero to grey "0 ZCL" with Send demoted —
+        // a funded wallet flashed empty on one hiccup. Debounce like the peerless
+        // banner (ezNoPeerPolls>=3): the first few consecutive errors do a SOFT
+        // disconnect that PRESERVES the last balances (hero goes WARMING/refreshing,
+        // no Send/Receive swap from a blanked label); only a sustained outage
+        // (>=3 consecutive failures, ~the same dwell as the banner) does the full
+        // teardown that wipes stale data.
+        getInfoErrCount++;
+        if (getInfoErrCount < 3)
+            this->noConnection(/*preserveBalances=*/true);
+        else
+            this->noConnection();
 
         // Prevent multiple dialog boxes, because these are called async. Also
         // suppress this generic error while the crash-recovery dialog is up (or the
@@ -1178,11 +1434,21 @@ void RPC::refreshAddresses() {
 }
 
 // Function to create the data model and update the views, used below.
-void RPC::updateUI(bool anyUnconfirmed) {    
+void RPC::updateUI(bool anyUnconfirmed) {
     ui->unconfirmedWarning->setVisible(anyUnconfirmed);
 
     // Update balances model data, which will update the table too
+#ifdef ZCL_WIDGET_TEST
+    // PERF harness (perf16_modelJank): time ONLY the balances-model rebuild — the
+    // pure-CPU hot path the perf slot asserts on. Zero cost when ZCL_WIDGET_TEST is
+    // undefined (the entire block compiles out).
+    QElapsedTimer _perfTimer;
+    _perfTimer.start();
     balancesTableModel->setNewData(allBalances, utxos);
+    balanceModelSamplesNs.push_back(_perfTimer.nsecsElapsed());
+#else
+    balancesTableModel->setNewData(allBalances, utxos);
+#endif
 
     // Update from address
     main->updateFromCombo();
@@ -1251,6 +1517,8 @@ bool RPC::repollTransparentUnspent(const std::function<void(bool)>& cb) {
     return false;     // no seam installed -> caller fails closed
 #else
     if (!conn) { cb(false); return false; }            // never null-deref getTransparentUnspent
+    // MERGE RECONCILE: local getTransparentUnspent is 2-arg (cb, err). Pass an err lambda
+    // that fails closed (cb(false)) instead of hanging if the unspent query errors.
     getTransparentUnspent([this, cb](json reply) {
         auto* freshT       = new QList<UnspentOutput>();
         auto* throwawayBals = new QMap<QString, double>();
@@ -1258,17 +1526,36 @@ bool RPC::repollTransparentUnspent(const std::function<void(bool)>& cb) {
         delete throwawayBals;
         utxos = mergeTransparentUnspent(utxos, freshT);
         cb(true);
-    });
+    }, [cb]() { cb(false); });
     return true;
 #endif
 }
 
-void RPC::refreshBalances() {    
-    if  (conn == nullptr) 
+void RPC::refreshBalances() {
+    if  (conn == nullptr)
         return noConnection();
 
-    // 1. Get the Balances
-    getBalance([=] (json reply) {    
+    // 1. Get the Balances — the hero numbers (transparent / shielded / total).
+    //
+    // SINGLE WRITER, two interchangeable sources. getwalletsummary {0} and
+    // z_gettotalbalance {0} return the SAME three FormatMoney fields and (proven) the
+    // SAME satoshi totals, so we pick exactly ONE per cycle and feed it through a
+    // shared paint routine — never both concurrently. That removes any last-writer
+    // race over the hero labels/cache.
+    //   * New daemon (summaryCapable): getwalletsummary is the SOLE hero source. It
+    //     reads the daemon's cached note values in one round-trip (no per-note
+    //     re-decrypt), so the hero is fast in ALL cases, not just the first paint. We
+    //     SKIP the slow z_gettotalbalance entirely on this path.
+    //   * Old daemon: the FIRST summary call returns JSON-RPC -32601 ("Method not
+    //     found"); we latch summaryCapable=false (never call it again this session)
+    //     and fall back to z_gettotalbalance — identical to the legacy behavior.
+    //   * Any transient summary error (warmup -28, network) does NOT latch; we just
+    //     fall back to z_gettotalbalance for THIS cycle so the hero still updates, and
+    //     retry the summary on the next poll.
+    // The per-address listunspent join (step 2 below) ALWAYS runs and remains the sole
+    // owner of the per-address balances model / UTXO set; it does not touch the hero.
+    auto paintHero = std::function<void(json)>([=] (json reply) {
+        // Amounts are FormatMoney decimal STRINGS from either source.
         auto balT      = QString::fromStdString(reply["transparent"]).toDouble();
         auto balZ      = QString::fromStdString(reply["private"]).toDouble();
         auto balTotal  = QString::fromStdString(reply["total"]).toDouble();
@@ -1276,6 +1563,16 @@ void RPC::refreshBalances() {
         ui->balSheilded   ->setText(Settings::getZCLDisplayFormat(balZ));
         ui->balTransparent->setText(Settings::getZCLDisplayFormat(balT));
         ui->balTotal      ->setText(Settings::getZCLDisplayFormat(balTotal));
+
+        // [gui-startup] The hero balances just hit the labels — the wallet is now
+        // usable. Record the milestone and flush the ONE summary line, exactly once,
+        // matching the daemon's [startup] log. first-write-wins + the summaryLogged
+        // one-shot guarantee no later refresh re-logs it.
+        GuiStartup::markFirstBalance();
+        if (!GuiStartup::marks().summaryLogged && main && main->logger) {
+            GuiStartup::marks().summaryLogged = true;
+            main->logger->write(GuiStartup::summaryLine());
+        }
 
         ui->balSheilded   ->setToolTip(Settings::getUSDFormat(balZ));
         ui->balTransparent->setToolTip(Settings::getUSDFormat(balT));
@@ -1285,6 +1582,7 @@ void RPC::refreshBalances() {
         // fix-it card from these same freshly-set balances. We pass the transparent
         // amount we already have (balT) rather than re-querying; the hero reads the
         // labels just set above. The card shows only when balT > 0, hides at 0.
+        // updateHomeFixIt() emits heroBalancesPainted() at its end.
         main->updateHomeFixIt(balT);
 
         // Remember the last-known balances so the next launch can paint them
@@ -1301,44 +1599,120 @@ void RPC::refreshBalances() {
 
         // FUND-SAFETY: this wallet has no seed phrase, so an un-backed-up wallet.dat
         // is permanent, unrecoverable loss. Once we are fully synced AND the user
-        // actually holds a balance, prompt them to back up -- exactly ONCE per run.
-        // promptWalletBackup() is itself permanently silenced after a successful
-        // backup (options/walletbackedup), and the session one-shot here guarantees
-        // we never re-pop the dialog on subsequent balance polls (privacy-without-
-        // annoyance: it fires on the synced edge, not every refresh).
+        // actually holds a balance, surface the backup reminder -- exactly ONCE per
+        // run. W1-2: this now shows a NON-blocking amber Home card (showBackupNag())
+        // instead of the modal promptWalletBackup() box, so it never interrupts the
+        // user. It is permanently silenced after a successful backup
+        // (options/walletbackedup), and the session one-shot here guarantees we never
+        // re-fire on subsequent balance polls (it fires on the synced edge, not every
+        // refresh). promptWalletBackup() stays reachable from the Help menu.
         static bool backupPromptShownThisSession = false;
         if (!backupPromptShownThisSession &&
             !Settings::getInstance()->isSyncing() &&
             balTotal > 0) {
             backupPromptShownThisSession = true;
-            main->promptWalletBackup();
+            main->showBackupNag();
         }
     });
 
+    if (summaryCapable) {
+        getWalletSummary([=] (json reply) {
+            // Well-formed summary => it is the sole hero source this cycle. Require all
+            // three fields to be present AND strings (a forked/buggy daemon returning a
+            // numeric or partial object falls back rather than throwing or painting
+            // garbage).
+            if (reply.is_null() ||
+                reply.find("transparent") == reply.end() || !reply["transparent"].is_string() ||
+                reply.find("private")     == reply.end() || !reply["private"].is_string()     ||
+                reply.find("total")       == reply.end() || !reply["total"].is_string()) {
+                getBalance(paintHero);   // defensive: authoritative slow path this cycle
+                return;
+            }
+            paintHero(reply);
+        },
+        [=] (const json& parsed) {
+            // -32601 "Method not found" => OLD daemon: latch the capability off so we
+            // never call getwalletsummary again this session and log ONE diagnostic.
+            // Any OTHER error (warmup -28, transient network) does NOT latch.
+            if (!parsed.is_discarded() &&
+                parsed.find("error") != parsed.end() && parsed["error"].is_object() &&
+                parsed["error"].find("code") != parsed["error"].end() &&
+                parsed["error"]["code"].is_number_integer() &&
+                parsed["error"]["code"].get<int>() == -32601) {
+                summaryCapable = false;
+                main->logger->write("Daemon lacks getwalletsummary (-32601); "
+                                    "using z_gettotalbalance for balances this session");
+            }
+            // Either way, paint the hero from the authoritative slow path THIS cycle so
+            // a summary failure never leaves the hero stale.
+            getBalance(paintHero);
+        });
+    } else {
+        getBalance(paintHero);
+    }
+
     // 2. Get the UTXOs
-    // First, create a new UTXO list. It will be replacing the existing list when everything is processed.
-    auto newUtxos = new QList<UnspentOutput>();
-    auto newBalances = new QMap<QString, double>();
+    // W1-5: fire the transparent and z unspent APIs CONCURRENTLY (they were nested/
+    // serialized) and join once BOTH have returned. To avoid any shared-write race,
+    // each completion writes into its OWN temporary (t* / z*); we merge them into the
+    // final balances/utxos ONLY in the join, after both have landed. T-addr and z-addr
+    // keys are disjoint, so the merged result is identical to the old serial fill —
+    // semantics are preserved exactly, only the two round-trips now overlap.
+    struct UnspentJoin {
+        int pending = 2;
+        bool failed = false;
+        QList<UnspentOutput> tUtxos;     QMap<QString, double> tBalances;     bool tUnconfirmed = false;
+        QList<UnspentOutput> zUtxos;     QMap<QString, double> zBalances;     bool zUnconfirmed = false;
+    };
+    auto st = std::make_shared<UnspentJoin>();
 
-    // Call the Transparent and Z unspent APIs serially and then, once they're done, update the UI
+    auto finish = [=]() {
+        if (--st->pending != 0)
+            return;   // wait for the other stream
+
+        // W1-5: if either stream errored, do NOT publish a partial (wrong, too-low)
+        // balance — keep the last-known values and let the next refresh retry. The join
+        // still settles here, so it never hangs.
+        if (st->failed)
+            return;
+
+        // Both streams are in. Merge the two temporaries into the fresh containers
+        // that will replace the live ones.
+        auto newUtxos    = new QList<UnspentOutput>(st->tUtxos);
+        auto newBalances = new QMap<QString, double>(st->tBalances);
+        *newUtxos += st->zUtxos;
+        for (auto it = st->zBalances.constBegin(); it != st->zBalances.constEnd(); ++it)
+            (*newBalances)[it.key()] = (*newBalances)[it.key()] + it.value();
+
+        // Swap out the balances and UTXOs
+        delete allBalances;
+        delete utxos;
+
+        allBalances = newBalances;
+        utxos       = newUtxos;
+
+        updateUI(st->tUnconfirmed || st->zUnconfirmed);
+
+        main->balancesReady();
+    };
+
+    // W1-5 blocker fix: on RPC error, mark the join failed and STILL settle the latch
+    // so it can never hang. doRPC fires exactly one of {cb, err} per stream, so pending
+    // still reaches 0 and finish() runs exactly once.
+    auto fail = [=]() {
+        st->failed = true;
+        finish();
+    };
+
     getTransparentUnspent([=] (json reply) {
-        auto anyTUnconfirmed = processUnspent(reply, newBalances, newUtxos);
+        st->tUnconfirmed = processUnspent(reply, &st->tBalances, &st->tUtxos);
+        finish();
+    }, fail);
 
-        getZUnspent([=] (json reply) {
-            auto anyZUnconfirmed = processUnspent(reply, newBalances, newUtxos);
-
-            // Swap out the balances and UTXOs
-            delete allBalances;
-            delete utxos;
-
-            allBalances = newBalances;
-            utxos       = newUtxos;
-
-            updateUI(anyTUnconfirmed || anyZUnconfirmed);
-
-            main->balancesReady();
-        });        
-    });
+    getZUnspent([=] (json reply) {
+        st->zUnconfirmed = processUnspent(reply, &st->zBalances, &st->zUtxos);
+        finish();
+    }, fail);
 }
 
 void RPC::refreshTransactions() {    
@@ -1380,48 +1754,88 @@ void RPC::refreshSentZTrans() {
     if  (conn == nullptr) 
         return noConnection();
 
+    // W1-6 reorg safety: the deep-confirmed entries below stop being re-queried, so a
+    // reorg would otherwise freeze their now-wrong counts. If the chain height moved
+    // BACKWARD since the cache was last filled, a reorg happened — drop the whole cache
+    // so every tx is re-queried fresh (reorgs are rare, so a full re-query is fine).
+    int curHeight = Settings::getInstance()->getBlockNumber();
+    if (curHeight < sentZConfCacheHeight)
+        sentZConfCache.clear();
+    sentZConfCacheHeight = curHeight;
+
     auto sentZTxs = SentTxStore::readSentTxFile();
 
-    // If there are no sent z txs, then empty the table. 
+    // If there are no sent z txs, then empty the table.
     // This happens when you clear history.
     if (sentZTxs.isEmpty()) {
+        sentZConfCache.clear();   // history cleared — drop orphaned cache entries
         transactionsTableModel->addZSentData(sentZTxs);
         return;
     }
 
-    QList<QString> txids;
-
-    for (auto sentTx: sentZTxs) {
-        txids.push_back(sentTx.txid);
+    // W1-6: throttle the per-block gettransaction storm. A sent z-tx that is already
+    // DEEPLY confirmed (>= kDeepConfirmations) will never meaningfully change, so we
+    // stop re-querying it: its last (>= kDeepConfirmations) count is served straight
+    // from sentZConfCache. Only the SHALLOW/unconfirmed subset (and any txid we've
+    // never seen) is re-batched. This keeps the confirmation display correct —
+    // deeply-confirmed rows stay shown with their cached deep count — while collapsing
+    // the batch on an established wallet to just the few young transactions.
+    QList<QString> shallowTxids;
+    for (auto& sentTx : sentZTxs) {
+        auto cached = sentZConfCache.find(sentTx.txid);
+        if (cached != sentZConfCache.end() && cached.value() >= kDeepConfirmations)
+            continue;   // deeply confirmed -> served from cache, no re-query
+        shallowTxids.push_back(sentTx.txid);
     }
 
-    // Look up all the txids to get the confirmation count for them. 
-    conn->doBatchRPC<QString>(txids,
+    // Apply any cached counts (deep or shallow) so the rendered list reflects what we
+    // already know; the batch below refreshes only the shallow subset on top of this.
+    auto applyCache = [this](QList<TransactionItem>& list) {
+        for (TransactionItem& sentTx : list) {
+            auto cached = sentZConfCache.find(sentTx.txid);
+            if (cached != sentZConfCache.end())
+                sentTx.confirmations = (unsigned long)cached.value();
+        }
+    };
+
+    // Everything is deeply confirmed -> nothing to query. Render from cache and return.
+    if (shallowTxids.isEmpty()) {
+        auto newSentZTxs = sentZTxs;
+        applyCache(newSentZTxs);
+        transactionsTableModel->addZSentData(newSentZTxs);
+        return;
+    }
+
+    // Look up only the shallow/unconfirmed txids to refresh their confirmation count.
+    conn->doBatchRPC<QString>(shallowTxids,
         [=] (QString txid) {
             json payload = {
                 {"jsonrpc", "1.0"},
                 {"id", "senttxid"},
                 {"method", "gettransaction"},
-                {"params", {txid.toStdString()}} 
+                {"params", {txid.toStdString()}}
             };
 
             return payload;
-        },          
+        },
         [=] (QMap<QString, json>* txidList) {
             auto newSentZTxs = sentZTxs;
-            // Update the original sent list with the confirmation count
-            // TODO: This whole thing is kinda inefficient. We should probably just update the file
-            // with the confirmed block number, so we don't have to keep calling gettransaction for the
-            // sent items.
+            // Seed every row from the cache first (so deeply-confirmed rows we did NOT
+            // re-query keep their last known count), then overlay the fresh shallow
+            // results and update the cache.
+            applyCache(newSentZTxs);
             for (TransactionItem& sentTx: newSentZTxs) {
                 auto j = txidList->value(sentTx.txid);
                 if (j.is_null())
                     continue;
                 auto error = j["confirmations"].is_null();
-                if (!error)
-                    sentTx.confirmations = j["confirmations"].get<json::number_unsigned_t>();
+                if (!error) {
+                    auto confs = j["confirmations"].get<json::number_unsigned_t>();
+                    sentTx.confirmations = confs;
+                    sentZConfCache[sentTx.txid] = (long)confs;   // remember; deep ones stop re-querying
+                }
             }
-            
+
             transactionsTableModel->addZSentData(newSentZTxs);
             delete txidList;
         }
@@ -1518,10 +1932,21 @@ void RPC::watchTxStatus() {
 }
 
 void RPC::checkForUpdate(bool silent) {
-    if  (conn == nullptr) 
+    if  (conn == nullptr)
         return noConnection();
 
-    QUrl cmcURL("https://api.github.com/repos/ZClassicFoundation/zcl-qt-wallet/releases");
+    // W1-3: the very FIRST automatic (silent) update check after launch must not pop
+    // the "Update Available" modal on top of the just-opened window — it stalls the
+    // perceived startup. Suppress the modal for that first auto check ONLY; we do NOT
+    // mark the version as hidden, so a LATER automatic re-check (the periodic one)
+    // still surfaces it, and a user-initiated (non-silent) Help->Check always shows it.
+    bool suppressFirstModal = false;
+    if (silent && !firstUpdateCheckDone) {
+        firstUpdateCheckDone = true;
+        suppressFirstModal   = true;
+    }
+
+    QUrl cmcURL("https://api.github.com/repos/ZclassicCommunity/zcl-qt-wallet/releases");
 
     QNetworkRequest req;
     req.setUrl(cmcURL);
@@ -1560,14 +1985,14 @@ void RPC::checkForUpdate(bool silent) {
 
                 qDebug() << "Version check: Current " << currentVersion << ", Available " << maxVersion;
 
-                if (maxVersion > currentVersion && (!silent || maxVersion > maxHiddenVersion)) {
+                if (maxVersion > currentVersion && !suppressFirstModal && (!silent || maxVersion > maxHiddenVersion)) {
                     auto ans = QMessageBox::information(main, QObject::tr("Update Available"), 
                         QObject::tr("A new release v%1 is available! You have v%2.\n\nWould you like to visit the releases page?")
                             .arg(maxVersion.toString())
                             .arg(currentVersion.toString()),
                         QMessageBox::Yes, QMessageBox::Cancel);
                     if (ans == QMessageBox::Yes) {
-                        QDesktopServices::openUrl(QUrl("https://github.com/ZClassicFoundation/zcl-qt-wallet/releases"));
+                        QDesktopServices::openUrl(QUrl("https://github.com/ZclassicCommunity/zcl-qt-wallet/releases"));
                     } else {
                         // If the user selects cancel, don't bother them again for this version
                         s.setValue("update/lastversion", maxVersion.toString());
@@ -1579,6 +2004,18 @@ void RPC::checkForUpdate(bool silent) {
                                 .arg(currentVersion.toString()));
                     }
                 } 
+            } else {
+                // A user-initiated check must never silently do nothing: report the
+                // failure and offer the releases page so the Help menu always responds.
+                if (!silent) {
+                    auto ans = QMessageBox::warning(main, QObject::tr("Couldn't check for updates"),
+                        QObject::tr("Couldn't reach the update server right now.\n\n"
+                                    "Open the releases page in your browser?"),
+                        QMessageBox::Yes, QMessageBox::Cancel);
+                    if (ans == QMessageBox::Yes) {
+                        QDesktopServices::openUrl(QUrl("https://github.com/ZclassicCommunity/zcl-qt-wallet/releases"));
+                    }
+                }
             }
         }
         catch (...) {

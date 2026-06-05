@@ -31,6 +31,18 @@ public:
     bool    isSyncing();
     void    setSyncing(bool syncing);
 
+    // Send-gate staleness: epoch (secs) of the last successful sync poll, plus a PURE
+    // predicate deciding whether a still-true isSyncing flag is stale (no poll refreshed
+    // it within the window) and so must NOT block a send. now/last are passed in so the
+    // decision is unit-testable with no clock (mirrors RPC::desiredPollMs).
+    void    setLastSyncPollEpoch(qint64 e) { _lastSyncPollEpoch = e; }
+    qint64  getLastSyncPollEpoch() { return _lastSyncPollEpoch; }
+    static const qint64 kSyncGateStaleSecs = 180;   // 3 min with no live poll => stale
+    static bool syncGateIsStale(qint64 nowEpoch, qint64 lastPollEpoch) {
+        if (lastPollEpoch == 0) return false;       // never polled yet -> let normal gate run
+        return (nowEpoch - lastPollEpoch) > kSyncGateStaleSecs;
+    }
+
     int     getZClassicdVersion();
     void    setZClassicdVersion(int version);
     
@@ -56,6 +68,20 @@ public:
     // independent of getSaveZtxs() so the privacy opt-out keeps the fast paint.
     bool    getShowCachedBalance();
     void    setShowCachedBalance(bool show);
+
+    // W1-1 (opt-out, default ON): show the MainWindow immediately on startup and
+    // run the node-warmup splash as a NON-blocking, dismissible overlay instead of
+    // blocking the UI behind a nested d->exec() modal loop for 1-2 minutes. When
+    // OFF (or headless) the proven d->exec() modal path is retained verbatim.
+    bool    getNonModalStartup();
+    void    setNonModalStartup(bool on);
+
+    // Opt-in (default OFF for the first beta): ask the router to open our P2P
+    // listen port automatically via NAT-PMP/PCP (no UPnP), so NAT/firewalled
+    // users become reachable for inbound peers. When on, connection.cpp passes
+    // -natpmp=1 to the embedded daemon. Maps only our own listen port.
+    bool    getOpenPortNatpmp();
+    void    setOpenPortNatpmp(bool on);
 
     bool    isWalletBackedUp();
     void    setWalletBackedUp(bool backedUp);
@@ -86,6 +112,9 @@ public:
     static bool    isTAddress(QString addr);
 
     static QString getDecimalString(double amt);
+    // Thousands-separated integer for block heights, e.g. 1700000 -> "1,700,000".
+    // Single source of truth so every "block N" string reads the same.
+    static QString getHeightString(qint64 height);
     static QString getUSDFormat(double bal);
     static QString getZCLDisplayFormat(double bal);
     static QString getZCLUSDDisplayFormat(double bal);
@@ -127,6 +156,7 @@ private:
     QString _executable;
     bool    _isTestnet        = false;
     bool    _isSyncing        = false;
+    qint64  _lastSyncPollEpoch = 0;   // secs-since-epoch of last successful sync poll (send-gate staleness)
     int     _blockNumber      = 0;
     int     _zclassicdVersion    = 0;
     bool    _useEmbedded      = false;

@@ -123,12 +123,22 @@ void TxTableModel::updateAllData() {
         return a.datetime > b.datetime; // reverse sort
     });
 
+    // PERF: capture the previous row count BEFORE the swap so we can gate the
+    // heavy layoutChanged() on an actual row-count change (mirrors
+    // BalancesTableModel::setNewData). The common case — a refresh/notify that
+    // only bumps a confirmation count — keeps the same rows, so we emit only the
+    // in-place dataChanged() repaint and skip the full view relayout (no flicker,
+    // no scroll/selection jump). A new/removed tx changes the count and still
+    // triggers layoutChanged() so the reverse-time sort reorder is applied.
+    int oldRows = modeldata ? modeldata->size() : 0;
+
     // And then swap out the modeldata with the new one.
     delete modeldata;
     modeldata = newmodeldata;
 
     dataChanged(index(0, 0), index(modeldata->size()-1, columnCount(index(0,0))-1));
-    layoutChanged();
+    if (modeldata->size() != oldRows)
+        layoutChanged();
 }
 
  int TxTableModel::rowCount(const QModelIndex&) const
@@ -149,22 +159,30 @@ void TxTableModel::updateAllData() {
     if (role == Qt::TextAlignmentRole && index.column() == 3) return QVariant(Qt::AlignRight | Qt::AlignVCenter);
     
     if (role == Qt::ForegroundRole) {
-        if (modeldata->at(index.row()).confirmations == 0) {
-            QBrush b;
-            b.setColor(Qt::red);
-            return b;
-        }
-
-        // Else, just return the default brush
         QBrush b;
-        b.setColor(Qt::black);
-        return b;        
+        // Pending (0-conf): amber = not-yet-final, matching the PUBLIC/amber token.
+        // Confirmed: normal dark-theme text. NEVER Qt::black here — it is invisible
+        // on the dark Type/Date columns (the default-delegate columns honor this).
+        if (modeldata->at(index.row()).confirmations == 0)
+            b.setColor(QColor("#d9822b"));
+        else
+            b.setColor(QColor("#e6e6e6"));
+        return b;
     }
 
     auto dat = modeldata->at(index.row());
     if (role == Qt::DisplayRole) {
         switch (index.column()) {
-        case 0: return dat.type;
+        case 0: {
+                    // FRIENDLY-LABEL FIX: show "Sent"/"Received" instead of the raw lowercase
+                    // RPC category ("send"/"receive"). DisplayRole only — getType() and the
+                    // ToolTipRole below still return the raw string so the privacy-badge
+                    // delegate's category classification is unaffected.
+                    const QString t = dat.type.toLower();
+                    if (t.contains("send") || t.contains("sent"))  return tr("Sent");
+                    if (t.contains("receive"))                     return tr("Received");
+                    return dat.type;
+                }
         case 1: { 
                     auto addr = modeldata->at(index.row()).address;
                     if (addr.trimmed().isEmpty()) 
@@ -172,7 +190,8 @@ void TxTableModel::updateAllData() {
                     else 
                         return addr;
                 }
-        case 2: return QDateTime::fromMSecsSinceEpoch(modeldata->at(index.row()).datetime *  (qint64)1000).toLocalTime().toString();
+        case 2: return QDateTime::fromMSecsSinceEpoch(modeldata->at(index.row()).datetime * (qint64)1000)
+                        .toLocalTime().toString("yyyy-MM-dd hh:mm");   // compact, scannable, sorts right; full ts in tooltip
         case 3: return Settings::getZCLDisplayFormat(modeldata->at(index.row()).amount);
         }
     } 
@@ -199,9 +218,12 @@ void TxTableModel::updateAllData() {
             QIcon icon = QApplication::style()->standardIcon(QStyle::SP_MessageBoxInformation);            
             return QVariant(icon.pixmap(16, 16));
         } else {
-            // Empty pixmap to make it align
+            // WHITE-SQUARE FIX: a Qt::white fill renders as a glaring solid white block on
+            // the dark table background for every memo-less row (the majority). Use a
+            // transparent placeholder so the column still aligns with the memo-icon rows
+            // without drawing a visible square.
             QPixmap p(16, 16);
-            p.fill(Qt::white);
+            p.fill(Qt::transparent);
             return QVariant(p);
         }
     }

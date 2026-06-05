@@ -2,6 +2,7 @@
 #define BALANCESTABLEMODEL_H
 
 #include "precompiled.h"
+#include <QSet>
 
 struct UnspentOutput {
     QString address;
@@ -41,6 +42,13 @@ private:
 
     QList<std::tuple<QString, double>>*    modeldata   = nullptr;
     QList<UnspentOutput>*                  utxos       = nullptr;
+
+    // PERF (PM-2): precomputed set of addresses that have at least one utxo with
+    // confirmations==0 (those rows paint red). Built once in setNewData() (behind the
+    // fingerprint gate, so only on real data change) and queried O(1) in
+    // data(ForegroundRole), replacing a per-repaint O(rows*utxos) scan that also deep-
+    // copied each UnspentOutput per inner step.
+    QSet<QString>                          unconfirmedAddrs;
 
     bool loading = true;
 };

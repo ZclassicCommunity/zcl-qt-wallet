@@ -239,6 +239,9 @@ private slots:
     void notify_launchArgsGatedOnSocketReady();       // ITEM 2 source guard (connection.cpp)
     void conf_permsVerifiedAfterWrite();              // ITEM 3 source guard (connection.cpp)
 
+    // --- First-run trust: send-gate staleness predicate (pure) ---
+    void sendgate_staleWhenPollStops();               // Settings::syncGateIsStale boundary
+
 private:
     QString sandboxAppData() const {
         return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
@@ -1186,6 +1189,25 @@ void TestLogic::conf_permsVerifiedAfterWrite() {
              "ITEM 3: the verify must test for group/other read/write bits");
     QVERIFY2(code.contains("could not be secured to 0600"),
              "ITEM 3: a clear 0600 diagnostic must be logged when the conf stays leaky");
+}
+
+// First-run trust: the send gate must ignore a FROZEN isSyncing flag (a poll that
+// stopped refreshing) so a wedged flag can't imply a fresh sync problem — but must
+// NOT treat a fresh flag, or a never-polled flag, as stale. Pure boundary check.
+void TestLogic::sendgate_staleWhenPollStops() {
+    const qint64 W = Settings::kSyncGateStaleSecs;   // window (180s)
+    const qint64 now = 1'000'000;
+    // Never polled yet (last==0): NOT stale -> let the normal gate run.
+    QVERIFY(!Settings::syncGateIsStale(now, 0));
+    // Fresh poll: not stale.
+    QVERIFY(!Settings::syncGateIsStale(now, now));
+    // Just inside the window: not stale.
+    QVERIFY(!Settings::syncGateIsStale(now, now - (W - 1)));
+    // Exactly at the window edge: not stale (uses '>' not '>=').
+    QVERIFY(!Settings::syncGateIsStale(now, now - W));
+    // Past the window: stale.
+    QVERIFY(Settings::syncGateIsStale(now, now - (W + 1)));
+    QVERIFY(Settings::syncGateIsStale(now, now - 10 * W));
 }
 
 QTEST_MAIN(TestLogic)

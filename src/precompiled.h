@@ -49,6 +49,7 @@
 #include <QDialog>
 #include <QInputDialog>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QDebug>
 #include <QUrl>
 #include <QQueue>

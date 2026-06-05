@@ -156,6 +156,30 @@ class Handler(BaseHTTPRequestHandler):
         method = req.get("method")
         req_id = req.get("id")
 
+        # getwalletsummary — the GUI's instant-balance fast path. Derive it from the
+        # scenario's z_gettotalbalance so the displayed transparent/private/total are
+        # IDENTICAL to the legacy hero source, then add the extra metadata fields the
+        # real RPC returns (unused by the GUI). This exercises the GUI fast path with
+        # values consistent with every scenario's balance assertions. A scenario with
+        # no z_gettotalbalance falls through to the generic -32601 below, which the GUI
+        # treats as an OLD daemon and falls back — so both paths stay reachable.
+        if method == "getwalletsummary":
+            found_b, bal = load_fixture("z_gettotalbalance")
+            if found_b and isinstance(bal, dict):
+                summary = {
+                    "transparent": bal.get("transparent", "0.00"),
+                    "transparentunconfirmed": "0.00",
+                    "transparentimmature": "0.00",
+                    "private": bal.get("private", "0.00"),
+                    "total": bal.get("total", "0.00"),
+                    "shieldedcached": True,
+                    "txcount": 0,
+                    "height": 0,
+                    "bestblockhash": "00" * 32,
+                }
+                self._send_json({"result": summary, "error": None, "id": req_id})
+                return
+
         found, result = load_fixture(method)
         if not found:
             self._send_json(

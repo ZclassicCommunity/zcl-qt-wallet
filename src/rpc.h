@@ -106,6 +106,16 @@ public:
     // (not a stand-in) so a regression in the production wiring is caught.
     void testFireNotifyPush() { onNotifyPush(); }
     bool testNotifyDebounceActive() const { return notifyDebounce && notifyDebounce->isActive(); }
+
+    // PERF harness seam (perf16_modelJank). Each call to updateUI() (under
+    // ZCL_WIDGET_TEST) appends the wall-clock nanoseconds the balances-model
+    // setNewData() rebuild took to this vector; the perf slot reads it to compute
+    // p50/p95/p100. Entirely absent from the shipped app build (guard is compile-time).
+    QVector<qint64>& testBalanceModelSamplesNs() { return balanceModelSamplesNs; }
+    // Drive the REAL updateUI() path directly (no daemon) so the perf harness can
+    // repeatedly re-run the balances-model rebuild over a seeded large dataset. The
+    // anyUnconfirmed arg is forwarded straight through.
+    void testUpdateUI(bool anyUnconfirmed) { updateUI(anyUnconfirmed); }
 #endif
 
     // SAFE-RACE: synchronously-driven re-poll of ONLY the transparent UTXOs, spliced into
@@ -142,7 +152,11 @@ public:
     // exited", so the repair path must call this before touching blocks/chainstate.
     bool confirmEmbeddedStopped();
 
-    void noConnection();
+    // preserveBalances=true => SOFT disconnect: keep the last-painted balance labels
+    // and tables, just de-confidence the hero to the WARMING "refreshing" state. Used
+    // by the debounced getinfo error path so a single failed poll never blanks a
+    // funded wallet. Default false keeps every existing caller's full-teardown behavior.
+    void noConnection(bool preserveBalances = false);
     bool isEmbedded() { return ezclassicd != nullptr; }
 
     // ---- NOTIFY-SRV push-wiring pure helpers (used by prod + asserted by L1) ----
@@ -195,6 +209,12 @@ private:
 
     void getInfoThenRefresh(bool force);
 
+    // Deliverable A: read-only refresh of the "you're helping the network" panel
+    // (MainWindow::netHelp* labels) from getnetworkinfo + getpeerinfo. `connections`
+    // is passed from the enclosing getinfo poll. Never mutates node state; both inner
+    // calls are error-ignoring so an old/foreign/warming daemon degrades silently.
+    void refreshNetworkHelpPanel(int connections);
+
     // NOTIFY-SRV: handle a validated push (NotifyServer::notified). Records the epoch
     // (so getInfoThenRefresh's interval picker sees the channel as healthy) and
     // (re)starts the single-shot debounce; the debounce timeout runs refresh(TRUE).
@@ -236,8 +256,18 @@ private:
 
     void getBalance(const std::function<void(json)>& cb);
 
-    void getTransparentUnspent  (const std::function<void(json)>& cb);
-    void getZUnspent            (const std::function<void(json)>& cb);
+    // INSTANT-BALANCE fast path: one getwalletsummary call returns the wallet's
+    // transparent + private (shielded) totals in a single round-trip (no per-address
+    // listunspent join), letting the hero balance paint instantly on connect. The
+    // success cb receives the raw summary json; the err cb receives the parsed
+    // JSON-RPC body so the caller can detect -32601 ("Method not found") on an OLD
+    // daemon that lacks the method and latch summaryCapable=false. KEY-1: this reads
+    // ONLY balance numbers — no key material is ever returned, serialized, or logged.
+    void getWalletSummary(const std::function<void(json)>& cb,
+                          const std::function<void(const json&)>& err);
+
+    void getTransparentUnspent  (const std::function<void(json)>& cb, const std::function<void(void)>& err);
+    void getZUnspent            (const std::function<void(json)>& cb, const std::function<void(void)>& err);
     void getTransactions        (const std::function<void(json)>& cb);
     void getZAddresses          (const std::function<void(json)>& cb);
     void getTAddresses          (const std::function<void(json)>& cb);
@@ -271,6 +301,13 @@ private:
     // shouldn't flip the banner. Counts consecutive peerless polls; reset on a peer.
     int                         ezNoPeerPolls               = 0;
 
+    // transient-disconnect debounce: a SINGLE failed getinfo poll (one dropped
+    // reply, a momentary RPC stall) must NOT wipe a funded wallet's hero to grey
+    // "0 ZCL" and demote Send. Counts consecutive getinfo error replies; reset to 0
+    // on any successful getinfo. The error path keeps the last balances painted
+    // (soft disconnect) until this crosses the threshold, then does a full teardown.
+    int                         getInfoErrCount             = 0;
+
     // Cached getbootstrapinfo snapshot-download state (post-connect). A node mid
     // bootstrap-snapshot download reports 0 normal P2P peers + warming RPC, which the
     // peerless banner/heal would otherwise mislabel as "waiting for peers" (and could
@@ -291,6 +328,15 @@ private:
     // from re-showing every poll.
     bool                        ezForeignStuckShown         = false;
 
+    // W1-4: SUSTAINED-timeout gate for the foreign-node-stuck dialog. The poll-count
+    // gate (ezNoPeerPolls) alone can be reached quickly if the sync cadence is fast,
+    // false-firing the dialog during a legitimate multi-minute first-run warmup where
+    // a foreign node is briefly peerless. Require the peerless condition to ALSO have
+    // persisted for a wall-clock window (~120s, mirroring the connection.cpp warmup
+    // patience) before surfacing it. Started on the first peerless sample, invalidated
+    // the moment any peer appears.
+    QElapsedTimer               ezForeignStuckSince;
+
     // G6: the warmup-wedge cap (heal/attempts.warmupRestart) must only be cleared by
     // SUSTAINED health, never by one getinfo — otherwise a node that answers a single
     // getinfo and then re-wedges would reset the counter forever and never escalate
@@ -299,6 +345,22 @@ private:
     // sync polls OR after the chain tip has demonstrably advanced past warmup.
     int                         ezHealthyPolls              = 0;
     bool                        ezWarmupWedgeCleared        = false;
+
+    // INSTANT-BALANCE daemon-capability gate. We assume the connected daemon supports
+    // getwalletsummary — the single-round-trip total (read from the daemon's cached
+    // note values, no per-note re-decrypt) used to paint the hero balance fast on
+    // every refresh. When true, getwalletsummary {0} is the SOLE hero source and the
+    // slow z_gettotalbalance is skipped; when false z_gettotalbalance is the SOLE
+    // source instead. The FIRST refreshBalances() this session doubles as the version
+    // probe: if getwalletsummary returns JSON-RPC -32601 ("Method not found") — i.e.
+    // an OLD daemon — this latches to false and we NEVER call it again this session,
+    // falling back EXACTLY to the legacy z_gettotalbalance path. Any OTHER (transient)
+    // summary error does NOT latch; that cycle paints from z_gettotalbalance and the
+    // next poll retries the summary. getwalletsummary {0} and z_gettotalbalance {0}
+    // return the same satoshi totals, so the displayed number is identical regardless
+    // of source. The per-address listunspent join remains the sole owner of the
+    // per-address balances model / UTXO set and never touches the hero labels.
+    bool                        summaryCapable              = true;
 
     Connection*                 conn                        = nullptr;
     QProcess*                   ezclassicd                     = nullptr;
@@ -337,11 +399,33 @@ private:
     // Current balance in the UI. If this number updates, then refresh the UI
     QString                     currentBalance;
 
+    // W1-3: defer the price/update fetch out of the connect critical path. The
+    // first checkForUpdate() after launch must NOT pop the update-available modal
+    // on top of the freshly-opened window (it stalls perceived startup). The modal
+    // is suppressed exactly once — the version is recorded so a LATER check still
+    // surfaces it (and a non-silent, user-initiated Help->Check still always shows).
+    bool                        firstUpdateCheckDone        = false;
+
+    // W1-6: throttle the sent-z confirmation refresh. Cache the last-seen
+    // confirmation count per sent-z txid; once a tx is deeply confirmed
+    // (>= kDeepConfirmations) we stop re-querying gettransaction for it and reuse
+    // the cached deep count, re-batching only the shallow/unconfirmed subset.
+    QMap<QString, long>         sentZConfCache;
+    static constexpr long       kDeepConfirmations          = 10;
+    // W1-6 reorg safety: the chain height the cache reflects. A backward move => reorg
+    // => drop the cache so a deep-confirmed row can't keep showing a stale (too-high)
+    // confirmation count after the chain rewinds.
+    int                         sentZConfCacheHeight        = 0;
+
 #ifdef ZCL_WIDGET_TEST
     // MAJOR-3 test seam backing store: the address the next newZaddr(true) returns
     // (one-shot). Empty => the sync-create fails (fail-closed path). Never present
     // in the shipped app build.
     QString                     testNextZaddrResult;
+    // PERF harness backing store: per-update nanoseconds spent in the balances-model
+    // rebuild inside updateUI(). Filled only under ZCL_WIDGET_TEST; read by
+    // perf16_modelJank. Never present in the shipped build.
+    QVector<qint64>             balanceModelSamplesNs;
     // SAFE-RACE backing store: the transparent set the next repollTransparentUnspent()
     // splices in (one-shot). nullptr => the re-poll cannot fire (fail-closed).
     QList<UnspentOutput>*       testRepollUTXOs = nullptr;
