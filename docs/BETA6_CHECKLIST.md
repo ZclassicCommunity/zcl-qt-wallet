@@ -11,7 +11,7 @@ Legend: ✅ done · 🔵 in progress · ⏳ blocked/waiting · ⬜ not started
 |---|------|-------|--------|
 | 1 | **Version bump** GUI `version.h` + `Info.plist` → beta6 | me | ✅ PR #22 |
 | 2 | **Send-form redesign** merged into beta6 candidate | me | ✅ PR #21 → folded into `release/v2.1.2-beta6` |
-| 3 | **Reproducible + tagged daemon** (commit the 16 uncommitted changes; `configure.ac` build 4→5; tag `v2.1.2-beta6` pinned to `be6f0031d`, drop parallel-rescan) | **dev** | ⏳ see `BETA6_DAEMON_HANDOFF.md` |
+| 3 | **Reproducible + tagged daemon** | me/dev | 🔵 **daemon PR ZclassicCommunity/zclassic#119** (committed the uncommitted changes, junk excluded, `configure.ac` 4→5; getwalletsummary+NAT-PMP+param-presence). Needs CI build+gtest + the parallel-rescan decision, then merge + `git tag v2.1.2-beta6` |
 | 4 | **Live funded `t→z` send-with-change** (3 cases; change lands shielded; shown==sent) | **you** | ⏳ see `BETA6_LIVE_SEND_TEST.md` |
 | 5 | **Bob fresh-install end-to-end** (start → connect → balance → first send) on a clean machine | you/bob | 🔵 Send form already confirmed launching on bob@Arch |
 | 6 | **Linux** beta6 single-file (version-stamped) | me | ✅ `zclwallet-v2.1.2-beta6-linux-x86_64` sha 20ebb6c6 |
