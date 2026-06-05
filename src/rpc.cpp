@@ -1464,15 +1464,72 @@ bool RPC::processUnspent(const json& reply, QMap<QString, double>* balancesMap, 
             anyUnconfirmed = true;
         }
 
+        // "generated" marks a coinbase UTXO (transparent listunspent only; z_listunspent
+        // omits it). The auto-shield change basis must exclude coinbase, since z_sendmany
+        // refuses to spend it to a transparent output or alongside change. (find()/end()
+        // is used rather than contains() -- the bundled nlohmann::json 3.3 predates it.)
+        bool coinbase = it.find("generated") != it.end() && it["generated"].get<json::boolean_t>();
+
         newUtxos->push_back(
             UnspentOutput{ qsAddr, QString::fromStdString(it["txid"]),
                             Settings::getDecimalString(it["amount"].get<json::number_float_t>()),
-                            (int)confirmations, it["spendable"].get<json::boolean_t>() });
+                            (int)confirmations, it["spendable"].get<json::boolean_t>(), coinbase });
 
         (*balancesMap)[qsAddr] = (*balancesMap)[qsAddr] + it["amount"].get<json::number_float_t>();
     }
     return anyUnconfirmed;
 };
+
+// SAFE-RACE: keep the shielded-note rows from `oldUtxos` and replace the transparent rows
+// with `freshT`. A row is transparent iff Settings::isTAddress(address). Frees both inputs
+// and returns a new owned list. A transparent-only re-poll thus never drops the z-notes.
+QList<UnspentOutput>* RPC::mergeTransparentUnspent(QList<UnspentOutput>* oldUtxos,
+                                                   QList<UnspentOutput>* freshT) {
+    auto* merged = new QList<UnspentOutput>();
+    if (oldUtxos) {
+        for (const UnspentOutput& u : *oldUtxos)
+            if (!Settings::isTAddress(u.address))     // keep shielded notes as-is
+                merged->append(u);
+        delete oldUtxos;
+    }
+    if (freshT) {
+        merged->append(*freshT);
+        delete freshT;
+    }
+    return merged;
+}
+
+// SAFE-RACE: re-poll ONLY the transparent UTXOs and splice them into the cached `utxos`,
+// preserving the shielded-note rows. Invokes cb(true) once fresh data has landed; returns
+// false (and cb(false)) when it cannot fire so the caller fails closed. See
+// MainWindow::verifyAutoShieldUnchanged.
+bool RPC::repollTransparentUnspent(const std::function<void(bool)>& cb) {
+#ifdef ZCL_WIDGET_TEST
+    // TEST-ONLY SEAM: no daemon. If a fresh transparent set was injected, splice it in
+    // (preserving z rows) and fire the callback SYNCHRONOUSLY -- no pump, no connection.
+    if (testRepollUTXOs) {
+        utxos = mergeTransparentUnspent(utxos, testRepollUTXOs);   // takes ownership / frees inputs
+        testRepollUTXOs = nullptr;
+        cb(true);
+        return true;
+    }
+    cb(false);
+    return false;     // no seam installed -> caller fails closed
+#else
+    if (!conn) { cb(false); return false; }            // never null-deref getTransparentUnspent
+    // MERGE RECONCILE: local getTransparentUnspent is 2-arg (cb, err). Pass an err lambda
+    // that fails closed (cb(false)) instead of hanging if the unspent query errors.
+    getTransparentUnspent([this, cb](json reply) {
+        auto* freshT       = new QList<UnspentOutput>();
+        auto* throwawayBals = new QMap<QString, double>();
+        processUnspent(reply, throwawayBals, freshT);  // reuse the exact parser (sets coinbase)
+        delete throwawayBals;
+        utxos = mergeTransparentUnspent(utxos, freshT);
+        cb(true);
+    }, [cb]() { cb(false); });
+    return true;
+#endif
+}
 
 void RPC::refreshBalances() {
     if  (conn == nullptr)
