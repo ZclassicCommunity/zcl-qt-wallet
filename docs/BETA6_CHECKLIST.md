@@ -16,7 +16,7 @@ Legend: ✅ done · 🔵 in progress · ⏳ blocked/waiting · ⬜ not started
 | 5 | **Bob fresh-install end-to-end** (start → connect → balance → first send) on a clean machine | you/bob | 🔵 Send form already confirmed launching on bob@Arch |
 | 6 | **Linux** beta6 single-file (version-stamped) | me | ✅ `zclwallet-v2.1.2-beta6-linux-x86_64` sha 20ebb6c6 |
 | 7 | **Windows** single-file `.exe` (beta6 GUI; built qtsvg cross-module; embeds win daemon) | me | ✅ `zclwallet-v2.1.2-beta6-win64.exe` sha 38b0ee56 — note: win daemon is pre-getwalletsummary (graceful fallback); refresh for parity when daemon is tagged |
-| 8 | **macOS** arm64 `.dmg` — `macdeployqt` + ad-hoc re-sign | **Mac dev** | ⬜ instructions ready: `docs/BETA6_MACOS_HANDOFF.md` (note: their static Qt needs qtsvg too) |
+| 8 | **macOS** arm64 `.dmg` — `macdeployqt` + ad-hoc re-sign | **Mac dev** | ✅ `macOS-zclwallet-v2.1.2-beta6.dmg` sha 9bfb796e — arm64, ad-hoc (`codesign --deep --strict` PASS, **not** notarized); **bundles the getwalletsummary daemon `594652bc3`** so it's already at daemon-parity (unlike win #7). Built from branch head, not a tag — refresh if `v2.1.2-beta6` tags a different commit. Full sha256 `9bfb796e502648597df6a23563d89b1c2a443adcda40ccd9c170dc216162ceed` |
 | 9 | **Windows runtime smoke-test** (fresh install + daemon-extract + sync) | you/tester | ⬜ |
 | 10 | **GUI master merge** (ff `feature/wallet-redesign` → master, *after* version bump) + **daemon master merge** | dev | ⬜ |
 | 11 | **SHA256SUMS + GPG signatures + release notes**, then tag + publish pre-release | me/dev | 🔵 notes drafted (`RELEASE_NOTES_v2.1.2-beta6.md`) |
