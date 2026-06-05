@@ -66,6 +66,7 @@ void MainWindow::setupSendTab() {
     ui->minerFeeAmt->setReadOnly(!Settings::getInstance()->getAllowCustomFees());
     QObject::connect(ui->minerFeeAmt, &QLineEdit::textChanged, [=](auto txt) {
         ui->lblMinerFeeUSD->setText(Settings::getUSDFormat(txt.toDouble()));
+        recomputeMaxIfChecked();   // fee changed -> the "Send max" amount must follow
     });
     ui->minerFeeAmt->setText(Settings::getDecimalString(Settings::getMinerFee()));    
 
@@ -189,12 +190,25 @@ void MainWindow::updateFromCombo() {
 }
 
 void MainWindow::inputComboTextChanged(int index) {
-    auto addr   = ui->inputsCombo->itemText(index);
-    auto bal    = rpc->getAllBalances()->value(addr);
-    auto balFmt = Settings::getZCLDisplayFormat(bal);
+    auto addr      = ui->inputsCombo->itemText(index);
+    double displayed = rpc->getAllBalances()->value(addr);   // minconf=0 total (incl. 0-conf)
+    double spendable = spendableOrFallback(addr);            // confirmed-spendable, fails open
+
+    // LEGIBILITY: the "Available" line shows what is actually spendable now (so it agrees
+    // with the spendable-based Send-max), and when some funds for this address are still
+    // confirming we append a calm "(+X confirming)" qualifier so the user is not surprised
+    // that the field auto-filled less than the hero total. pending = displayed - spendable
+    // is only meaningful when the UTXO set is loaded; spendableOrFallback() returns the
+    // displayed value when it isn't, so pending is then 0 and no qualifier is shown.
+    double pending = displayed - spendable;
+    if (pending < 0) pending = 0;
+    QString balFmt = Settings::getZCLDisplayFormat(spendable);
+    if (Settings::getDecimalString(pending) != "0")
+        balFmt = balFmt % " (+" % Settings::getZCLDisplayFormat(pending) % tr(" confirming") % ")";
 
     ui->sendAddressBalance->setText(balFmt);
-    ui->sendAddressBalanceUSD->setText(Settings::getUSDFormat(bal));
+    ui->sendAddressBalanceUSD->setText(Settings::getUSDFormat(spendable));
+    recomputeMaxIfChecked();   // from-address changed -> its balance drives the "Send max" amount
 }
 
     
@@ -319,6 +333,11 @@ void MainWindow::addressChanged(int itemNumber, const QString& text) {
 void MainWindow::amountChanged(int item, const QString& text) {
     auto usd = ui->sendToWidgets->findChild<QLabel*>(QString("AmtUSD") % QString::number(item));
     usd->setText(Settings::getUSDFormat(text.toDouble()));
+    // A change to ANOTHER recipient's amount (item != 1) shrinks the max available for
+    // recipient 1; recompute it. Guard on item != 1 to avoid recursing on our own setText
+    // of Amount1 (which would re-emit amountChanged(1)).
+    if (item != 1)
+        recomputeMaxIfChecked();
 }
 
 void MainWindow::setMemoEnabled(int number, bool enabled) {
@@ -464,39 +483,60 @@ void MainWindow::removeExtraAddresses() {
 void MainWindow::maxAmountChecked(int checked) {
     if (checked == Qt::Checked) {
         ui->Amount1->setReadOnly(true);
-        if (rpc->getAllBalances() == nullptr) return;
-           
-        // Calculate maximum amount
-        double sumAllAmounts = 0.0;
-        // Calculate all other amounts
-        int totalItems = ui->sendToWidgets->children().size() - 2;   // The last one is a spacer, so ignore that        
-        // Start counting the sum skipping the first one, because the MAX button is on the first one, and we don't
-        // want to include it in the sum. 
-        for (int i=1; i < totalItems; i++) {
-            auto amt  = ui->sendToWidgets->findChild<QLineEdit*>(QString("Amount")  % QString::number(i+1));
-            sumAllAmounts += amt->text().toDouble();
-        }
-
-        if (Settings::getInstance()->getAllowCustomFees()) {
-            // += (not =): must ADD the custom fee to the other recipients' amounts
-            // already summed above, else MAX is computed too large (it ignores the
-            // other outputs) and the send fails with a confusing "Not enough funds".
-            sumAllAmounts += ui->minerFeeAmt->text().toDouble();
-        }
-        else {
-            sumAllAmounts += Settings::getMinerFee();
-        }
-
-        auto addr = ui->inputsCombo->currentText();
-
-        auto maxamount  = rpc->getAllBalances()->value(addr) - sumAllAmounts;
-        maxamount       = (maxamount < 0) ? 0 : maxamount;
-            
-        ui->Amount1->setText(Settings::getDecimalString(maxamount));
+        recomputeMaxIfChecked();
     } else if (checked == Qt::Unchecked) {
         // Just remove the readonly part, don't change the content
         ui->Amount1->setReadOnly(false);
     }
+}
+
+// STALE-MAX FIX: recompute the max amount IN PLACE whenever Max is currently checked. Called
+// on the checkbox toggle AND from every later input that changes the result (from-address,
+// fee, other recipients) so the read-only Amount1 never shows a stale max. Early-returns when
+// Max is unchecked, so it is safe to call unconditionally. Setting Amount1 here can re-emit
+// amountChanged(1), but that path is guarded (item==1 does not recompute), so no recursion.
+void MainWindow::recomputeMaxIfChecked() {
+    if (!ui->Max1->isChecked()) return;
+    if (rpc->getAllBalances() == nullptr) return;
+
+    // Calculate maximum amount
+    double sumAllAmounts = 0.0;
+    // Calculate all other amounts
+    int totalItems = ui->sendToWidgets->children().size() - 2;   // The last one is a spacer, so ignore that
+    // Start counting the sum skipping the first one, because the MAX button is on the first one, and we don't
+    // want to include it in the sum.
+    for (int i=1; i < totalItems; i++) {
+        auto amt  = ui->sendToWidgets->findChild<QLineEdit*>(QString("Amount")  % QString::number(i+1));
+        if (amt)
+            sumAllAmounts += amt->text().toDouble();
+    }
+
+    if (Settings::getInstance()->getAllowCustomFees()) {
+        // += (not =): must ADD the custom fee to the other recipients' amounts
+        // already summed above, else MAX is computed too large (it ignores the
+        // other outputs) and the send fails with a confusing "Not enough funds".
+        sumAllAmounts += ui->minerFeeAmt->text().toDouble();
+    }
+    else {
+        sumAllAmounts += Settings::getMinerFee();
+    }
+
+    auto addr = ui->inputsCombo->currentText();
+
+    // SPENDABLE-MAX FIX: base "Send max" / "Shield my funds" on the CONFIRMED, spendable
+    // balance, not the minconf=0 getAllBalances() total. The daemon (z_sendmany,
+    // minconf=1) spends only confirmed inputs, so a max derived from the unconfirmed-
+    // inclusive total asks to move more than is spendable and the send is rejected with
+    // "insufficient funds" -- the exact dead-end the user hit. spendableOrFallback()
+    // fails OPEN (returns the minconf=0 value) when the UTXO set isn't loaded, so a
+    // legitimate send is never blocked. Fee accounting is unchanged: sumAllAmounts
+    // already folds in the fee (custom ui->minerFeeAmt or Settings::getMinerFee()), and
+    // the (<0 -> 0) clamp keeps the result non-negative. The value written to the
+    // read-only Amount1 is exactly what flows into z_sendmany, so shown == sent.
+    double maxamount = spendableOrFallback(addr) - sumAllAmounts;
+    maxamount        = (maxamount < 0) ? 0 : maxamount;
+
+    ui->Amount1->setText(Settings::getDecimalString(maxamount));
 }
 
 // PRIV-11 / UX-12 — pure four-way classifier. The actual body is the single
@@ -635,6 +675,27 @@ double MainWindow::confirmedSpendableBalance(const QString& addr) {
     return sum;
 }
 
+// FAIL-OPEN spendable accessor. The daemon (z_sendmany, minconf=1) spends only
+// CONFIRMED, spendable inputs, so the amount the GUI offers / validates must be the
+// confirmed-spendable figure -- NOT the minconf=0 getAllBalances() total, which leaks
+// 0-conf funds and causes the daemon to reject with "insufficient funds". BUT the UTXO
+// set is null until the first successful unspent-join and publishes nothing on a stream
+// error, so confirmedSpendableBalance() would return 0 there. Failing CLOSED on missing
+// data would wrongly block a legitimate send during warmup, so when the UTXO set is
+// unavailable/empty we fall back to today's behavior (getAllBalances()->value(addr)) and
+// let the daemon stay the final source of truth. Money-safety: this NEVER asserts a
+// higher spendable amount than the daemon will spend (the confirmed sum is conservative),
+// and NEVER blocks a send the daemon would accept (it fails open).
+double MainWindow::spendableOrFallback(const QString& addr) {
+    bool haveUtxoData = rpc && rpc->getUTXOs() && !rpc->getUTXOs()->isEmpty();
+    if (haveUtxoData)
+        return confirmedSpendableBalance(addr);
+    double fallback = 0.0;
+    if (rpc && rpc->getAllBalances())
+        fallback = rpc->getAllBalances()->value(addr);
+    return fallback;
+}
+
 // Find an existing Sapling z-address usable as the change sink: it must be a real
 // Sapling address AND not collide with any recipient (zclassic rejects a duplicate
 // output address). Returns "" if none exists. Factored out of createTxFromSendPage
@@ -686,8 +747,12 @@ QString MainWindow::createSaplingAddressSync() {
     // a connection actually exists -- with no daemon connection the async create can
     // never complete, so pumping would just spin to the timeout for nothing (and the
     // caller will fail CLOSED on the empty result).
+    // UITB-1: cap the GUI-thread pump at 3000ms (was 8000ms) so a wedged or warming
+    // daemon can never freeze the window for 8s. The caller already fails CLOSED with
+    // a 'try again in a moment' QMessageBox on an empty result (sendtab.cpp ~601,
+    // mainwindow.cpp ~1106), so a shorter cap just routes to that message sooner.
     QElapsedTimer t; t.start();
-    while (created.isEmpty() && rpc->getConnection() && t.elapsed() < 8000) {
+    while (created.isEmpty() && rpc->getConnection() && t.elapsed() < 3000) {
         QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 50);
     }
 
@@ -1028,16 +1093,26 @@ void MainWindow::sendButton() {
             [=] (QString opid) {
                 ui->statusBar->showMessage(tr("Computing Tx: ") % opid);
             },
-            [=] (QString, QString txid) { 
+            [=] (QString, QString txid) {
+                // Keep the long-standing status-bar line so the right-click
+                // "Copy txid"/"View on explorer" status-bar menu keeps working,
+                // then surface the calm, non-blocking "you did it" affirmation.
                 ui->statusBar->showMessage(Settings::txidStatusMessage + " " + txid);
+                showSendSuccess(txid);
             },
             [=] (QString opid, QString errStr) {
-                ui->statusBar->showMessage(QObject::tr(" Tx ") % opid % QObject::tr(" failed"), 15 * 1000);
+                ui->statusBar->showMessage(QObject::tr("Transaction couldn't be sent"), 15 * 1000);
 
+                // Humane failure: a plain, actionable headline (no opid noise),
+                // raw daemon text tucked under the native "Show Details" expander.
+                // Warning (not Critical) -- a declined send isn't a crash.
+                QMessageBox msg(QMessageBox::Warning, QObject::tr("Couldn't send"),
+                                humaneSendError(errStr), QMessageBox::Ok, this);
+                QString details = errStr;
                 if (!opid.isEmpty())
-                    errStr = QObject::tr("The transaction with id ") % opid % QObject::tr(" failed. The error was") + ":\n\n" + errStr; 
-
-                QMessageBox::critical(this, QObject::tr("Transaction Error"), errStr, QMessageBox::Ok);            
+                    details = QObject::tr("Operation id: ") % opid % "\n\n" + details;
+                msg.setDetailedText(details);
+                msg.exec();
             }
         );
     }        
@@ -1053,9 +1128,16 @@ QString MainWindow::doSendTxValidations(Tx tx) {
         }
 
         // This technically shouldn't be possible, but issue #62 seems to have discovered a bug
-        // somewhere, so just add a check to make sure. 
+        // somewhere, so just add a check to make sure.
         if (toAddr.amount < 0) {
             return QString(tr("Amount '%1' is invalid!").arg(toAddr.amount));
+        }
+
+        // ZERO-AMOUNT FIX: a blank/zero amount (the validator accepts an empty field, which
+        // reads as 0.0) used to pass ALL client checks and walk the user through the confirm
+        // dialog before z_sendmany rejected it. Catch it here with a clear message instead.
+        if (toAddr.amount == 0) {
+            return tr("Enter an amount greater than 0 for each recipient.");
         }
     }
 
@@ -1066,15 +1148,37 @@ QString MainWindow::doSendTxValidations(Tx tx) {
     if (!Settings::getInstance()->isSyncing()) {
         auto bals = rpc ? rpc->getAllBalances() : nullptr;
         if (bals && bals->contains(tx.fromAddr)) {
-            double balance = bals->value(tx.fromAddr);
-            double total   = tx.fee;
+            double displayed = bals->value(tx.fromAddr);          // minconf=0 total (incl. 0-conf)
+            double confirmed = spendableOrFallback(tx.fromAddr);  // confirmed-spendable, fails open
+            double total     = tx.fee;
             for (auto toAddr : tx.toAddrs)
                 total += toAddr.amount;
-            if (total > balance) {
+
+            // Three-way guard so the user is never dead-ended:
+            //  1) confirmed >= total            -> PASS (proceed exactly as today). NEVER
+            //                                       block a send the daemon would accept.
+            //  2) confirmed < total <= displayed -> they DO own the funds, some are just
+            //                                       still confirming. Show a calm, honest
+            //                                       message instead of a scary "insufficient".
+            //  3) total > displayed             -> they genuinely don't have it: keep
+            //                                       today's "only holds %2" message.
+            // The daemon's own insufficient-funds rejection (mapped by humaneSendError)
+            // remains the final backstop; this is just an EARLIER, friendlier check.
+            if (confirmed >= total) {
+                // ok -- fall through, do not block
+            }
+            else if (displayed >= total) {
+                double stillConfirming = total - confirmed;
+                if (stillConfirming < 0) stillConfirming = 0;
+                return tr("%1 of these funds is still confirming (about a few minutes). "
+                          "You can shield or send it as soon as it confirms.")
+                       .arg(Settings::getZCLDisplayFormat(stillConfirming));
+            }
+            else {
                 return tr("Not enough funds. You're trying to send %1 (including the fee), "
                           "but this address only holds %2.")
                        .arg(Settings::getZCLDisplayFormat(total))
-                       .arg(Settings::getZCLDisplayFormat(balance));
+                       .arg(Settings::getZCLDisplayFormat(displayed));
             }
         }
     }
@@ -1084,5 +1188,79 @@ QString MainWindow::doSendTxValidations(Tx tx) {
 
 void MainWindow::cancelButton() {
     removeExtraAddresses();
+}
+
+// Item 2: calm, NON-blocking "you did it" affirmation shown once a send confirms.
+// Parented to `this` with WA_DeleteOnClose + show() (not exec()) so it never blocks
+// the UI and Qt owns its lifetime (auto-destroyed if the window closes) -- UAF-safe.
+void MainWindow::showSendSuccess(QString txid) {
+    auto box = new QMessageBox(this);
+    box->setAttribute(Qt::WA_DeleteOnClose);
+    box->setWindowModality(Qt::NonModal);
+    box->setIcon(QMessageBox::Information);
+    box->setWindowTitle(tr("Sent! Your ZCL is on its way"));
+    box->setText(tr("Sent! Your ZCL is on its way"));
+    box->setInformativeText(tr("Your transaction was accepted by the network. "
+                               "It will appear in your transactions in a few minutes."));
+    box->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
+
+    // One-click Copy txid (clipboard idiom matches addressbook.cpp / mainwindow.cpp),
+    // plus a brief status-bar echo so the user sees it took.
+    QPushButton* copyBtn = box->addButton(tr("Copy txid"), QMessageBox::ActionRole);
+    QObject::connect(copyBtn, &QPushButton::clicked, this, [this, txid]() {
+        QGuiApplication::clipboard()->setText(txid);
+        ui->statusBar->showMessage(tr("Copied to clipboard"), 3 * 1000);
+    });
+
+    // View on explorer -- only when there's a live explorer (empty on testnet).
+    QString url = Settings::getExplorerTxURL(txid);
+    if (!url.isEmpty()) {
+        QPushButton* viewBtn = box->addButton(tr("View on explorer"), QMessageBox::ActionRole);
+        QObject::connect(viewBtn, &QPushButton::clicked, this, [url]() {
+            QDesktopServices::openUrl(QUrl(url));
+        });
+    }
+
+    box->addButton(tr("Close"), QMessageBox::AcceptRole);
+    box->show();
+}
+
+// Item 2: map common z_sendmany daemon error substrings to plain, actionable copy.
+// The raw daemon text is preserved by the caller under "Show Details" -- this only
+// produces the friendly HEADLINE, and never hides the underlying error.
+QString MainWindow::humaneSendError(const QString& raw) {
+    const QString e = raw.toLower();
+
+    // Order matters: check the most specific causes before the generic ones.
+    if (e.contains("coinbase") || e.contains("must be sent to a single z") ||
+        e.contains("to a zaddr") || e.contains("shielding coinbase"))
+        return tr("Mined (coinbase) ZCL must be sent to exactly one shielded (z) "
+                  "address at a time. Send it to a single z-address first, then "
+                  "spend normally.");
+
+    if (e.contains("no utxo") || e.contains("no unspent"))
+        return tr("These coins aren't confirmed yet. Wait a few minutes for the "
+                  "network to confirm them, then try again.");
+
+    if (e.contains("insufficient") || e.contains("not enough"))
+        return tr("You don't have enough confirmed ZCL to cover this amount plus the "
+                  "network fee. Wait for recent deposits to confirm, or send a "
+                  "smaller amount.");
+
+    if (e.contains("try again") || e.contains("still syncing") ||
+        e.contains("downloading blocks") || e.contains("is downloading") ||
+        e.contains("loading block index") || e.contains("rescanning"))
+        return tr("Your wallet is still catching up with the network. Let it finish "
+                  "syncing, then try sending again.");
+
+    if (e.contains("wallet is locked") || e.contains("walletpassphrase"))
+        return tr("Your wallet is locked. Unlock it, then try sending again.");
+
+    if (e.contains("amount out of range") || e.contains("invalid amount") ||
+        e.contains("too small") || e.contains("dust"))
+        return tr("That amount is too small to send. Try a larger amount.");
+
+    return tr("Your transaction couldn't be sent. The details are below -- you can "
+              "try again.");
 }
 

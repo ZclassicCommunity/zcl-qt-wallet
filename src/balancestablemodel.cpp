@@ -56,6 +56,16 @@ void BalancesTableModel::setNewData(const QMap<QString, double>* balances,
     // This is a QList deep copy.
     *utxos = *outputs;
 
+    // PERF (PM-2): precompute the address->has-unconfirmed-utxo relation ONCE here
+    // (we are past the fingerprint gate, so this only runs on a real data change).
+    // data(ForegroundRole) then does an O(1) set lookup instead of scanning every
+    // utxo (with a per-element struct copy) for every visible row on every repaint.
+    unconfirmedAddrs.clear();
+    for (const auto& u : *outputs) {
+        if (u.confirmations == 0)
+            unconfirmedAddrs.insert(u.address);
+    }
+
     // Process the address balances into a list
     delete modeldata;
     modeldata = new QList<std::tuple<QString, double>>();
@@ -105,20 +115,13 @@ QVariant BalancesTableModel::data(const QModelIndex &index, int role) const
     if (role == Qt::TextAlignmentRole && index.column() == 1) return QVariant(Qt::AlignRight | Qt::AlignVCenter);
     
     if (role == Qt::ForegroundRole) {
-        // If any of the UTXOs for this address has zero confirmations, paint it in red
+        // PERF (PM-2): O(1) lookup against the set precomputed in setNewData(), instead
+        // of an O(utxos) scan (with a per-iteration UnspentOutput copy) on every repaint.
+        // If any utxo for this address is unconfirmed, paint the row red.
         const auto& addr = std::get<0>(modeldata->at(index.row()));
-        for (auto utxo : *utxos) {
-            if (utxo.address == addr && utxo.confirmations == 0) {
-                QBrush b;
-                b.setColor(Qt::red);
-                return b;
-            }
-        }
-
-        // Else, just return the default brush
         QBrush b;
-        b.setColor(Qt::black);
-        return b;    
+        b.setColor(unconfirmedAddrs.contains(addr) ? Qt::red : Qt::black);
+        return b;
     }
     
     if (role == Qt::DisplayRole) {

@@ -227,13 +227,30 @@
         </widget>
        </item>
        <item row="13" column="0" colspan="2">
+        <widget class="QCheckBox" name="chkNatpmp">
+         <property name="text">
+          <string>Help the network: open my port automatically (NAT-PMP/PCP, no UPnP)</string>
+         </property>
+        </widget>
+       </item>
+       <item row="14" column="0" colspan="2">
+        <widget class="QLabel" name="label_natpmp">
+         <property name="text">
+          <string>Asks your router to forward this node's connection port so other peers can reach you, strengthening the network. Uses the modern, safe NAT-PMP/PCP protocols (never UPnP) and opens only this node's own port. If your router doesn't support it, nothing happens. Default: off.</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item row="15" column="0" colspan="2">
         <widget class="Line" name="line_2">
          <property name="orientation">
           <enum>Qt::Horizontal</enum>
          </property>
         </widget>
        </item>
-       <item row="14" column="0" colspan="2">
+       <item row="16" column="0" colspan="2">
         <spacer name="verticalSpacer_2">
          <property name="orientation">
           <enum>Qt::Vertical</enum>

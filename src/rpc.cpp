@@ -5,6 +5,7 @@
 #include "senttxstore.h"
 #include "turnstile.h"
 #include "version.h"
+#include "guistartup.h"     // [gui-startup] first-balance milestone + summary line
 
 #include <QEventLoop>
 #include <QElapsedTimer>
@@ -269,6 +270,25 @@ void RPC::setConnection(Connection* c) {
 
     delete conn;
     this->conn = c;
+
+    // ADVANCED-TAB-FIX: the node-stats ("zclassicd") page is held aside at startup
+    // (MainWindow ctor: widget(4) + removeTab(4)) and must be re-added once we are
+    // attached to a LIVE node so the nav-rail "⚙ Advanced" button has somewhere to
+    // land. setConnection is the universal attach instant: doRPCSetConnection calls
+    // it for BOTH the embedded (owned-QProcess) path AND the foreign/already-running
+    // node path, and it has already early-returned above when c == nullptr, so it
+    // never fires on teardown/showError. Previously the tab was added only inside
+    // setEZClassicd behind an `ezclassicd != nullptr` gate, so a foreign node (the
+    // now-common path, ezclassicd stays null) never got the tab and Advanced was a
+    // silent no-op. All fields on the page are RPC-derived (getinfo connections,
+    // getnetworksolps, getblockchaininfo, getpeerinfo) and valid for any node; none
+    // read the QProcess. Keep the widget(4)==nullptr guard — it is the genuine
+    // no-double-add sentinel (tab_5/index 4 is the only widget at index>=4, the sole
+    // removeTab is the ctor, the sole adds are here + the now-redundant setEZClassicd
+    // path) and also honors "do not re-add after close" if a close path is ever added.
+    if (main->zclassicdtab != nullptr && ui->tabWidget->widget(4) == nullptr) {
+        ui->tabWidget->addTab(main->zclassicdtab, "zclassicd");
+    }
 
     // W1-6: a new connection may be a different node/chain, so drop the sent-z
     // confirmation cache; we must never carry stale deep-conf counts across a reconnect.
@@ -626,7 +646,7 @@ void RPC::fillTxJsonParams(json& params, Tx tx) {
 }
 
 
-void RPC::noConnection() {    
+void RPC::noConnection(bool preserveBalances) {
     QIcon i = QApplication::style()->standardIcon(QStyle::SP_MessageBoxCritical);
     main->statusIcon->setPixmap(i.pixmap(16, 16));
     main->statusIcon->setToolTip("");
@@ -636,6 +656,20 @@ void RPC::noConnection() {
 
     // P0-6: reflect the lost connection in the main-tab sync banner.
     main->setSyncStatusConnecting();
+
+    // transient-disconnect-zeroes-hero: a SOFT disconnect (one debounced getinfo
+    // error, connection still live) must NOT discard the last-known balances. Keep
+    // the labels/tables/send-inputs exactly as painted and only de-confidence the
+    // hero to WARMING grey with the "Last updated … · refreshing" qualifier
+    // (fromCache=true). Because the canonical labels stay non-blank, updateHomeFixIt
+    // reads haveNumber=true, so a funded wallet keeps Send primary and never flashes
+    // grey "0 ZCL". transparent=0.0 only hides the amber shield card for the blip; it
+    // re-appears on the next successful poll. The full teardown below runs only on a
+    // sustained outage (or any of the many conn==nullptr callers, which pass false).
+    if (preserveBalances) {
+        main->updateHomeFixIt(0.0, /*fromCache=*/true);
+        return;
+    }
 
     // Clear balances table.
     QMap<QString, double> emptyBalances;
@@ -815,6 +849,80 @@ void RPC::onNotifyPush() {
 }
 
 
+// Deliverable A: fill the "you're helping the network" panel from getpeerinfo.
+// 100% read-only (doRPCIgnoreError => an old/foreign daemon, a -28 warmup, or a
+// missing method just leaves the last text; never pops a dialog, never writes).
+// HONESTY: reachability is derived from the INBOUND peer count, NOT from
+// getnetworkinfo networks[].reachable -- that field is just !vfLimited[net]
+// (net.cpp), true by default even behind a NAT, so it would falsely tell a NAT'd
+// user they are reachable. inbound>0 is hard proof we actually accept incoming.
+void RPC::refreshNetworkHelpPanel(int connections) {
+    if (conn == nullptr || main == nullptr || main->netHelpStatusLabel == nullptr)
+        return;
+    // Honestly gate the panel's one-click NAT-PMP toggle: it only does anything
+    // with an embedded daemon (the -natpmp flag is a launch arg we pass only when
+    // WE start the node, connection.cpp). With a foreign/attached node, disable it
+    // and explain -- exactly like the Settings chkNatpmp (mainwindow.cpp). We do
+    // this here (not at build time) because setupNetworkHelpPanel() runs before
+    // `rpc = new RPC(this)`, so rpc->isEmbedded() is only knowable by this point.
+    if (main->netHelpNatpmpChk != nullptr) {
+        const bool embedded = isEmbedded();
+        main->netHelpNatpmpChk->setEnabled(embedded);
+        if (!embedded)
+            main->netHelpNatpmpChk->setToolTip(QObject::tr(
+                "Automatic port opening is available only when ZclWallet runs its own (embedded) node."));
+        // DESYNC FIX: the panel checkbox is set only at construction, so toggling the SAME
+        // setting from the Settings dialog left this control stale (and contradicting its own
+        // adjacent reach label, which is recomputed live). Re-sync the visual state each poll.
+        // QSignalBlocker is required: the toggled lambda pops a QMessageBox, which we must not
+        // fire from a programmatic re-sync.
+        {
+            QSignalBlocker b(main->netHelpNatpmpChk);
+            main->netHelpNatpmpChk->setChecked(Settings::getInstance()->getOpenPortNatpmp());
+        }
+    }
+    if (QSettings().value("net/helpPanelHidden", false).toBool())
+        return;   // user opted out of the nudge; skip the extra round-trip
+
+    const int port = Settings::getInstance()->isTestnet() ? 18033 : 8033;
+    json peerPayload = {
+        {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "getpeerinfo"}
+    };
+    conn->doRPCIgnoreError(peerPayload, [=](const json& reply) {
+        if (main == nullptr || main->netHelpStatusLabel == nullptr
+                || main->netHelpReachLabel == nullptr)
+            return;
+        int inbound = 0;
+        if (reply.is_array()) {
+            for (const auto& p : reply) {
+                if (p.find("inbound") != p.end() && !p["inbound"].is_null()
+                        && p["inbound"].get<json::boolean_t>())
+                    inbound++;
+            }
+        }
+        main->netHelpStatusLabel->setText(
+            QObject::tr("P2P: ON \xc2\xb7 port %1 \xc2\xb7 %2 peers (%3 inbound)")
+                .arg(port).arg(connections).arg(inbound));
+        if (inbound > 0)
+            main->netHelpReachLabel->setText(
+                QObject::tr("Inbound connections: reachable \xe2\x80\x94 thank you for serving!"));
+        else if (Settings::getInstance()->getOpenPortNatpmp())
+            // Toggle is ON but no inbound peer yet. This is an ACTION statement,
+            // NOT a reachability claim: a NAT-PMP/PCP mapping can succeed and the
+            // user still be unreachable behind double-NAT/CGNAT, and we never
+            // verify reachability -- inbound>0 above is the ONLY 'reachable' claim.
+            main->netHelpReachLabel->setText(
+                QObject::tr("Inbound connections: none yet \xe2\x80\x94 automatic port opening is on; "
+                            "waiting for the first inbound peer. (If your router doesn't "
+                            "support it, forward port %1 manually.)").arg(port));
+        else
+            main->netHelpReachLabel->setText(
+                QObject::tr("Inbound connections: none yet \xe2\x80\x94 you're still helping by "
+                            "relaying. Forward port %1 on your router to accept incoming "
+                            "connections.").arg(port));
+    });
+}
+
 void RPC::getInfoThenRefresh(bool force) {
     if  (conn == nullptr) 
         return noConnection();
@@ -828,6 +936,8 @@ void RPC::getInfoThenRefresh(bool force) {
     static bool prevCallSucceeded = false;
     conn->doRPC(payload, [=] (const json& reply) {
         prevCallSucceeded = true;
+        // A good poll clears the transient-disconnect debounce (see error cb below).
+        getInfoErrCount = 0;
         // F4: a successful getinfo means the node is back up and answering, so a
         // prior crash has been fully recovered. Reset the restart counter; the cap
         // therefore means "3 crashes without a successful recovery in between"
@@ -839,8 +949,20 @@ void RPC::getInfoThenRefresh(bool force) {
         };
 
         // Connected, so display checkmark.
-        QIcon i(":/icons/res/connected.gif");
-        main->statusIcon->setPixmap(i.pixmap(16, 16));
+        // PR-2: decode the checkmark pixmap exactly once (function-local static)
+        // instead of re-reading the GIF resource + rescaling to 16x16 through the
+        // image plugin on every poll tick. We still call setPixmap each tick (with
+        // the pre-decoded pixmap, which is cheap), and deliberately do NOT add a
+        // cross-tick "skip if unchanged" guard: noConnection() also writes
+        // main->statusIcon (the red SP_MessageBoxCritical icon) on every transient
+        // getinfo error without our knowledge, so such a guard would leave the stale
+        // red icon stuck after a reconnect. GUI-thread only: this lambda is
+        // delivered on the main thread (QNetworkReply::finished). The desired icon
+        // defaults to 'connected'; the no-peers check below may flip it to the
+        // warning icon, and we then apply it exactly once.
+        static const QPixmap connectedPm = QIcon(":/icons/res/connected.gif").pixmap(16, 16);
+        bool showWarningIcon = false;
+
 
         static int    lastBlock = 0;
         int curBlock  = reply["blocks"].get<json::number_integer_t>();
@@ -863,13 +985,45 @@ void RPC::getInfoThenRefresh(bool force) {
         Settings::getInstance()->setPeers(connections);
 
         if (connections == 0) {
-            // If there are no peers connected, then the internet is probably off or something else is wrong. 
-            QIcon i = QApplication::style()->standardIcon(QStyle::SP_MessageBoxWarning);
-            main->statusIcon->setPixmap(i.pixmap(16, 16));
+            // If there are no peers connected, then the internet is probably off or
+            // something else is wrong.
+            showWarningIcon = true;
+        }
+
+        // PR-2: apply the status icon exactly once per tick (the original set it here
+        // AND above on a zero-peer tick). The warning pixmap is cached in its own
+        // function-local static so QStyle::standardIcon + the 16x16 scale runs at
+        // most once for the whole process. We always setPixmap with the pre-decoded
+        // pixmap (no cross-tick skip) so a prior noConnection() critical icon is
+        // reliably cleared on recovery. connectedPm and showWarningIcon are declared
+        // earlier in this same lambda body. Main-thread only.
+        if (showWarningIcon) {
+            static const QPixmap warningPm =
+                QApplication::style()->standardIcon(QStyle::SP_MessageBoxWarning).pixmap(16, 16);
+            main->statusIcon->setPixmap(warningPm);
+        } else {
+            main->statusIcon->setPixmap(connectedPm);
         }
 
         // Get network sol/s
-        if (ezclassicd) {
+        // ADVANCED-TAB-FIX: gate on `conn` (a live connection), NOT on `ezclassicd`
+        // (the owned-QProcess pointer). numconnections + solrate are pure RPC data
+        // (getinfo `connections`, already in scope; getnetworksolps) valid for ANY
+        // connected node, so a foreign/already-running node must fill them too —
+        // otherwise the now-visible Advanced tab sits on its "Loading..." .ui
+        // placeholders. We are already inside the live getinfo doRPC reply (reached
+        // only after getInfoThenRefresh's early-return-on-conn==nullptr), and the
+        // node dying stops the polls, so `if (conn)` is crash-safe; do NOT introduce
+        // any unconditional ezclassicd deref here.
+        if (conn) {
+            // DECOUPLE FIX: the peer count is already known here (from the getinfo reply), so
+            // paint it NOW rather than only inside the getnetworksolps success callback. The
+            // old code set numconnections only on a successful getnetworksolps (doRPCIgnoreError
+            // = silent no-op on error), so on a node/build where getnetworksolps errors the
+            // Advanced page's prime stat (Connections) sat on "Loading…" forever even though we
+            // had the number. Sol/s stays in the callback (it genuinely needs that RPC).
+            ui->numconnections->setText(QString::number(connections));
+
             json payload = {
                 {"jsonrpc", "1.0"},
                 {"id", "someid"},
@@ -878,11 +1032,14 @@ void RPC::getInfoThenRefresh(bool force) {
 
             conn->doRPCIgnoreError(payload, [=](const json& reply) {
                 qint64 solrate = reply.get<json::number_unsigned_t>();
-
-                ui->numconnections->setText(QString::number(connections));
                 ui->solrate->setText(QString::number(solrate) % " Sol/s");
             });
-        } 
+        }
+
+        // Deliverable A: refresh the read-only "you're helping the network" panel.
+        // READ-ONLY: getnetworkinfo + getpeerinfo only; never mutates node state.
+        refreshNetworkHelpPanel(connections);
+
 
         // Call to see if the blockchain is syncing. 
         json payload = {
@@ -1105,7 +1262,14 @@ void RPC::getInfoThenRefresh(bool force) {
             }
 
             // Update zclassicd tab if it exists
-            if (ezclassicd) {
+            // ADVANCED-TAB-FIX: gate on `conn` (live connection), NOT on `ezclassicd`
+            // (owned QProcess). blockheight/heightLabel are derived purely from this
+            // getblockchaininfo reply (blockNumber/target/isSyncing) and are valid for
+            // any connected node, so a foreign node must fill them too instead of
+            // leaving the height field on its "Loading..." placeholder. This block
+            // already runs inside the live conn-guarded getblockchaininfo reply, so
+            // `if (conn)` is crash-safe; no unconditional ezclassicd deref is added.
+            if (conn) {
                 if (isSyncing) {
                     QString txt = QString::number(blockNumber);
                     if (targetKnown) {
@@ -1150,7 +1314,17 @@ void RPC::getInfoThenRefresh(bool force) {
             else {
                 tooltip = QObject::tr("zclassicd has no peer connections");
             }
-            tooltip = tooltip % "(v " % QString::number(Settings::getInstance()->getZClassicdVersion()) % ")";
+            // FORMAT FIX: was "…zclassicd(v 2001225)" — no space before "(", and a raw
+            // CLIENT_VERSION integer. Add the space and decode the standard encoding
+            // (1000000*major + 10000*minor + 100*rev + build) to a dotted version.
+            {
+                int v = Settings::getInstance()->getZClassicdVersion();
+                QString vStr = (v > 0)
+                    ? QString("%1.%2.%3.%4").arg(v / 1000000).arg((v / 10000) % 100)
+                                            .arg((v / 100) % 100).arg(v % 100)
+                    : QString::number(v);
+                tooltip = tooltip % " (v" % vStr % ")";
+            }
 
             if (!zclPrice.isEmpty()) {
                 tooltip = "1 ZCL = " % zclPrice % "\n" % tooltip;
@@ -1180,7 +1354,20 @@ void RPC::getInfoThenRefresh(bool force) {
 
     }, [=](QNetworkReply* reply, const json&) {
         // zclassicd has probably disappeared.
-        this->noConnection();
+        // transient-disconnect-zeroes-hero: doRPC has no retry, so a SINGLE dropped
+        // getinfo reply (a momentary RPC stall, not a real teardown) used to blank
+        // the balance labels and reset the hero to grey "0 ZCL" with Send demoted —
+        // a funded wallet flashed empty on one hiccup. Debounce like the peerless
+        // banner (ezNoPeerPolls>=3): the first few consecutive errors do a SOFT
+        // disconnect that PRESERVES the last balances (hero goes WARMING/refreshing,
+        // no Send/Receive swap from a blanked label); only a sustained outage
+        // (>=3 consecutive failures, ~the same dwell as the banner) does the full
+        // teardown that wipes stale data.
+        getInfoErrCount++;
+        if (getInfoErrCount < 3)
+            this->noConnection(/*preserveBalances=*/true);
+        else
+            this->noConnection();
 
         // Prevent multiple dialog boxes, because these are called async. Also
         // suppress this generic error while the crash-recovery dialog is up (or the
@@ -1319,6 +1506,16 @@ void RPC::refreshBalances() {
         ui->balSheilded   ->setText(Settings::getZCLDisplayFormat(balZ));
         ui->balTransparent->setText(Settings::getZCLDisplayFormat(balT));
         ui->balTotal      ->setText(Settings::getZCLDisplayFormat(balTotal));
+
+        // [gui-startup] The hero balances just hit the labels — the wallet is now
+        // usable. Record the milestone and flush the ONE summary line, exactly once,
+        // matching the daemon's [startup] log. first-write-wins + the summaryLogged
+        // one-shot guarantee no later refresh re-logs it.
+        GuiStartup::markFirstBalance();
+        if (!GuiStartup::marks().summaryLogged && main && main->logger) {
+            GuiStartup::marks().summaryLogged = true;
+            main->logger->write(GuiStartup::summaryLine());
+        }
 
         ui->balSheilded   ->setToolTip(Settings::getUSDFormat(balZ));
         ui->balTransparent->setToolTip(Settings::getUSDFormat(balT));
@@ -1692,7 +1889,7 @@ void RPC::checkForUpdate(bool silent) {
         suppressFirstModal   = true;
     }
 
-    QUrl cmcURL("https://api.github.com/repos/ZClassicFoundation/zcl-qt-wallet/releases");
+    QUrl cmcURL("https://api.github.com/repos/ZclassicCommunity/zcl-qt-wallet/releases");
 
     QNetworkRequest req;
     req.setUrl(cmcURL);
@@ -1738,7 +1935,7 @@ void RPC::checkForUpdate(bool silent) {
                             .arg(currentVersion.toString()),
                         QMessageBox::Yes, QMessageBox::Cancel);
                     if (ans == QMessageBox::Yes) {
-                        QDesktopServices::openUrl(QUrl("https://github.com/ZClassicFoundation/zcl-qt-wallet/releases"));
+                        QDesktopServices::openUrl(QUrl("https://github.com/ZclassicCommunity/zcl-qt-wallet/releases"));
                     } else {
                         // If the user selects cancel, don't bother them again for this version
                         s.setValue("update/lastversion", maxVersion.toString());
@@ -1750,6 +1947,18 @@ void RPC::checkForUpdate(bool silent) {
                                 .arg(currentVersion.toString()));
                     }
                 } 
+            } else {
+                // A user-initiated check must never silently do nothing: report the
+                // failure and offer the releases page so the Help menu always responds.
+                if (!silent) {
+                    auto ans = QMessageBox::warning(main, QObject::tr("Couldn't check for updates"),
+                        QObject::tr("Couldn't reach the update server right now.\n\n"
+                                    "Open the releases page in your browser?"),
+                        QMessageBox::Yes, QMessageBox::Cancel);
+                    if (ans == QMessageBox::Yes) {
+                        QDesktopServices::openUrl(QUrl("https://github.com/ZclassicCommunity/zcl-qt-wallet/releases"));
+                    }
+                }
             }
         }
         catch (...) {

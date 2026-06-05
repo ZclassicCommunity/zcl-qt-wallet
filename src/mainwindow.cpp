@@ -20,6 +20,8 @@
 
 #include <QSystemTrayIcon>
 #include <QCloseEvent>
+#include <QResizeEvent>   // narrow-window fix: re-elide the Home hero on resize
+#include <QFontMetrics>   // narrow-window fix: elidedText for the 40pt hero number
 #include <QtNetwork/QTcpSocket>
 #include <QFrame>
 #include <QLabel>
@@ -33,6 +35,7 @@
 #include <QGridLayout>
 #include <QTabBar>
 #include <QSignalBlocker>
+#include <QFileInfo>     // showExternalNodeAuthFailed: open the conf's folder
 
 using json = nlohmann::json;
 
@@ -77,10 +80,14 @@ MainWindow::MainWindow(QWidget *parent) :
     // Import Private Key
     QObject::connect(ui->actionImport_Private_Key, &QAction::triggered, this, &MainWindow::importPrivKey);
 
-    // Export All Private Keys
+    // Export All Private Keys — demoted to an explicitly-advanced label so it can
+    // never be mistaken for the everyday backup. Relabelled at runtime (no .ui regen).
+    ui->actionExport_All_Private_Keys->setText(tr("Advanced: Export private keys (text)…"));
     QObject::connect(ui->actionExport_All_Private_Keys, &QAction::triggered, this, &MainWindow::exportAllKeys);
 
-    // Backup wallet.dat
+    // Back up my wallet — the ONE safe everyday backup, worded identically to the
+    // Home card + on-sync prompt for learnable muscle-memory. Relabelled at runtime.
+    ui->actionBackup_wallet_dat->setText(tr("&Back up my wallet…"));
     QObject::connect(ui->actionBackup_wallet_dat, &QAction::triggered, this, &MainWindow::backupWalletDat);
 
     // Export transactions
@@ -133,9 +140,13 @@ MainWindow::MainWindow(QWidget *parent) :
     // demand from the Help menu so the user can invoke it any time. Created in code for
     // the same reason as the repair action (the .ui is checked in / not regenerated).
     {
-        auto* backupAction = new QAction(tr("Back up wallet…"), this);
+        auto* backupAction = new QAction(tr("&Back up my wallet…"), this);
         ui->menuHelp->addAction(backupAction);
-        QObject::connect(backupAction, &QAction::triggered, this, &MainWindow::promptWalletBackup);
+        // DEAD-CLICK FIX: promptWalletBackup() early-returns (does nothing) once
+        // options/walletbackedup is set — which happens after the first backup — so this
+        // menu item silently no-op'd forever after. Wire it to backupWallet(), the always-works
+        // copy flow (the same one the File-menu "Back up wallet.dat" uses), so it's never dead.
+        QObject::connect(backupAction, &QAction::triggered, this, &MainWindow::backupWallet);
     }
 
     // Initialize to the balances tab
@@ -157,6 +168,14 @@ MainWindow::MainWindow(QWidget *parent) :
     // has been removed (above), so the rail's primary destinations map to the
     // live tab indices (Home/Balance 0, Send 1, Receive 2, Activity 3).
     setupNavRail();
+
+    // Narrow-window fix: declare an HONEST, tested minimum width so dragging the edge has
+    // predictable behaviour (a deliberate floor) instead of an emergent "mystery wall" from
+    // additive child mins. Derivation: navRail setFixedWidth(168) + ~480 content budget =
+    // 648. The content side reaches ~480 because the 40pt hero now elides (QSizePolicy::Minimum
+    // + relayoutHero), the Summary groupBox .ui minimumSize was relaxed 250 -> 0, and the
+    // Receive QR floor dropped 200 -> 140. If the rail width or those mins change, revisit 648.
+    setMinimumWidth(648);
 
     rpc = new RPC(this);
 
@@ -190,8 +209,12 @@ void MainWindow::restoreSavedStates() {
 
         // Phase-3b: paint the Home dashboard from the cached balances too, so the
         // hero + fix-it card are correct during the warmup before the first live
-        // refresh (which calls this again via updateHomeFixIt).
-        updateHomeFixIt(balT);
+        // refresh (which calls this again via updateHomeFixIt). Item 1: pass
+        // fromCache=true so the hero paints the cached number in DE-CONFIDENCED grey
+        // with a "Last updated … · refreshing" qualifier — never confident green for a
+        // number we have not yet confirmed live this session (isSyncing() is not yet
+        // set this early, so fromCache is what short-circuits the synced edge here).
+        updateHomeFixIt(balT, /*fromCache=*/true);
 
         qint64 epoch = s.value("cache/lastSyncEpoch", (qint64) 0).toLongLong();
         if (epoch > 0) {
@@ -233,12 +256,19 @@ void MainWindow::closeEvent(QCloseEvent* event) {
         if (event)
             event->ignore();
 
-        if (!trayHintShown) {
+        // Show the "still running in the tray" hint AT MOST ONCE, EVER (persisted
+        // across launches), so the very first close quietly teaches where the window
+        // went and we NEVER nag again. trayHintShown also guards within-session
+        // repeats. A joyful wallet does not pop a notification you have to dismiss
+        // every time you close it.
+        if (!trayHintShown && !s.value("tray/hintShown", false).toBool()) {
             trayHintShown = true;
-            trayIcon->showMessage(tr("ZclWallet is still running"),
-                tr("ZclWallet keeps running in the background so it opens instantly next time. "
-                   "Right-click the tray icon (or use File > Exit) to quit completely."),
-                QSystemTrayIcon::Information, 5000);
+            s.setValue("tray/hintShown", true);
+            s.sync();
+            trayIcon->showMessage(tr("Still here — opens instantly next time"),
+                tr("ZClassic stays ready in the tray, so it opens instantly. "
+                   "Use File ▸ Exit (or right-click the tray icon) to quit completely."),
+                QSystemTrayIcon::Information, 4000);
         }
         return;
     }
@@ -587,7 +617,10 @@ void MainWindow::setupSyncBanner() {
     syncProgressBar->setRange(0, 100);
     syncProgressBar->setValue(0);
     syncProgressBar->setTextVisible(true);
-    syncProgressBar->setMinimumWidth(180);
+    // Narrow-window fix: 120 (was 180) so the sync banner row doesn't spike the window's
+    // minimum width above the honest floor while a sync is in progress. The bar is hidden
+    // at rest (below), so this only matters during sync; 120px still reads clearly.
+    syncProgressBar->setMinimumWidth(120);
     syncProgressBar->setMaximumWidth(300);
     syncProgressBar->setVisible(false);
 
@@ -669,9 +702,20 @@ void MainWindow::setupHomeDashboard() {
     homeHeroPrivate = new QLabel(QString(), hero);
     homeHeroPrivate->setObjectName("homeHeroPrivate");
     homeHeroPrivate->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    // Narrow-window fix: a 40pt non-wrapping QLabel's minimumSizeHint tracks its full
+    // rendered text (~430-520px for a balance string), which propagated up through the
+    // Summary groupBox -> Balance tab -> tabWidget and PINNED the whole window's minimum
+    // width. QSizePolicy::Minimum lets the label shrink BELOW its sizeHint (it still won't
+    // stretch wider, so the hero stays left-aligned at normal/large widths); minimumWidth(0)
+    // removes the residual floor. The displayed text is elided in relayoutHero() so it shows
+    // an ellipsis rather than a mid-glyph clip; heroPrivateFull keeps the real value.
+    homeHeroPrivate->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Preferred);
+    homeHeroPrivate->setMinimumWidth(0);
 
     homeHeroTotal = new QLabel(QString(), hero);
     homeHeroTotal->setObjectName("homeHeroTotal");
+    homeHeroTotal->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Preferred);
+    homeHeroTotal->setMinimumWidth(0);
 
     // Polish P1/UX-22: a one-line friendly helper, shown ONLY when the balance is
     // zero ("Your private balance — receive ZCL to get started"). Hidden once the
@@ -682,9 +726,23 @@ void MainWindow::setupHomeDashboard() {
     homeHeroHelper->setWordWrap(true);
     homeHeroHelper->setVisible(false);
 
+    // Trust-aware hero (item 1): an inline qualifier shown ONLY while the number is
+    // cached / warming / mid-sync, so a de-confidenced grey balance always says why
+    // ("Updating… not final yet" / "Last updated <when> · refreshing"). Hidden on the
+    // synced edge. objectName -> dark.qss owns its colour.
+    homeHeroQualifier = new QLabel(QString(), hero);
+    homeHeroQualifier->setObjectName("homeHeroQualifier");
+    homeHeroQualifier->setWordWrap(true);
+    homeHeroQualifier->setVisible(false);
+
+    // Born NOT-confident: the hero starts grey and only turns green on the first synced
+    // paint (updateHomeFixIt). A blank or warming number must never look confident.
+    homeHeroPrivate->setProperty("heroconfident", false);
+
     heroV->addWidget(heroCaption);
     heroV->addWidget(homeHeroPrivate);
     heroV->addWidget(homeHeroTotal);
+    heroV->addWidget(homeHeroQualifier);
     heroV->addWidget(homeHeroHelper);
 
     summaryVBox->insertWidget(insertAt++, hero);
@@ -728,6 +786,28 @@ void MainWindow::setupHomeDashboard() {
     });
 
     summaryVBox->insertWidget(insertAt++, actions);
+
+    // ALWAYS-AVAILABLE backup front door (Krug/Sierra ROOT-CAUSE fix). The amber
+    // backup CARD only appears once synced && balance>0 (showBackupNag), so a careful
+    // zero-balance first-timer who wants to back up BEFORE funding finds NO entry
+    // point on Home and goes hunting — which is exactly how they trip over the raw
+    // key-export dialog. This quiet, full-width secondary button is the calm, balance-
+    // independent answer to "how do I save my wallet": it calls the SAME safe copy
+    // flow as every other surface (backupWallet) and self-hides once the wallet is
+    // backed up. Its own row (not crowding Send/Receive). UAF-safe ([this], child of
+    // ui->tab). KEY-1 N/A: this is a wallet.dat copy, not a key reveal.
+    homeBackupBtn = new QPushButton(tr("Back up my wallet"), ui->tab);
+    homeBackupBtn->setObjectName("homeBackupBtn");
+    homeBackupBtn->setProperty("homeaction", "secondary");   // reuse the secondary qss hook
+    homeBackupBtn->setAutoDefault(false);
+    homeBackupBtn->setCursor(Qt::PointingHandCursor);
+    homeBackupBtn->setVisible(!Settings::getInstance()->isWalletBackedUp());
+    QObject::connect(homeBackupBtn, &QPushButton::clicked, [this]() {
+        backupWallet();
+        if (Settings::getInstance()->isWalletBackedUp() && homeBackupBtn)
+            homeBackupBtn->setVisible(false);
+    });
+    summaryVBox->insertWidget(insertAt++, homeBackupBtn);
 
     // ---- 3) FIX-IT CARD (amber; hidden unless transparent > 0) --------------
     homeFixItCard = new QFrame(ui->tab);
@@ -782,45 +862,26 @@ void MainWindow::setupHomeDashboard() {
     homeBackupText->setObjectName("homeFixItText");   // reuse the amber-body qss rule
     homeBackupText->setWordWrap(true);
 
+    // Krug: ONE obvious action. The co-equal "Export Private Keys" button (and its
+    // self-report quiz) is gone — raw key export is an advanced operation reachable
+    // only from the File menu / Receive disclosure / right-click, never as a peer of
+    // the safe backup. Identical "Back up my wallet" label on every surface.
     auto* backupRow = new QHBoxLayout();
     backupRow->setSpacing(8);
-    auto* backupNowBtn = new QPushButton(tr("Back Up Now"), homeBackupCard);
+    auto* backupNowBtn = new QPushButton(tr("Back up my wallet"), homeBackupCard);
     backupNowBtn->setObjectName("homeFixItBtn");      // reuse the amber-button qss rule
     backupNowBtn->setAutoDefault(false);
     backupNowBtn->setCursor(Qt::PointingHandCursor);
-    auto* exportKeysBtn = new QPushButton(tr("Export Private Keys"), homeBackupCard);
-    exportKeysBtn->setObjectName("homeFixItBtn");
-    exportKeysBtn->setAutoDefault(false);
-    exportKeysBtn->setCursor(Qt::PointingHandCursor);
 
-    // Wire to the existing handlers. backupWalletDat()/exportAllKeys() are the same
-    // file-copy / key-export flows the Help menu uses; on a confirmed backup they set
-    // options/walletbackedup, after which showBackupNag() hides the card permanently.
+    // backupWallet() is the single safe copy flow; on a verified copy it sets the
+    // backed-up flag, after which showBackupNag() hides this card permanently. Drop
+    // the card immediately too (idempotent) if the user actually backed up.
     QObject::connect(backupNowBtn, &QPushButton::clicked, [this]() {
-        backupWalletDat();
-        // backupWalletDat() persists options/walletbackedup on a successful copy; if
-        // the user actually backed up, drop the card immediately (idempotent).
+        backupWallet();
         if (Settings::getInstance()->isWalletBackedUp() && homeBackupCard)
             homeBackupCard->setVisible(false);
     });
-    QObject::connect(exportKeysBtn, &QPushButton::clicked, [this]() {
-        // Reuse the existing key-export dialog, then confirm the user actually saved
-        // before recording the backup (mirrors promptWalletBackup's export path so a
-        // false sense of safety is never created).
-        exportAllKeys();
-        auto saved = QMessageBox::question(this, tr("Did you save your keys?"),
-            tr("Did you save the file with your private keys somewhere safe?\n\n"
-               "Only choose Yes if you actually saved it — otherwise the reminder "
-               "stays."),
-            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
-        if (saved == QMessageBox::Yes) {
-            Settings::getInstance()->setWalletBackedUp(true);
-            if (homeBackupCard)
-                homeBackupCard->setVisible(false);
-        }
-    });
     backupRow->addWidget(backupNowBtn);
-    backupRow->addWidget(exportKeysBtn);
     backupRow->addStretch();
 
     backupV->addWidget(homeBackupText);
@@ -886,20 +947,78 @@ void MainWindow::setupHomeDashboard() {
 //   * FIX-IT card: visible ONLY when transparent > 0; the message names the exact
 //     public amount. A tiny epsilon guards against float dust below a displayable
 //     unit so a true-zero never shows the card.
-void MainWindow::updateHomeFixIt(double transparent) {
-    // Mirror the canonical labels into the hero (no-op if the dashboard isn't built).
-    if (homeHeroPrivate)
-        homeHeroPrivate->setText(ui->balSheilded->text());
-    if (homeHeroTotal)
-        homeHeroTotal->setText(tr("Total: %1").arg(ui->balTotal->text()));
+void MainWindow::updateHomeFixIt(double transparent, bool fromCache) {
+    // ---- ITEM 1: trust-aware hero — ONE state-driven pass ------------------------
+    // Derive the hero state from inputs that already exist (the canonical balance
+    // labels, Settings::isSyncing(), the cache epoch) plus the heroLivePainted session
+    // flag. The number is ALWAYS painted (never blank); only its CONFIDENCE (green vs
+    // neutral grey) and an inline qualifier change with state.
+    //
+    //   SYNCED  : live paint (!fromCache) && NOT syncing && a REAL number -> confident green
+    //   WARMING : fromCache || isSyncing() || no real number yet -> grey + "not final" line
+    //   FRESH   : WARMING with no number yet & no cache -> deterministic "0 <token>"
+    //
+    // Crucial correctness rule: green is reachable ONLY from the synced edge, and the
+    // synced edge clears the qualifier in the SAME pass — so a cached/warming number is
+    // never confident-green and a real synced number is never hidden behind a stale label.
+    const QString balZText  = ui->balSheilded->text();
+    const QString balTotTxt = ui->balTotal->text().trimmed();
+    const bool    haveNumber = !balZText.trimmed().isEmpty();
+
+    // haveNumber is REQUIRED for the synced edge: noConnection() (rpc.cpp:663) calls
+    // this with the default fromCache=false and does NOT raise the syncing flag (its
+    // single writer is the live status poll), but it FIRST blanks balSheilded to "".
+    // Requiring a real (non-blank) number means a disconnect — or a fresh install
+    // before the first status poll — reads WARMING grey-zero, never a confident green
+    // zero painted over the user's just-cleared balance.
+    const bool synced  = !fromCache && !Settings::getInstance()->isSyncing() && haveNumber;
+    const bool warming = !synced;   // cached restore, mid-sync, disconnect, or no real number yet
+
+    if (synced)
+        heroLivePainted = true;     // latch: a live, non-syncing, real balance has been painted
+
+    // Mirror the canonical labels into the hero. On a true FRESH install the labels are
+    // still empty (""), so substitute a deterministic zero rather than paint a blank card.
+    // Narrow-window fix: stash the FULL strings in members and let relayoutHero() set the
+    // (possibly elided) display text, so the 40pt number never pins the window width yet
+    // still copies/re-expands to its true value. relayoutHero() runs here AND on resize.
+    heroPrivateFull = haveNumber ? balZText
+                                 : Settings::getZCLDisplayFormat(0.0);
+    heroTotalFull   = tr("Total: %1").arg(haveNumber ? ui->balTotal->text()
+                                                     : Settings::getZCLDisplayFormat(0.0));
+    relayoutHero();
+
+    // Confidence colour: a dynamic property on the big number, repolished so the qss
+    // recomputes (same idiom as the homeaction swap below). dark.qss owns green vs grey.
+    if (homeHeroPrivate) {
+        homeHeroPrivate->setProperty("heroconfident", synced);
+        homeHeroPrivate->style()->unpolish(homeHeroPrivate);
+        homeHeroPrivate->style()->polish(homeHeroPrivate);
+    }
+
+    // Inline qualifier: shown only while warming. Prefer the cache epoch ("Last updated
+    // <when> · refreshing"); fall back to a generic "not final yet" when no epoch exists.
+    if (homeHeroQualifier) {
+        if (warming) {
+            qint64 epoch = QSettings().value("cache/lastSyncEpoch", (qint64) 0).toLongLong();
+            if (epoch > 0) {
+                QString when = QDateTime::fromSecsSinceEpoch(epoch).toString("MMM d, h:mm AP");
+                homeHeroQualifier->setText(tr("Last updated %1 · refreshing").arg(when));
+            } else {
+                homeHeroQualifier->setText(tr("Updating… not final yet"));
+            }
+        }
+        homeHeroQualifier->setVisible(warming);
+    }
 
     // Polish P1/UX-22: friendly empty-state helper under the hero when the wallet
     // has nothing yet. Parse the canonical Total label (e.g. "0 ZCL"); show the
     // helper only at true-zero. Make Receive the primary action when balance == 0
     // (see the quick-action swap below).
-    const bool isEmpty = ui->balTotal->text().trimmed().startsWith("0 ")
-                      || ui->balTotal->text().trimmed() == "0"
-                      || ui->balTotal->text().trimmed().isEmpty();
+    const bool isEmpty = !haveNumber
+                      || balTotTxt.startsWith("0 ")
+                      || balTotTxt == "0"
+                      || balTotTxt.isEmpty();
     if (homeHeroHelper)
         homeHeroHelper->setVisible(isEmpty);
     if (homeSendBtn && homeReceiveBtn) {
@@ -948,29 +1067,62 @@ void MainWindow::shieldPublicFunds() {
     // MINOR-1 null-deref guard: getDefaultSaplingAddress() below dereferences the
     // zaddresses list, which is null until the first refreshAddresses(). Mirror
     // ensureSaplingProvisioned()'s readiness guard -- if the connection or the
-    // z-address list isn't up yet, just open Send and let the user retry.
+    // z-address list isn't up yet, do NOT dump the user on a blank Send form with no
+    // explanation: keep them on Home and show a brief, friendly status so they know
+    // to retry shielding in a moment.
     if (!rpc->getConnection() || !rpc->getAllZAddresses()) {
-        ui->tabWidget->setCurrentIndex(1);
+        ui->statusBar->showMessage(
+            tr("ZClassic is still getting ready — try shielding again in a moment."),
+            5 * 1000);
         return;
     }
 
-    // 1) Pick the largest-balance transparent (t) address as the source.
+    // 1) Pick the source transparent (t) address. Prefer the t-addr with the largest
+    //    CONFIRMED, spendable balance: a t-addr that is "largest" only because of
+    //    unconfirmed funds would auto-fill Send-max = 0 (the daemon won't spend 0-conf),
+    //    leaving the user on a Send form that can't go through. spendableOrFallback()
+    //    fails open to the minconf=0 total when the UTXO set isn't loaded, so we never
+    //    refuse to shield just because UTXO data is still warming up. We ALSO track the
+    //    largest minconf=0 (displayed) t-addr balance so we can (a) fall back to it when
+    //    nothing is confirmed yet and (b) decide whether there is genuinely anything to
+    //    shield at all.
     QString fromT;
-    double  bestBal = 0;
+    double  bestBal       = 0;   // largest CONFIRMED-spendable t-addr balance
+    QString bestDispAddr;
+    double  bestDisplayed = 0;   // largest minconf=0 (displayed, incl. 0-conf) t-addr balance
     if (rpc->getAllBalances()) {
         for (auto it = rpc->getAllBalances()->constBegin(); it != rpc->getAllBalances()->constEnd(); ++it) {
-            if (Settings::isTAddress(it.key()) && it.value() > bestBal) {
-                bestBal = it.value();
+            if (!Settings::isTAddress(it.key()))
+                continue;
+            if (it.value() > bestDisplayed) {
+                bestDisplayed = it.value();
+                bestDispAddr  = it.key();
+            }
+            double spendable = spendableOrFallback(it.key());
+            if (spendable > bestBal) {
+                bestBal = spendable;
                 fromT   = it.key();
             }
         }
+    }
+    if (fromT.isEmpty()) {
+        // No t-addr has confirmed-spendable funds (e.g. everything is still confirming).
+        // Fall back to the largest minconf=0 t-addr so the user still lands on the right
+        // source; the spendable-based Send-max will then be small/0 and the calm
+        // "still confirming" guard in doSendTxValidations explains why.
+        fromT = bestDispAddr;
     }
     if (fromT.isEmpty()) {
         // Fall back to any known t-address; if there are genuinely no public funds,
         // there is nothing to shield -- just open Send.
         fromT = rpc->getDefaultTAddress();
     }
-    if (fromT.isEmpty() || bestBal <= 0.0000001) {
+    // Nothing to shield AT ALL (no confirmed AND no pending public funds): do not run a
+    // blocking Sapling create or set up a doomed Amount=0 shield -- just open Send. We
+    // gate on the DISPLAYED (minconf=0) total, not the spendable figure, so the
+    // all-funds-still-confirming case (bestBal==0 but bestDisplayed>0) still proceeds and
+    // is explained by the "still confirming" guard rather than being silently dropped.
+    if (fromT.isEmpty() || bestDisplayed <= 0.0000001) {
         ui->tabWidget->setCurrentIndex(1);
         return;
     }
@@ -1052,6 +1204,43 @@ void MainWindow::ensureSaplingProvisioned() {
 //   * syncBanner is a child of ui->tab (the Balance page) and sits ABOVE that
 //     page's content via gridLayout_2; it is unaffected and stays above the
 //     content, spanning the content column (not the rail), exactly as required.
+// Narrow-window fix: re-elide the Home hero number/total to the labels' CURRENT width so
+// the 40pt balance shows an ellipsis instead of either pinning a large minimum width or
+// hard-clipping mid-glyph. The full (un-elided) value lives in heroPrivateFull/heroTotalFull
+// so text-selection copies the real number and it re-expands when the window widens. Called
+// from updateHomeFixIt() (text-set) and resizeEvent() (geometry change). Cheap + idempotent.
+void MainWindow::relayoutHero() {
+    if (homeHeroPrivate) {
+        int w = homeHeroPrivate->width();
+        // Width is 0 before the first layout pass; show the full string then (resizeEvent
+        // re-elides once a real width exists). elidedText with w<=0 would blank the label.
+        QString shown = (w > 0)
+            ? QFontMetrics(homeHeroPrivate->font()).elidedText(heroPrivateFull, Qt::ElideRight, w)
+            : heroPrivateFull;
+        if (homeHeroPrivate->text() != shown)
+            homeHeroPrivate->setText(shown);
+        // Keep the real value reachable on hover even when elided.
+        homeHeroPrivate->setToolTip(shown == heroPrivateFull ? QString() : heroPrivateFull);
+    }
+    if (homeHeroTotal) {
+        int w = homeHeroTotal->width();
+        QString shown = (w > 0)
+            ? QFontMetrics(homeHeroTotal->font()).elidedText(heroTotalFull, Qt::ElideRight, w)
+            : heroTotalFull;
+        if (homeHeroTotal->text() != shown)
+            homeHeroTotal->setText(shown);
+        homeHeroTotal->setToolTip(shown == heroTotalFull ? QString() : heroTotalFull);
+    }
+}
+
+// Narrow-window fix: re-elide the hero on every resize so the number tracks the available
+// width (shrinks with an ellipsis as the window narrows, re-expands as it widens). Base
+// behaviour first, then our pass.
+void MainWindow::resizeEvent(QResizeEvent* event) {
+    QMainWindow::resizeEvent(event);
+    relayoutHero();
+}
+
 void MainWindow::setupNavRail() {
     // 1) Hide the tab bar — pages stay; index selection still works.
     ui->tabWidget->tabBar()->hide();
@@ -1123,8 +1312,28 @@ void MainWindow::setupNavRail() {
     QObject::connect(advBtn, &QPushButton::clicked, [this]() {
         // Find the zclassicd page in the live tabWidget; switch to it if present.
         int idx = ui->tabWidget->indexOf(zclassicdtab);
-        if (idx >= 0)
+        if (idx >= 0) {
             ui->tabWidget->setCurrentIndex(idx);
+            return;
+        }
+
+        // ADVANCED-TAB-FIX: the tab is added on the live-connection attach
+        // (RPC::setConnection). In the sub-second cold-open window BEFORE that
+        // attach fires, the tab is still absent (indexOf == -1). Never leave the
+        // click a SILENT no-op (Krug: don't-make-me-think): give honest feedback,
+        // then re-sync the rail's checked state so the gear does not get stuck
+        // "checked" while a primary tab (e.g. Balances) is still shown. We mirror
+        // the currentChanged sync handler below: under a QSignalBlocker, re-check
+        // the button for the current tab so the rail reflects reality.
+        ui->statusBar->showMessage(
+            tr("Advanced (node stats) opens once you're connected to a node."), 3000);
+        if (navRailGroup) {
+            QAbstractButton* match = navRailGroup->button(ui->tabWidget->currentIndex());
+            if (match) {
+                QSignalBlocker block(navRailGroup);
+                match->setChecked(true);
+            }
+        }
     });
 
     // 6) Keep the rail's checked state synced to the CURRENT tab index, from any
@@ -1175,6 +1384,21 @@ void MainWindow::setupNavRail() {
         home->setChecked(true);
 }
 
+// PR-1 (snappiness): apply the banner stylesheet ONLY when it actually changes.
+// setStyleSheet() forces QStyleSheetStyle to re-parse the sheet and unpolish/
+// repolish the widget subtree + a relayout even when the string is byte-identical
+// to what is already applied. The poll calls setSyncStatus() every 5s during sync
+// with the SAME orange sheet, and the at-rest heartbeat re-applies the SAME
+// transparent sheet -- so dirty-checking against the cached last-applied sheet
+// turns every same-state tick into a no-op (one QString compare), removing a
+// recurring micro-hitch on the most-watched screen. Pure main-thread.
+void MainWindow::applyBannerStyle(const QString& sheet) {
+    if (syncBanner == nullptr) return;
+    if (sheet == lastBannerSheet) return;   // already applied; skip the re-polish
+    lastBannerSheet = sheet;
+    syncBanner->setStyleSheet(sheet);
+}
+
 // P0-6: called from rpc.cpp's getblockchaininfo poll on every refresh.
 void MainWindow::setSyncStatus(bool isSyncing, int blockNumber, int estimatedHeight, double progress) {
     if (syncBanner == nullptr) return;
@@ -1198,7 +1422,7 @@ void MainWindow::setSyncStatus(bool isSyncing, int blockNumber, int estimatedHei
             syncQuietPill->setText(pill);
             syncQuietPill->setVisible(true);
         }
-        syncBanner->setStyleSheet("QWidget { background-color: transparent; }");
+        applyBannerStyle("QWidget { background-color: transparent; }");
         return;
     }
 
@@ -1224,7 +1448,7 @@ void MainWindow::setSyncStatus(bool isSyncing, int blockNumber, int estimatedHei
                 .arg(blockNumber));
         else
             syncStatusLabel->setText(tr("Starting your node…"));
-        syncBanner->setStyleSheet("QWidget { background-color: #d9822b; } QLabel { color: white; }");
+        applyBannerStyle("QWidget { background-color: #d9822b; } QLabel { color: white; }");
         return;
     }
 
@@ -1271,7 +1495,7 @@ void MainWindow::setSyncStatus(bool isSyncing, int blockNumber, int estimatedHei
     }
 
     syncStatusLabel->setText(tr("Syncing blockchain… %1%").arg(pct) % heightText % etaText);
-    syncBanner->setStyleSheet("QWidget { background-color: #d9822b; } QLabel { color: white; }");
+    applyBannerStyle("QWidget { background-color: #d9822b; } QLabel { color: white; }");
 }
 
 // P0-6: called from rpc.cpp's noConnection() so the user sees a clear,
@@ -1283,7 +1507,7 @@ void MainWindow::setSyncStatusConnecting() {
     if (syncQuietPill) syncQuietPill->setVisible(false);
     syncStatusLabel->setVisible(true);
     syncStatusLabel->setText(tr("Connecting to your ZClassic node…"));
-    syncBanner->setStyleSheet("QWidget { background-color: #555555; } QLabel { color: white; }");
+    applyBannerStyle("QWidget { background-color: #555555; } QLabel { color: white; }");
 }
 
 // C9: called from rpc.cpp when the node is "syncing" but has 0 peers. A fresh
@@ -1301,7 +1525,7 @@ void MainWindow::setSyncStatusWaitingForPeers(bool longStretch) {
             "connection and try again later"));
     else
         syncStatusLabel->setText(tr("Waiting for peers… check your internet connection"));
-    syncBanner->setStyleSheet("QWidget { background-color: #d9822b; } QLabel { color: white; }");
+    applyBannerStyle("QWidget { background-color: #d9822b; } QLabel { color: white; }");
 }
 
 // Bootstrap snapshot download in progress: show real determinate progress instead of
@@ -1328,7 +1552,7 @@ void MainWindow::setSyncStatusBootstrapSnapshot(int pct, qint64 received, qint64
         detail = detail % QString(" • ") % tr("%1 MB/s").arg(mbps, 0, 'f', 1);
 
     syncStatusLabel->setText(tr("Downloading blockchain snapshot… %1%").arg(pct) % detail);
-    syncBanner->setStyleSheet("QWidget { background-color: #d9822b; } QLabel { color: white; }");
+    applyBannerStyle("QWidget { background-color: #d9822b; } QLabel { color: white; }");
 }
 
 // SELF-HEAL (B-side): non-blocking validation banner. An empty message clears it
@@ -1344,7 +1568,7 @@ void MainWindow::setBootstrapValidationBanner(const QString& msg) {
     syncStatusLabel->setVisible(true);
     syncProgressBar->setVisible(false);
     syncStatusLabel->setText(msg);
-    syncBanner->setStyleSheet("QWidget { background-color: #2c5d8f; } QLabel { color: white; }");
+    applyBannerStyle("QWidget { background-color: #2c5d8f; } QLabel { color: white; }");
 }
 
 // Non-modal notification. Prefer a system-tray balloon (visible even when the main
@@ -1407,7 +1631,7 @@ void MainWindow::autoHealStubChain() {
     if (syncStatusLabel != nullptr) {
         syncProgressBar->setVisible(false);
         syncStatusLabel->setText(tr("Re-downloading blockchain…"));
-        syncBanner->setStyleSheet("QWidget { background-color: #2c5d8f; } QLabel { color: white; }");
+        applyBannerStyle("QWidget { background-color: #2c5d8f; } QLabel { color: white; }");
     }
     notify(tr("Re-downloading blockchain"),
         tr("ZClassic couldn't find any peers and the local copy is incomplete, so it is "
@@ -1467,8 +1691,9 @@ void MainWindow::showForeignNodeStuck() {
             "<b>Your wallet file and your coins are safe.</b> Nothing has been changed.<br><br>"
             "<b>To fix this:</b> stop the other node, then reopen this wallet so it can "
             "manage its own node.<br>"
-            "&nbsp;&nbsp;• On Linux, run: <code>systemctl --user stop zclassicd</code><br>"
-            "&nbsp;&nbsp;• Or simply close the other copy of ZClassic that is open."));
+            "&nbsp;&nbsp;• If it is another copy of ZClassic, simply close that window, or<br>"
+            "&nbsp;&nbsp;• stop the <code>zclassicd</code> background process the same way you started it<br>"
+            "&nbsp;&nbsp;&nbsp;&nbsp;(for example via your service manager, or <code>pkill zclassicd</code>)."));
 
         // Offer "Use the bundled node" ONLY when the ports are ACTUALLY free right now
         // (the foreign node was already stopped) — re-checked on click below.
@@ -1517,6 +1742,105 @@ void MainWindow::showForeignNodeStuck() {
     }
 }
 
+// 401 from a deliberately-EXTERNAL node. The bundled node's 401 is healed automatically
+// (ConnectionLoader::handleEmbeddedAuthFailure) and never reaches here, so this is the one
+// case where pointing the user at the credentials is correct and actionable. Krug-plain,
+// Sierra-reassuring, NO terminal commands, and NEVER a dead end — it branches on WHERE the
+// credentials actually live so the offered action always works.
+// See header. Dedicated, side-effect-free reader: does the conf actually hold usable creds
+// (rpcpassword line, OR a readable .cookie under its datadir)? Mirrors the connect path's
+// base resolution (conf datadir= override else conf dir). NEVER logs the cookie contents.
+bool MainWindow::confHasUsableCreds(const QString& confLocation) {
+    if (confLocation.isEmpty())
+        return false;
+
+    QFile file(confLocation);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
+        return false;
+
+    QString dataDirOverride;
+    bool    hasRpcPassword = false;
+    {
+        QTextStream in(&file);
+        while (!in.atEnd()) {
+            QString line = in.readLine();
+            int s = line.indexOf(QLatin1Char('='));
+            QString name  = (s < 0 ? line : line.left(s)).trimmed().toLower();
+            QString value = (s < 0 ? QString() : line.mid(s + 1)).trimmed();
+            if (name == QLatin1String("rpcpassword") && !value.isEmpty())
+                hasRpcPassword = true;   // NEVER log `value`
+            else if (name == QLatin1String("datadir"))
+                dataDirOverride = value;
+        }
+    }
+    file.close();
+
+    if (hasRpcPassword)
+        return true;
+
+    // No password line -> a cookie under the daemon's datadir is the other usable source.
+    QString base = !dataDirOverride.isEmpty()
+                       ? dataDirOverride
+                       : QFileInfo(confLocation).absoluteDir().absolutePath();
+    if (base.isEmpty())
+        return false;
+    QString cookiePath = QDir::cleanPath(QDir(base).filePath(QStringLiteral(".cookie")));
+    QFile ck(cookiePath);
+    if (!ck.open(QIODevice::ReadOnly | QIODevice::Text))
+        return false;
+    QTextStream cin(&ck);
+    QString cookieLine = cin.readLine().trimmed();   // SECRET: presence only, never logged
+    ck.close();
+    return !cookieLine.isEmpty();
+}
+
+void MainWindow::showExternalNodeAuthFailed() {
+    const QString confLoc   = Settings::getInstance()->getZClassicdConfLocation();
+    // A conf path can exist yet hold NO usable creds (e.g. "server=1" only, with the running
+    // node's creds on its command line). Only point the user at the FILE when the file truly
+    // holds creds; otherwise route to the EDITABLE Settings branch so it is never a dead end.
+    const bool    credsInConf = !confLoc.isEmpty() && confHasUsableCreds(confLoc);
+
+    QMessageBox box(this);
+    box.setIcon(QMessageBox::Information);
+    box.setWindowTitle(tr("Let's reconnect to your node"));
+    box.setText(tr("ZClassic reached your node, but the sign-in details weren't accepted."));
+
+    if (credsInConf) {
+        // Credentials come from a detected zclassic.conf that ACTUALLY holds them, so the
+        // Edit -> Settings fields are read-only (setupSettingsModal disables them only when
+        // the conf has usable creds). A cred-less conf takes the editable branch below.
+        // Pointing at Settings would be a dead end — point at the file instead, with a
+        // one-click button that opens its folder.
+        box.setInformativeText(tr(
+            "Your node reads its RPC username and password from this file:\n\n%1\n\n"
+            "They don't match the node that's running right now. Update them there (or in "
+            "your node's own settings) so they match, then open ZClassic again. Nothing is "
+            "wrong with your wallet or your coins — they're safe.").arg(confLoc));
+        QPushButton* showBtn = box.addButton(tr("Show me the file"), QMessageBox::AcceptRole);
+        box.addButton(tr("Not now"), QMessageBox::RejectRole);
+        box.setDefaultButton(showBtn);
+        box.exec();
+        if (box.clickedButton() == showBtn)
+            QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(confLoc).absolutePath()));
+    } else {
+        // Credentials come from Edit -> Settings (manual external connection); those
+        // fields ARE editable on this path, so a one-click jump to Settings is correct.
+        box.setInformativeText(tr(
+            "You've set ZClassic to use your own node, and its RPC username or password "
+            "doesn't match what's saved here. Nothing is wrong with your wallet or your "
+            "coins — they're safe.\n\n"
+            "Open Settings to update the username and password to match your node, then "
+            "ZClassic will connect."));
+        QPushButton* openBtn = box.addButton(tr("Open Settings"), QMessageBox::AcceptRole);
+        box.addButton(tr("Not now"), QMessageBox::RejectRole);
+        box.setDefaultButton(openBtn);
+        box.exec();
+        if (box.clickedButton() == openBtn && ui && ui->actionSettings)
+            ui->actionSettings->trigger();
+    }
+}
+
 // Sibling of the above for the connect-time CATCH-ALL (edit #2). The node has not answered
 // cleanly nor with a recognized warmup state for too long. Actionable + retryable; Retry
 // relaunches the app (a clean reconnect) instead of leaving the connect dialog frozen.
@@ -1562,9 +1886,15 @@ void MainWindow::setupSettingsModal() {
 
         // Setup clear button
         QObject::connect(settings.btnClearSaved, &QCheckBox::clicked, [=]() {
-            if (QMessageBox::warning(this, "Clear saved history?",
-                "Shielded z-Address transactions are stored locally in your wallet, outside zclassicd. You may delete this saved information safely any time for your privacy.\nDo you want to delete the saved shielded transactions now?",
-                QMessageBox::Yes, QMessageBox::Cancel)) {
+            // DATA-LOSS FIX: the old `if (QMessageBox::warning(...))` ran the irreversible
+            // delete for EVERY button — Yes returns 0x4000 and Cancel returns 0x400000, both
+            // non-zero/truthy, and Cancel is also the Esc/X escape button. So Cancel, Esc and
+            // the window-X all deleted the saved history with no way to back out. Capture the
+            // result and gate on equality so ONLY "Yes" deletes.
+            auto ans = QMessageBox::warning(this, tr("Clear saved history?"),
+                tr("Shielded z-Address transactions are stored locally in your wallet, outside zclassicd. You may delete this saved information safely any time for your privacy.\nDo you want to delete the saved shielded transactions now?"),
+                QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
+            if (ans == QMessageBox::Yes) {
                     SentTxStore::deleteHistory();
                     // Also drop the cached last-known balances (same local data).
                     QSettings().remove("cache");
@@ -1582,6 +1912,15 @@ void MainWindow::setupSettingsModal() {
         if (!QSystemTrayIcon::isSystemTrayAvailable()) {
             settings.chkKeepInTray->setEnabled(false);
             settings.chkKeepInTray->setToolTip(tr("Your desktop doesn't provide a system tray, so this option isn't available."));
+        }
+
+        // Help the network: open our P2P port automatically via NAT-PMP/PCP
+        // (no UPnP). Default OFF. Only meaningful with the embedded daemon, since
+        // the flag is passed at daemon launch; disable + explain otherwise.
+        settings.chkNatpmp->setChecked(Settings::getInstance()->getOpenPortNatpmp());
+        if (!rpc->isEmbedded()) {
+            settings.chkNatpmp->setEnabled(false);
+            settings.chkNatpmp->setToolTip(tr("Automatic port opening is available only when running an embedded zclassicd."));
         }
 
         // Custom fees
@@ -1608,14 +1947,28 @@ void MainWindow::setupSettingsModal() {
         QIntValidator validator(0, 65535);
         settings.port->setValidator(&validator);
 
-        // If values are coming from zclassic.conf, then disable all the fields
+        // If values are coming from zclassic.conf, then disable all the fields — BUT only
+        // when that conf actually holds usable creds. A conf can exist yet carry none (e.g.
+        // "server=1" only, with a running node's creds on its command line); in that case
+        // leave the fields EDITABLE so the user can supply them (never a dead end).
         auto zclassicConfLocation = Settings::getInstance()->getZClassicdConfLocation();
-        if (!zclassicConfLocation.isEmpty()) {
+        bool confLocked = !zclassicConfLocation.isEmpty() && confHasUsableCreds(zclassicConfLocation);
+        if (confLocked) {
             settings.confMsg->setText("Settings are being read from \n" + zclassicConfLocation);
             settings.hostname->setEnabled(false);
             settings.port->setEnabled(false);
             settings.rpcuser->setEnabled(false);
             settings.rpcpassword->setEnabled(false);
+        }
+        else if (!zclassicConfLocation.isEmpty()) {
+            // Conf exists but has no usable creds: editable, with reassuring guidance.
+            settings.confMsg->setText(tr(
+                "A ZClassic node is already running, but its sign-in details aren't saved here.\n"
+                "Enter its RPC username and password and ZClassic will connect."));
+            settings.hostname->setEnabled(true);
+            settings.port->setEnabled(true);
+            settings.rpcuser->setEnabled(true);
+            settings.rpcpassword->setEnabled(true);
         }
         else {
             settings.confMsg->setText("No local zclassic.conf found. Please configure connection manually.");
@@ -1661,6 +2014,20 @@ void MainWindow::setupSettingsModal() {
             Settings::getInstance()->setKeepInTray(keepInTray);
             applyTraySetting(keepInTray);
 
+            // Help the network: open my port automatically (NAT-PMP/PCP, no UPnP).
+            // The daemon reads -natpmp only at launch, so a change takes effect on
+            // the next restart. Tell the user only when the value actually changed.
+            bool wasNatpmp = Settings::getInstance()->getOpenPortNatpmp();
+            bool natpmp = settings.chkNatpmp->isChecked();
+            if (natpmp != wasNatpmp) {
+                Settings::getInstance()->setOpenPortNatpmp(natpmp);
+                QMessageBox::information(this, tr("Open port automatically"),
+                    natpmp
+                        ? tr("Automatic port opening will be enabled the next time ZclWallet starts its node. This asks your router to make you reachable to other peers (NAT-PMP/PCP, never UPnP).")
+                        : tr("Automatic port opening will be disabled the next time ZclWallet starts its node."),
+                    QMessageBox::Ok);
+            }
+
             if (!isUsingTor && settings.chkTor->isChecked()) {
                 // If "use tor" was previously unchecked and now checked
                 Settings::addToZClassicConf(zclassicConfLocation, "proxy=127.0.0.1:9050");
@@ -1681,14 +2048,19 @@ void MainWindow::setupSettingsModal() {
                     QMessageBox::Ok);
             }
 
-            if (zclassicConfLocation.isEmpty()) {
+            // Persist + reconnect whenever the cred fields were EDITABLE this dialog — i.e.
+            // no conf at all, OR a conf with no usable creds (confLocked false). Without this
+            // the creds a user typed for a cred-less-conf node would never be saved, so the
+            // dead end would persist even with editable fields. The saved creds are picked up
+            // by autoDetectZClassicConf's QSettings fallback on the very next connect.
+            if (!confLocked) {
                 // Save settings
                 Settings::getInstance()->saveSettings(
                     settings.hostname->text(),
                     settings.port->text(),
                     settings.rpcuser->text(),
                     settings.rpcpassword->text());
-                
+
                 auto cl = new ConnectionLoader(this, rpc);
                 cl->loadConnection();
             }
@@ -1707,12 +2079,16 @@ void MainWindow::setupSettingsModal() {
 
             if (showRestartInfo) {
                 auto desc = tr("ZclWallet needs to restart to rescan/reindex. ZclWallet will now close, please restart ZclWallet to continue");
-                
+
                 QMessageBox::information(this, tr("Restart ZclWallet"), desc, QMessageBox::Ok);
-                // Context 'this': Qt auto-cancels the timer if the window is
-                // destroyed before it fires, so the lambda never calls close()
-                // on a freed MainWindow (UAF on a fast quit).
-                QTimer::singleShot(1, this, [=]() { this->close(); });
+                // NO-OP-IN-TRAY FIX: in the default tray-resident/embedded config (the only
+                // config where Rescan/Reindex are even enabled), close() merely HIDES to the
+                // tray — closeEvent ignores it before rpc->shutdownZClassicd(), so the daemon
+                // never stops and never re-reads rescan=1/reindex=1, making the whole feature a
+                // silent no-op. quitApp() sets quitting=true so closeEvent actually shuts the
+                // node down; the next launch then performs the rescan/reindex (matches the copy).
+                // Context 'this': Qt auto-cancels the timer if the window is destroyed first.
+                QTimer::singleShot(1, this, [=]() { this->quitApp(); });
             }
         }
     });
@@ -1797,12 +2173,20 @@ void MainWindow::balancesReady() {
 // rpc.cpp on the synced && balTotal>0 && once-per-session edge (the same trigger that
 // used to fire the modal promptWalletBackup()). No-op once the wallet has been backed
 // up (options/walletbackedup) or when the card isn't built (e.g. before the dashboard
-// is set up). The card's own buttons (Back Up Now / Export Private Keys) silence it.
+// is set up). The card's single "Back up my wallet" button silences it on a verified copy.
 void MainWindow::showBackupNag() {
     if (Settings::getInstance()->isWalletBackedUp())
         return;   // already backed up -> never nag again
-    if (homeBackupCard != nullptr)
+    if (homeBackupCard != nullptr) {
+        // The amber card supersedes the quiet standalone button: showing both at
+        // once duplicates the identical "Back up my wallet" control on Home. Hide
+        // the standalone while the card is up (both call backupWallet(), so this is
+        // pure de-duplication). If the card was never built, leave the standalone
+        // visible as the sole un-backed-up entry point.
+        if (homeBackupBtn != nullptr)
+            homeBackupBtn->setVisible(false);
         homeBackupCard->setVisible(true);
+    }
 }
 
 void MainWindow::showImportProgress(bool active) {
@@ -1822,92 +2206,32 @@ void MainWindow::promptWalletBackup() {
     if (!rpc || !rpc->getConnection())
         return;
 
+    // Krug: ONE self-evident primary action + one quiet escape. No co-equal "Export
+    // Private Keys" fork, no inline copy duplication (the copy lives in backupWallet),
+    // no 'Did you save your keys?' quiz, no scolding 'No backup yet' modal. Sierra:
+    // reassure, don't quiz. The Home card already nags non-blockingly; this prompt
+    // just makes the one safe action a single click away.
     QMessageBox box(this);
     box.setWindowTitle(tr("Back up your wallet"));
     box.setIcon(QMessageBox::Warning);
-    box.setText(tr("Protect your coins — back up your wallet now."));
+    box.setText(tr("Back up your wallet"));
     box.setInformativeText(tr(
-        "Your ZClassic is stored in a single file on this computer called "
-        "<b>wallet.dat</b>. There is <b>no seed phrase / recovery phrase</b> for this wallet.<br><br>"
-        "If this computer is lost, reset, or its disk fails and you have no backup, "
-        "<b>your coins are gone forever and cannot be recovered by anyone</b>.<br><br>"
-        "Make a backup now and keep a copy somewhere safe (a USB stick or another "
-        "computer). You can:<br>"
-        "&nbsp;&nbsp;• Save a copy of the wallet.dat file, or<br>"
-        "&nbsp;&nbsp;• Export your private keys to a text file.<br><br>"
-        "Keep your backup private — anyone who has it can spend your coins."));
+        "Your ZClassic lives in one file on this computer (wallet.dat). There is "
+        "<b>no recovery phrase</b>. If this computer is lost or its disk fails and "
+        "you have no backup, your coins are gone forever.<br><br>"
+        "It takes one click. Keep the copy somewhere safe — a USB stick or another "
+        "computer."));
 
-    QPushButton* backupBtn = box.addButton(tr("Back Up Now"), QMessageBox::AcceptRole);
-    QPushButton* exportBtn = box.addButton(tr("Export Private Keys"), QMessageBox::ActionRole);
+    QPushButton* backupBtn = box.addButton(tr("Back up my wallet"), QMessageBox::AcceptRole);
     QPushButton* laterBtn  = box.addButton(tr("Maybe later"), QMessageBox::RejectRole);
     box.setDefaultButton(backupBtn);
+    box.setEscapeButton(laterBtn);
 
     box.exec();
-    QAbstractButton* clicked = box.clickedButton();
-
-    if (clicked == backupBtn) {
-        // Copy wallet.dat to a user-chosen location. We mirror backupWalletDat()
-        // here (rather than calling it) so we can detect a SUCCESSFUL copy and
-        // only then mark the wallet as backed up.
-        QDir zclassicdir(rpc->getConnection()->config->zclassicDir);
-        QString backupDefaultName = "zclassic-wallet-backup-" +
-            QDateTime::currentDateTime().toString("yyyyMMdd") + ".dat";
-
-        if (Settings::getInstance()->isTestnet()) {
-            zclassicdir.cd("testnet3");
-            backupDefaultName = "testnet-" + backupDefaultName;
-        }
-
-        QFile wallet(zclassicdir.filePath("wallet.dat"));
-        if (!wallet.exists()) {
-            QMessageBox::critical(this, tr("No wallet.dat"),
-                tr("Couldn't find the wallet.dat on this computer") + "\n" +
-                tr("You need to back it up from the machine zclassicd is running on"),
-                QMessageBox::Ok);
-            return;
-        }
-
-        QUrl backupName = QFileDialog::getSaveFileUrl(this, tr("Backup wallet.dat"),
-            backupDefaultName, "Data file (*.dat)");
-        if (backupName.isEmpty())
-            return;  // User cancelled the save dialog: leave the flag unset so we nag again next launch.
-
-        if (wallet.copy(backupName.toLocalFile())) {
-            // Success: remember that the wallet has been backed up.
-            QSettings().setValue("options/walletbackedup", true);
-            QMessageBox::information(this, tr("Backup complete"),
-                tr("Your wallet backup was saved.\n\n"
-                   "Keep this file private and in a safe place. You can restore your "
-                   "coins later by copying it back into the wallet's data folder."),
-                QMessageBox::Ok);
-        } else {
-            QMessageBox::critical(this, tr("Couldn't backup"),
-                tr("Couldn't backup the wallet.dat file.") +
-                tr("You need to back it up manually."), QMessageBox::Ok);
-        }
-    } else if (clicked == exportBtn) {
-        // Reuse the existing private-key export dialog. The user saves the keys
-        // to a file from inside that dialog. Because that dialog's Save is
-        // optional and reports no status, we explicitly confirm the user
-        // actually saved before marking the wallet backed up -- otherwise we'd
-        // give a false sense of safety and never remind them again.
-        exportAllKeys();
-        auto saved = QMessageBox::question(this, tr("Did you save your keys?"),
-            tr("Did you save the file with your private keys somewhere safe?\n\n"
-               "Only choose Yes if you actually saved it — otherwise we'll remind "
-               "you to back up again next time."),
-            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
-        if (saved == QMessageBox::Yes)
-            QSettings().setValue("options/walletbackedup", true);
-    } else {
-        // "Maybe later" (or the dialog was closed): make the consequence explicit,
-        // but never block. The flag stays unset, so we nag again next launch.
-        QMessageBox::warning(this, tr("No backup yet"),
-            tr("You have not backed up your wallet.\n\n"
-               "Until you do, you risk losing all your coins if this computer is "
-               "lost or breaks. We'll remind you again next time you open the wallet."),
-            QMessageBox::Ok);
-    }
+    if (box.clickedButton() == backupBtn)
+        backupWallet();   // the one safe copy + the one warm closure; sets the flag on success
+    // "Maybe later" / closed: do nothing. The flag stays unset, so the non-blocking
+    // Home card keeps the gentle reminder. No scare modal.
 }
 
 // Event filter for MacOS specific handling of payment URIs
@@ -2013,7 +2337,18 @@ void MainWindow::payZClassicURI(QString uri) {
     ui->Address1->setText(addr);
     ui->Address1->setCursorPosition(0);
     ui->Amount1->setText(QString::number(amount));
-    ui->MemoTxt1->setText(memo);
+    // A URI memo can only be delivered to a shielded z-address; t-addresses carry no
+    // memo field. Rather than show it on the page and then silently drop it when the tx
+    // is built (MemoTxt1 is read directly into ToFields), only carry it to a z-recipient.
+    // For a t-addr we clear the field (the Memo button is already disabled via
+    // addressChanged above) and tell the user once, so the drop is never a surprise.
+    if (!memo.isEmpty() && !Settings::isZAddress(addr)) {
+        ui->MemoTxt1->clear();
+        QMessageBox::information(this, tr("Memo not sent"),
+            tr("The memo in this payment link was not added: memos are only delivered to shielded z-addresses, not transparent t-addresses."));
+    } else {
+        ui->MemoTxt1->setText(memo);
+    }
 
     // And switch to the send tab.
     ui->tabWidget->setCurrentIndex(1);
@@ -2092,43 +2427,126 @@ void MainWindow::exportTransactions() {
     }
 } 
 
+// fnDefaultBackupDir: a sensible, EXISTING folder to pre-fill the Save dialog so the
+// happy path is zero-navigation — Desktop, then Documents, then Home. We never auto-
+// write a spendable secret without a Save dialog (agency/safety), but we make that
+// dialog open already pointing at a good place.
+QString MainWindow::fnDefaultBackupDir() {
+    for (auto loc : { QStandardPaths::DesktopLocation, QStandardPaths::DocumentsLocation,
+                      QStandardPaths::HomeLocation }) {
+        QString dir = QStandardPaths::writableLocation(loc);
+        if (!dir.isEmpty() && QDir(dir).exists())
+            return dir;
+    }
+    return QDir::homePath();
+}
+
+// backupWallet: the ONE safe everyday backup. Locates wallet.dat, opens a Save dialog
+// PRE-FILLED with both a smart folder (fnDefaultBackupDir) and a collision-safe dated
+// filename (so a same-day second backup never overwrites yesterday's and never raises
+// an overwrite prompt). On a VERIFIED copy: set the backed-up flag (silences the card
+// + prompt) and show the one warm closure. KEY-1: the secret is only ever copied to
+// the local file the user confirms — never networked or logged.
+void MainWindow::backupWallet() {
+    if (!rpc || !rpc->getConnection())
+        return;
+
+    QDir zclassicdir(rpc->getConnection()->config->zclassicDir);
+    QString namePrefix = "zclassic-wallet-backup-";
+    if (Settings::getInstance()->isTestnet()) {
+        zclassicdir.cd("testnet3");
+        namePrefix = "testnet-" + namePrefix;
+    }
+
+    QFile wallet(zclassicdir.filePath("wallet.dat"));
+    if (!wallet.exists()) {
+        QMessageBox::critical(this, tr("Couldn't find your wallet file"),
+            tr("Couldn't find wallet.dat on this computer. If ZClassic is running on "
+               "another machine, back it up from there."), QMessageBox::Ok);
+        return;
+    }
+
+    // Collision-safe dated default name (graft from Design 1): base, then base-2, -3…
+    // so the native Save dialog opens already pointing at a fresh file.
+    QDir   destDir(fnDefaultBackupDir());
+    QString date  = QDateTime::currentDateTime().toString("yyyyMMdd");
+    QString base  = namePrefix + date;
+    QString fileName = base + ".dat";
+    for (int i = 2; QFileInfo::exists(destDir.filePath(fileName)); ++i)
+        fileName = base + "-" + QString::number(i) + ".dat";
+
+    QString defaultPath = destDir.filePath(fileName);
+    QString chosen = QFileDialog::getSaveFileName(this, tr("Save your wallet backup"),
+                                                  defaultPath, tr("Data file (*.dat)"));
+    if (chosen.isEmpty())
+        return;   // cancelled: flag stays unset, the Home card keeps reminding
+
+    if (wallet.copy(chosen)) {
+        Settings::getInstance()->setWalletBackedUp(true);
+        showBackupSuccess(chosen, /*isWalletDat=*/true);
+    } else {
+        QMessageBox::critical(this, tr("Couldn't save the backup"),
+            tr("We couldn't save the backup file.") + "\n\n" +
+            tr("Nothing was changed. Please try again, or choose a different place "
+               "to save it."), QMessageBox::Ok);
+    }
+}
+
+// showBackupSuccess: the ONE warm closure, reused by the wallet.dat backup AND the
+// advanced key-file export (isWalletDat=false). Tells the user WHERE the secret is,
+// that they're safe, NOT to cloud-sync it, and HOW TO RESTORE — the difference
+// between a backup and a real backup. [Show in folder] opens the LOCAL containing
+// folder only (KEY-1: nothing leaves the machine). The path is HTML-escaped because
+// the body is rich text.
+void MainWindow::showBackupSuccess(const QString& savedPath, bool isWalletDat) {
+    QString safePath = savedPath.toHtmlEscaped();
+
+    QString restore = isWalletDat
+        ? tr("To restore later: copy this file back into the wallet's data folder and "
+             "rename it to wallet.dat.")
+        : tr("To restore later: open another ZClassic wallet and use "
+             "File &gt; Import private key.");
+
+    QString secretLine = isWalletDat
+        ? tr("Your coins are safe as long as you keep this file. Keep it private — "
+             "anyone who has it can spend your coins, so don't put it in a folder that "
+             "syncs to the cloud (Dropbox, iCloud, Google Drive) unless your wallet is "
+             "password-encrypted. A USB stick or a second computer is ideal.")
+        : tr("These are your private keys — keep this file private; anyone who has it "
+             "can spend your coins. Don't put it in a folder that syncs to the cloud "
+             "(Dropbox, iCloud, Google Drive). A USB stick or a second computer is ideal.");
+
+    QMessageBox box(this);
+    box.setWindowTitle(tr("Backup saved — you're safe"));
+    box.setIcon(QMessageBox::Information);
+    box.setText(tr("Backup saved — you're safe"));
+    box.setTextFormat(Qt::RichText);
+    box.setInformativeText(
+        tr("Saved to:") + "<br><b>" + safePath + "</b><br><br>" +
+        secretLine + "<br><br>" + restore);
+
+    QPushButton* showBtn = box.addButton(tr("Show in folder"), QMessageBox::ActionRole);
+    QPushButton* doneBtn = box.addButton(tr("Done"), QMessageBox::AcceptRole);
+    box.setDefaultButton(doneBtn);
+    box.setEscapeButton(doneBtn);
+    box.exec();
+
+    if (box.clickedButton() == showBtn) {
+        // KEY-1: local only. Open the containing folder (not the secret file itself).
+        QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(savedPath).absolutePath()));
+    }
+}
+
 /**
  * Backup the wallet.dat file. This is kind of a hack, since it has to read from the filesystem rather than an RPC call
  * This might fail for various reasons - Remote zclassicd, non-standard locations, custom params passed to zclassicd, many others
 */
 void MainWindow::backupWalletDat() {
-    if (!rpc->getConnection())
-        return;
-
-    QDir zclassicdir(rpc->getConnection()->config->zclassicDir);
-    QString backupDefaultName = "zclassic-wallet-backup-" + QDateTime::currentDateTime().toString("yyyyMMdd") + ".dat";
-
-    if (Settings::getInstance()->isTestnet()) {
-        zclassicdir.cd("testnet3");
-        backupDefaultName = "testnet-" + backupDefaultName;
-    }
-    
-    QFile wallet(zclassicdir.filePath("wallet.dat"));
-    if (!wallet.exists()) {
-        QMessageBox::critical(this, tr("No wallet.dat"), tr("Couldn't find the wallet.dat on this computer") + "\n" +
-            tr("You need to back it up from the machine zclassicd is running on"), QMessageBox::Ok);
-        return;
-    }
-    
-    QUrl backupName = QFileDialog::getSaveFileUrl(this, tr("Backup wallet.dat"), backupDefaultName, "Data file (*.dat)");
-    if (backupName.isEmpty())
-        return;
-
-    if (!wallet.copy(backupName.toLocalFile())) {
-        QMessageBox::critical(this, tr("Couldn't backup"), tr("Couldn't backup the wallet.dat file.") +
-            tr("You need to back it up manually."), QMessageBox::Ok);
-    } else {
-        // W1-2: a confirmed file-copy backup silences the backup nag (the amber Home
-        // card + the legacy promptWalletBackup modal) permanently. Previously only
-        // promptWalletBackup()'s own copy path set this; now the Help-menu action and
-        // the Home card's "Back Up Now" button record it too.
-        Settings::getInstance()->setWalletBackedUp(true);
-    }
+    // The File-menu "Back up my wallet…" action. One implementation: delegate to the
+    // shared safe-copy helper (smart pre-filled Save dialog + collision-safe name +
+    // verified-copy flag + the one warm closure). Kept as a thin wrapper because the
+    // .ui action (actionBackup_wallet_dat) is wired to this slot by name.
+    backupWallet();
 }
 
 void MainWindow::exportAllKeys() {
@@ -2136,6 +2554,18 @@ void MainWindow::exportAllKeys() {
 }
 
 void MainWindow::exportKeys(QString addr) {
+    // DEAD-END FIX: the Export-keys menu items are always clickable, but without a live
+    // connection getAllPrivKeys/getZPrivKey never fire their callback, so the dialog sat on
+    // "Loading…" forever with Save/Copy disabled and no way forward. Guard up front (mirrors
+    // the existing doImport/backupWallet null-conn guards) so the user gets a clear, recoverable
+    // message instead of a frozen modal.
+    if (!rpc || !rpc->getConnection()) {
+        QMessageBox::information(this, tr("Not connected"),
+            tr("ZClassic isn't connected to your node yet, so it can't read your keys. "
+               "Please wait until it's connected, then try again."));
+        return;
+    }
+
     bool allKeys = addr.isEmpty() ? true : false;
 
     // Don't-make-me-think: the user explicitly chose to view their keys — don't
@@ -2151,6 +2581,51 @@ void MainWindow::exportKeys(QString addr) {
     pui.helpLbl->setObjectName("privKeySecurity");
     pui.privKeyTxt->setObjectName("privKeyTextEdit");
 
+    // ADVANCED-EXPORT ORIENTATION (Krug/Sierra): this screen now has a beginning,
+    // middle, and end so it never orphans. privkey.ui is a QGridLayout (gridLayout)
+    // with row0=helpLbl, row1=privKeyTxt, row2=buttonBox. We re-place helpLbl/txt/
+    // buttons down one row each and insert a separate amber intro header at row0 and
+    // a hidden green 'saved' confirmation line above the buttons — no .ui regen.
+    // doneLbl is a LOCAL (not stashed on the generated Ui_PrivKey struct, so a uic
+    // regen of ui_privkey.h can never wipe it); the Save lambda captures it by value,
+    // and the QLabel lives as a child of &d for the dialog's lifetime.
+    QLabel* doneLbl = nullptr;
+    auto* grid = qobject_cast<QGridLayout*>(d.layout());
+    if (grid) {
+        grid->removeWidget(pui.helpLbl);
+        grid->removeWidget(pui.privKeyTxt);
+        grid->removeWidget(pui.buttonBox);
+
+        auto* introLbl = new QLabel(&d);
+        introLbl->setObjectName("privKeyIntro");
+        introLbl->setWordWrap(true);
+        introLbl->setText(tr(
+            "Advanced — this exports raw spending keys to move an address into another "
+            "wallet. It is not a regular backup. To back up everything safely, close "
+            "this and use \"Back up my wallet\"."));
+
+        doneLbl = new QLabel(&d);
+        doneLbl->setObjectName("privKeyDoneLbl");
+        doneLbl->setWordWrap(true);
+        doneLbl->setVisible(false);            // shown inline after a successful save
+
+        // Calm, dim reassurance so opening this just to LOOK has an obviously safe
+        // exit (Sierra: make the user feel capable). Child of &d, qss-styled.
+        auto* closeHint = new QLabel(&d);
+        closeHint->setObjectName("privKeyCloseHint");
+        closeHint->setWordWrap(true);
+        closeHint->setText(tr(
+            "Nothing is saved or shared until you press \"Save to file\". "
+            "Closing this is safe — your keys stay in your wallet."));
+
+        grid->addWidget(introLbl,        0, 0);
+        grid->addWidget(pui.helpLbl,     1, 0);
+        grid->addWidget(pui.privKeyTxt,  2, 0);
+        grid->addWidget(doneLbl,         3, 0);
+        grid->addWidget(closeHint,       4, 0);
+        grid->addWidget(pui.buttonBox,   5, 0);
+    }
+
     // Make the window big by default
     auto ps = this->geometry();
     QMargins margin = QMargins() + 50;
@@ -2164,15 +2639,36 @@ void MainWindow::exportKeys(QString addr) {
 
     const QString securityNote = tr("These are your secret keys — anyone who has them controls these funds. "
                                     "Keep this screen private and store any saved file somewhere safe.");
+    const QString whatToDo = tr("\nWhat to do: press \"Save to file\" below.");
     if (allKeys)
-        pui.helpLbl->setText(securityNote + tr("\n\nShowing the keys for every address in your wallet."));
+        pui.helpLbl->setText(securityNote + tr("\n\nShowing the keys for every address in your wallet.") + whatToDo);
     else
-        pui.helpLbl->setText(securityNote + tr("\n\nShowing the key for: ") + addr);
+        pui.helpLbl->setText(securityNote + tr("\n\nShowing the key for: ") + addr + whatToDo);
     pui.helpLbl->setWordWrap(true);
 
-    // Disable the save button until it finishes loading
-    pui.buttonBox->button(QDialogButtonBox::Save)->setEnabled(false);
+    // Disable the save button until it finishes loading. Promote it to the primary
+    // action: relabel "Save to file" and style it via objectName. We deliberately do
+    // NOT setDefault(true) — on a screen full of secret keys, a stray Enter should
+    // not begin a key-file export. (No .ui change — same objectName->qss idiom.)
+    auto* saveBtn = pui.buttonBox->button(QDialogButtonBox::Save);
+    saveBtn->setEnabled(false);
+    saveBtn->setText(tr("Save to file"));
+    saveBtn->setObjectName("privKeySaveBtn");
     pui.buttonBox->button(QDialogButtonBox::Ok)->setVisible(false);
+
+    // Krug: the chrome itself must say 'this is the advanced thing, not your backup',
+    // and the exit must be obviously consequence-free. The window title was the bare
+    // jargon 'Private Key' (privkey.ui:14); relabel it in plain words. Relabel the
+    // Close button so a nervous looker knows leaving without saving is safe, and make
+    // it the escape/default button so a stray Enter closes rather than starting an
+    // export. KEY-1: nothing is written on close.
+    d.setWindowTitle(allKeys ? tr("Advanced — export private keys")
+                             : tr("Advanced — export this address's private key"));
+    if (auto* closeBtn = pui.buttonBox->button(QDialogButtonBox::Close)) {
+        closeBtn->setText(tr("Close — nothing to save"));
+        closeBtn->setDefault(true);
+        closeBtn->setAutoDefault(true);
+    }
 
     // One-click Copy All — the user shouldn't have to select-all + Ctrl-C. Added in
     // C++ (no .ui change); enabled once keys load (see fnUpdateUIWithKeys). The
@@ -2187,17 +2683,39 @@ void MainWindow::exportKeys(QString addr) {
         QTimer::singleShot(1500, copyBtn, [copyBtn]() { copyBtn->setText(tr("Copy All")); });
     });
 
-    // Wire up save button
-    QObject::connect(pui.buttonBox->button(QDialogButtonBox::Save), &QPushButton::clicked, [=] () {
-        QString fileName = QFileDialog::getSaveFileName(this, tr("Save File"),
-                           allKeys ? "zclassic-all-privatekeys.txt" : "zclassic-privatekey.txt");
+    // Wire up save button. Pre-seed BOTH a smart folder (fnDefaultBackupDir) and a
+    // dated default name so the Save dialog opens with nothing to type. On a
+    // successful LOCAL write we fire the SAME warm closure (import-back restore hint
+    // + cloud caveat) AND reveal the inline green 'Saved to <path>' line so even the
+    // advanced screen confirms instead of orphaning. KEY-1: keys are written ONLY to
+    // the local file the user chose — never networked, never logged. doneLbl is the
+    // function-local QLabel from the grid block above, captured by value here.
+    QObject::connect(pui.buttonBox->button(QDialogButtonBox::Save), &QPushButton::clicked, [=, &pui, &d] () {
+        QString date = QDateTime::currentDateTime().toString("yyyyMMdd");
+        QString defName = (allKeys ? tr("zclassic-private-keys-") : tr("zclassic-private-key-")) + date + ".txt";
+        QString defPath = QDir(fnDefaultBackupDir()).filePath(defName);
+        QString fileName = QFileDialog::getSaveFileName(&d, tr("Save your private keys"),
+                           defPath, tr("Text file (*.txt)"));
+        if (fileName.isEmpty())
+            return;   // cancelled
         QFile file(fileName);
         if (!file.open(QIODevice::WriteOnly)) {
-            QMessageBox::information(this, tr("Unable to open file"), file.errorString());
+            QMessageBox::critical(&d, tr("Couldn't save the file"), file.errorString());
             return;
-        }        
-        QTextStream out(&file);
-        out << pui.privKeyTxt->toPlainText();
+        }
+        {
+            QTextStream out(&file);
+            out << pui.privKeyTxt->toPlainText();
+        }
+        file.close();
+
+        // Inline green confirmation (stays after the closure is dismissed).
+        if (doneLbl) {
+            doneLbl->setText(tr("Saved to: ") + fileName);
+            doneLbl->setVisible(true);
+        }
+        // The shared warm closure (where it is + keep it private + how to restore).
+        showBackupSuccess(fileName, /*isWalletDat=*/false);
     });
 
     // Call the API
@@ -2310,12 +2828,8 @@ void MainWindow::setupBalancesTab() {
 
         menu.addAction(tr("Copy address"), [=] () {
             QClipboard *clipboard = QGuiApplication::clipboard();
-            clipboard->setText(addr);            
+            clipboard->setText(addr);
             ui->statusBar->showMessage(tr("Copied to clipboard"), 3 * 1000);
-        });
-
-        menu.addAction(tr("Get private key"), [=] () {
-            this->exportKeys(addr);
         });
 
         menu.addAction("Send from " % addr.left(40) % (addr.size() > 40 ? "..." : ""), [=]() {
@@ -2334,6 +2848,9 @@ void MainWindow::setupBalancesTab() {
                 QString url = Settings::getExplorerAddressURL(addr);
                 if (!url.isEmpty())
                     QDesktopServices::openUrl(QUrl(url));
+                else
+                    // NO-OP FIX: empty on testnet — give honest feedback, not a dead click.
+                    ui->statusBar->showMessage(tr("No block explorer is available for this network."), 3 * 1000);
             });
         }
 
@@ -2343,12 +2860,123 @@ void MainWindow::setupBalancesTab() {
             });
         }
 
-        menu.exec(ui->balancesTable->viewport()->mapToGlobal(pos));            
+        // Raw spending-key export is an ADVANCED, dangerous operation (single-address
+        // migration into another wallet — not a backup). It must never be a peer of
+        // the everyday Copy/Send actions, so it lives only under a clearly-labelled
+        // Advanced submenu at the bottom of the menu. The exportKeys() dialog already
+        // carries the amber 'this is not a backup' orientation. KEY-1: keys stay
+        // local (shown / saved to a user-chosen local file only), never networked.
+        menu.addSeparator();
+        QMenu* advMenu = menu.addMenu(tr("Advanced"));
+        advMenu->addAction(tr("Export this address's private key…"), [=] () {
+            this->exportKeys(addr);
+        });
+
+        menu.exec(ui->balancesTable->viewport()->mapToGlobal(pos));
     });
 }
 
 void MainWindow::setupZClassicdTab() {    
     ui->zclassicdlogo->setBasePixmap(QPixmap(":/img/res/zclassicdlogo.gif"));
+    setupNetworkHelpPanel();
+}
+
+// Deliverable A: build the read-only "you're helping the network" panel inside the
+// EXISTING zclassicd-tab grid. Pure widget construction in C++ (no .ui change). The
+// labels start with placeholder text; RPC::refreshNetworkHelpPanel() fills them every
+// poll from getnetworkinfo + getpeerinfo. This NEVER sends anything to the node.
+void MainWindow::setupNetworkHelpPanel() {
+    if (netHelpPanel) return;   // build once
+
+    // gridLayout_5 already lays out: row1 Block height, row2 Connections, row3 Sol rate,
+    // row4 a horizontal Line. Append our block below it (rows 7+ are free; row5/6 are a
+    // mining label + spacer). Parent to groupBox_5 so it lives in the same card.
+    QGridLayout* grid = ui->gridLayout_5;
+
+    // The .ui ships a hard-coded "You are currently not mining" label (label_14) sitting
+    // among the LIVE node stats. It is never updated, so it reads as live status and is
+    // simply false if the daemon is mining. Hide it from code (no .ui regen) instead of
+    // showing stale/incorrect mining status.
+    if (ui->label_14) ui->label_14->hide();
+
+    netHelpPanel = new QWidget(ui->groupBox_5);
+    QVBoxLayout* v = new QVBoxLayout(netHelpPanel);
+    v->setContentsMargins(0, 8, 0, 0);
+    v->setSpacing(4);
+
+    netHelpTitleLabel = new QLabel(tr("You're helping the network"), netHelpPanel);
+    QFont tf = netHelpTitleLabel->font(); tf.setBold(true); netHelpTitleLabel->setFont(tf);
+
+    netHelpStatusLabel = new QLabel(tr("Checking…"), netHelpPanel);
+    netHelpReachLabel  = new QLabel(QString(), netHelpPanel);
+
+    netHelpBlurbLabel = new QLabel(netHelpPanel);
+    netHelpBlurbLabel->setWordWrap(true);
+    netHelpBlurbLabel->setTextFormat(Qt::RichText);
+    netHelpBlurbLabel->setOpenExternalLinks(true);   // how-to link opens in the browser
+    netHelpBlurbLabel->setText(tr(
+        "Your wallet quietly runs a full ZClassic node, so just by keeping it open "
+        "you help keep ZClassic decentralized.<br>"
+        "To also accept incoming connections from other wallets, turn on automatic "
+        "port opening below, or forward port "
+        "<b>%1</b> to this computer on your router "
+        "(<a href=\"https://portforward.com/\">how do I forward a port?</a>).")
+        .arg(Settings::getInstance()->isTestnet() ? 18033 : 8033));
+
+    // One-click discoverable front door for the NAT-PMP/PCP auto-port-opening that
+    // today is buried in Settings. It drives the SAME persisted setting
+    // (Settings::setOpenPortNatpmp -> options/openportnatpmp) that the Settings
+    // dialog (mainwindow.cpp setupSettingsModal) and the embedded-daemon launch arg
+    // (connection.cpp '-natpmp=1') already read, so the two surfaces stay in sync.
+    // The daemon reads -natpmp only at launch, so this takes effect on the next
+    // node start -- we say so honestly and never imply instant effect/reachability.
+    // It is initialized from the persisted value here; RPC::refreshNetworkHelpPanel
+    // enables/disables it honestly each poll (embedded-only, exactly like the
+    // Settings chkNatpmp) -- we cannot gate on rpc->isEmbedded() at build time
+    // because setupZClassicdTab() runs BEFORE `rpc = new RPC(this)`.
+    netHelpNatpmpChk = new QCheckBox(tr("Help the network — open my port automatically"), netHelpPanel);
+    netHelpNatpmpChk->setChecked(Settings::getInstance()->getOpenPortNatpmp());
+    netHelpNatpmpChk->setToolTip(tr("Asks your router to forward this node's port using NAT-PMP/PCP (never UPnP), opening only this node's own port. Takes effect the next time ZclWallet starts its node."));
+    QObject::connect(netHelpNatpmpChk, &QCheckBox::toggled, this, [this](bool on) {
+        if (on == Settings::getInstance()->getOpenPortNatpmp())
+            return;   // no real change (e.g. programmatic setChecked) -> no dialog
+        Settings::getInstance()->setOpenPortNatpmp(on);
+        QMessageBox::information(this, tr("Open port automatically"),
+            on
+                ? tr("Automatic port opening will be enabled the next time ZclWallet starts its node. This asks your router to make you reachable to other peers (NAT-PMP/PCP, never UPnP).")
+                : tr("Automatic port opening will be disabled the next time ZclWallet starts its node."),
+            QMessageBox::Ok);
+    });
+
+    QCheckBox* optOut = new QCheckBox(tr("Don't show this"), netHelpPanel);
+    optOut->setChecked(QSettings().value("net/helpPanelHidden", false).toBool());
+    // Opt-out is cosmetic only: it hides the nudge. The node keeps listening on the
+    // P2P port either way (we never pass -listen=0), so this never weakens the network.
+    QObject::connect(optOut, &QCheckBox::toggled, this, [this](bool hidden) {
+        QSettings().setValue("net/helpPanelHidden", hidden);
+        if (netHelpTitleLabel)   netHelpTitleLabel->setVisible(!hidden);
+        if (netHelpStatusLabel)  netHelpStatusLabel->setVisible(!hidden);
+        if (netHelpReachLabel)   netHelpReachLabel->setVisible(!hidden);
+        if (netHelpBlurbLabel)   netHelpBlurbLabel->setVisible(!hidden);
+        if (netHelpNatpmpChk)    netHelpNatpmpChk->setVisible(!hidden);
+    });
+
+    v->addWidget(netHelpTitleLabel);
+    v->addWidget(netHelpStatusLabel);
+    v->addWidget(netHelpReachLabel);
+    v->addWidget(netHelpBlurbLabel);
+    v->addWidget(netHelpNatpmpChk);
+    v->addWidget(optOut);
+
+    grid->addWidget(netHelpPanel, 7, 0, 1, 3);
+
+    // Apply the persisted opt-out immediately so the body is hidden on first paint.
+    bool hidden = optOut->isChecked();
+    netHelpTitleLabel->setVisible(!hidden);
+    netHelpStatusLabel->setVisible(!hidden);
+    netHelpReachLabel->setVisible(!hidden);
+    netHelpBlurbLabel->setVisible(!hidden);
+    netHelpNatpmpChk->setVisible(!hidden);
 }
 
 void MainWindow::setupTransactionsTab() {
@@ -2408,6 +3036,10 @@ void MainWindow::setupTransactionsTab() {
             QString url = Settings::getExplorerTxURL(txid);
             if (!url.isEmpty())
                 QDesktopServices::openUrl(QUrl(url));
+            else
+                // NO-OP FIX: getExplorerTxURL returns "" on testnet; the menu item used to
+                // dead-click silently. Tell the user why nothing opened.
+                ui->statusBar->showMessage(tr("No block explorer is available for this network."), 3 * 1000);
         });
 
         if (!memo.isEmpty()) {
@@ -2683,7 +3315,10 @@ void MainWindow::setupReceivePrivacyDisclosure() {
     // ---- 2) Advanced disclosure toggle --------------------------------------
     btnReceiveAdvanced = new QToolButton(ui->groupBox_6);
     btnReceiveAdvanced->setObjectName("btnReceiveAdvanced");   // qss hook
-    btnReceiveAdvanced->setText(tr("Public (transparent) address — balance visible to everyone"));
+    btnReceiveAdvanced->setText(tr("Other address types (advanced)"));
+    btnReceiveAdvanced->setToolTip(tr(
+        "Reveal transparent (public) and legacy address options. Your current address "
+        "above is private — you don't need this to receive coins."));
     btnReceiveAdvanced->setCheckable(true);
     btnReceiveAdvanced->setChecked(false);
     btnReceiveAdvanced->setCursor(Qt::PointingHandCursor);
@@ -2696,7 +3331,7 @@ void MainWindow::setupReceivePrivacyDisclosure() {
     receiveAdvancedPanel->setObjectName("receiveAdvancedPanel");
     auto* panelV = new QVBoxLayout(receiveAdvancedPanel);
     panelV->setContentsMargins(2, 4, 2, 4);
-    panelV->setSpacing(4);
+    panelV->setSpacing(8);
 
     auto* advCaption = new QLabel(receiveAdvancedPanel);
     advCaption->setObjectName("lblReceiveAdvancedCaption");
@@ -2737,7 +3372,7 @@ void MainWindow::setupReceivePrivacyDisclosure() {
     // explicit confirm (exportKeys() already pops a warning) for the currently
     // selected address. Demoted styling (secondary button) + a clear caption.
     auto* exportRow = new QHBoxLayout();
-    exportRow->setContentsMargins(0, 6, 0, 0);
+    exportRow->setContentsMargins(0, 8, 0, 0);
     exportRow->setSpacing(8);
     auto* btnExportKey = new QPushButton(tr("Export private key…"), receiveAdvancedPanel);
     btnExportKey->setObjectName("btnReceiveExportKey");
@@ -2749,7 +3384,7 @@ void MainWindow::setupReceivePrivacyDisclosure() {
         QString addr = ui->listRecieveAddresses->currentText();
         if (addr.isEmpty())
             return;
-        this->exportKeys(addr);   // pops the explicit "these keys are the money" confirm
+        this->exportKeys(addr);   // opens the advanced export dialog (amber intro + in-screen security note)
     });
     exportRow->addWidget(btnExportKey, 0, Qt::AlignLeft);
     exportRow->addStretch(1);
@@ -2770,8 +3405,12 @@ void MainWindow::setupReceivePrivacyDisclosure() {
             QString addr = ui->txtRecieve->toPlainText().trimmed();
             if (addr.isEmpty())
                 addr = ui->listRecieveAddresses->currentText();
-            if (addr.isEmpty())
+            if (addr.isEmpty()) {
+                // NO-FEEDBACK FIX: during the brief address-refresh window the field is empty;
+                // the most prominent Receive button must not be a silent no-op. Say so.
+                ui->statusBar->showMessage(tr("No address to copy yet"), 3 * 1000);
                 return;
+            }
             QGuiApplication::clipboard()->setText(addr);
             ui->statusBar->showMessage(tr("Address copied to clipboard"), 3 * 1000);
         });
@@ -2797,8 +3436,11 @@ void MainWindow::setupReceivePrivacyDisclosure() {
         qrV->setContentsMargins(0, 0, 0, 0);
         qrV->setSpacing(0);
         ui->qrcodeDisplay->setParent(qrCard);
+        // Narrow-window fix: allow the QR to scale DOWN to 140px (QRCodeLabel.sizeHint is
+        // 1:1 and resizeEvent re-renders, so it stays crisp) so the Receive page stops
+        // pinning a 200px floor; keep 200 as the max so it looks identical at normal width.
         ui->qrcodeDisplay->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
-        ui->qrcodeDisplay->setMinimumSize(200, 200);
+        ui->qrcodeDisplay->setMinimumSize(140, 140);
         ui->qrcodeDisplay->setMaximumSize(200, 200);
         qrV->addWidget(ui->qrcodeDisplay);
 

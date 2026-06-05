@@ -13,6 +13,8 @@
 #include <QFontMetrics>
 #include <QImageReader>
 #include <QSvgRenderer>
+#include <QBrush>     // pending-cue fix: read the model's ForegroundRole brush
+#include <QVariant>
 
 // ---- dark.qss token colors (kept in sync with res/styles/dark.qss) ----------
 namespace {
@@ -24,7 +26,9 @@ namespace {
     const QColor kSurface ("#1d2027");   // elevated card / pill base
 
     // Pill geometry (in device-independent px). Small + unobtrusive.
-    const int kPillH       = 20;   // pill height
+    const int kPillHMin    = 20;   // pill-height FLOOR; the actual height is derived from the
+                                   // pill font's metrics at paint/sizeHint so it scales with the
+                                   // base font + DPI and never clips (no fixed text-height clamp).
     const int kPillPadH    = 8;    // horizontal text padding inside the pill
     const int kIconGap     = 4;    // gap between icon and label
     const int kPillGap     = 8;    // gap between the pill and the address text
@@ -47,7 +51,28 @@ QString PrivacyBadgeDelegate::extractAddress(const QString& displayText) {
     return s;
 }
 
+// SP-1: memoized classify(). classifyUncached() is a pure function of
+// displayText (its only context read is the process-fixed testnet flag), so the
+// first paint of a given address pays the QRegExp/checksum cost once and every
+// subsequent paint (scroll, resize, repaint) is an O(1) hash lookup. classify()
+// runs only on the GUI thread (the delegate paint path), so this function-local
+// static cache needs no lock; magic-static init is thread-safe regardless. The
+// cache is bounded by the number of DISTINCT display strings the tables have
+// shown (the same addresses repeat across frames), so it stays tiny. The
+// context-sensitive de-shield upgrade lives in classifyForIndex (which reads the
+// live sibling Type cell) and is NOT cached, so a Type-column change can never
+// serve a stale badge.
 PrivacyBadgeDelegate::Kind PrivacyBadgeDelegate::classify(const QString& displayText) {
+    static QHash<QString, Kind> memo;
+    auto it = memo.constFind(displayText);
+    if (it != memo.constEnd())
+        return it.value();
+    const Kind k = classifyUncached(displayText);
+    memo.insert(displayText, k);
+    return k;
+}
+
+PrivacyBadgeDelegate::Kind PrivacyBadgeDelegate::classifyUncached(const QString& displayText) {
     // The transactions model (txtablemodel.cpp) renders shielded rows with no
     // address as the literal "(Shielded)" placeholder -> that's a private
     // send/receive. Check this on the RAW display text BEFORE extractAddress(),
@@ -245,8 +270,21 @@ void PrivacyBadgeDelegate::paint(QPainter* painter, const QStyleOptionViewItem& 
         QColor c = kText;
         const QString t = rawText.trimmed();
         if (!selected) {
-            if (t.startsWith('-'))      c = kDim;          // sent / outflow
-            else                        c = kText;         // received / balance
+            // PENDING-CUE FIX: honor the model's Qt::ForegroundRole so a 0-conf row's
+            // pending tint (amber #d9822b in the tx model, red in the balances model)
+            // shows on the Amount column too — it used to color by sign only and drop
+            // the cue. GUARD: the balances model returns Qt::black for CONFIRMED rows,
+            // which would be invisible on the dark theme — so ignore a black sentinel
+            // and fall back to the sign-based default for those.
+            QVariant fg = index.data(Qt::ForegroundRole);
+            QColor mc = (fg.canConvert<QBrush>()) ? fg.value<QBrush>().color() : QColor();
+            if (mc.isValid() && mc != QColor(Qt::black)) {
+                c = mc;                                     // pending / model-supplied tint
+            } else if (t.startsWith('-')) {
+                c = kDim;                                   // sent / outflow
+            } else {
+                c = kText;                                  // received / balance
+            }
         } else {
             c = opt.palette.color(QPalette::HighlightedText);
         }
@@ -270,6 +308,10 @@ void PrivacyBadgeDelegate::paint(QPainter* painter, const QStyleOptionViewItem& 
         pf.setBold(true);
         painter->setFont(pf);
         const QFontMetrics fm(pf);
+
+        // Pill height derived from the actual pill font so it grows with the base
+        // font / DPI instead of clipping at a hardcoded constant.
+        const int kPillH = qMax(kPillHMin, fm.height() + 6);
 
         const int iconPx = kPillH - 8;                 // glyph inside the pill
         const int textW  = fm.horizontalAdvance(label);
@@ -321,7 +363,11 @@ QSize PrivacyBadgeDelegate::sizeHint(const QStyleOptionViewItem& option,
     // dark.qss item padding already allows for the Fixed-height layout rows.
     QSize s = QStyledItemDelegate::sizeHint(option, index);
     if (_mode == Mode::Address) {
-        s.setHeight(qMax(s.height(), kPillH + 6));
+        QFont pf = option.font;
+        if (pf.pointSizeF() > 0) pf.setPointSizeF(pf.pointSizeF() * 0.82);
+        pf.setBold(true);
+        const int pillH = qMax(kPillHMin, QFontMetrics(pf).height() + 6);
+        s.setHeight(qMax(s.height(), pillH + 6));
         // Reserve room for the widest pill so column auto-size doesn't clip it.
         s.setWidth(s.width() + 120);
     }

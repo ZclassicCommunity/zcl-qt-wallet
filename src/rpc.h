@@ -141,7 +141,11 @@ public:
     // exited", so the repair path must call this before touching blocks/chainstate.
     bool confirmEmbeddedStopped();
 
-    void noConnection();
+    // preserveBalances=true => SOFT disconnect: keep the last-painted balance labels
+    // and tables, just de-confidence the hero to the WARMING "refreshing" state. Used
+    // by the debounced getinfo error path so a single failed poll never blanks a
+    // funded wallet. Default false keeps every existing caller's full-teardown behavior.
+    void noConnection(bool preserveBalances = false);
     bool isEmbedded() { return ezclassicd != nullptr; }
 
     // ---- NOTIFY-SRV push-wiring pure helpers (used by prod + asserted by L1) ----
@@ -187,6 +191,12 @@ private:
     void updateUI           (bool anyUnconfirmed);
 
     void getInfoThenRefresh(bool force);
+
+    // Deliverable A: read-only refresh of the "you're helping the network" panel
+    // (MainWindow::netHelp* labels) from getnetworkinfo + getpeerinfo. `connections`
+    // is passed from the enclosing getinfo poll. Never mutates node state; both inner
+    // calls are error-ignoring so an old/foreign/warming daemon degrades silently.
+    void refreshNetworkHelpPanel(int connections);
 
     // NOTIFY-SRV: handle a validated push (NotifyServer::notified). Records the epoch
     // (so getInfoThenRefresh's interval picker sees the channel as healthy) and
@@ -273,6 +283,13 @@ private:
     // C9/F6: debounce the waiting-for-peers banner; a single connections==0 sample
     // shouldn't flip the banner. Counts consecutive peerless polls; reset on a peer.
     int                         ezNoPeerPolls               = 0;
+
+    // transient-disconnect debounce: a SINGLE failed getinfo poll (one dropped
+    // reply, a momentary RPC stall) must NOT wipe a funded wallet's hero to grey
+    // "0 ZCL" and demote Send. Counts consecutive getinfo error replies; reset to 0
+    // on any successful getinfo. The error path keeps the last balances painted
+    // (soft disconnect) until this crosses the threshold, then does a full teardown.
+    int                         getInfoErrCount             = 0;
 
     // Cached getbootstrapinfo snapshot-download state (post-connect). A node mid
     // bootstrap-snapshot download reports 0 normal P2P peers + warming RPC, which the

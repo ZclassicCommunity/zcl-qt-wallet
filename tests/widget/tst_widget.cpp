@@ -38,6 +38,11 @@
 #include <QToolButton>
 #include <QLabel>
 #include <QPushButton>
+#include <QComboBox>
+#include <QLineEdit>
+#include <QProgressBar>
+#include <QVBoxLayout>
+#include <QFontMetrics>
 #include <QWidget>
 #include <QDialog>
 #include <QTimer>
@@ -138,6 +143,85 @@ private slots:
         ++_modalGen;
         _ackSeen = false;
         _confirmAccepted = false;
+    }
+
+    // ---- STANDARDIZATION GUARD: text controls must never be shorter than their
+    // own line box. This is the regression guard for the Receive-tab "Export
+    // private key…" clip and the removed badge max-height:22px clamp. It loads the
+    // SHIPPED res/styles/dark.qss (exactly as main.cpp does) and asserts every
+    // representative text-bearing control sizes from its font metrics. The
+    // invariant is RELATIVE to each widget's own font, so it is robust across
+    // platforms / DPI. Any future rule that floors a control below its text — or
+    // re-introduces a max-height clamp on a text control — fails HERE in CI.
+    // See the control-height tokens + conventions in res/styles/dark.qss.
+    void controlSizing_textControlsNeverClipBelowLineBox() {
+        const QString prevSheet = qApp->styleSheet();
+        QFile qssFile(":/styles/res/styles/dark.qss");
+        QVERIFY2(qssFile.open(QFile::ReadOnly),
+                 "shipped res/styles/dark.qss must be loadable from the qrc");
+        qApp->setStyleSheet(QString::fromUtf8(qssFile.readAll()));
+
+        QWidget host;                       // parents the throwaway controls
+        QVBoxLayout hostLayout(&host);
+
+        auto fits = [&](QWidget* w, const char* name) {
+            w->ensurePolished();
+            const int lineBox = QFontMetrics(w->font()).height();
+            QVERIFY2(w->sizeHint().height() >= lineBox,
+                     qPrintable(QStringLiteral(
+                         "%1: styled height (%2px) is below its own font line box (%3px) — "
+                         "text will clip. Size text controls from font metrics (min-height + "
+                         "symmetric padding); never clamp a text control with max-height.")
+                         .arg(name).arg(w->sizeHint().height()).arg(lineBox)));
+        };
+
+        auto* btnExport = new QPushButton(tr("Export private key…"), &host);
+        btnExport->setObjectName("btnReceiveExportKey");
+        hostLayout.addWidget(btnExport);
+
+        auto* btnCopy = new QPushButton(tr("Copy"), &host);
+        btnCopy->setObjectName("btnReceiveCopy");
+        hostLayout.addWidget(btnCopy);
+
+        auto* btnPlain = new QPushButton(tr("New Address"), &host);
+        hostLayout.addWidget(btnPlain);
+
+        auto* combo = new QComboBox(&host);
+        combo->addItem(QStringLiteral("t1ExampleTransparentAddress pqgjy"));
+        hostLayout.addWidget(combo);
+
+        auto* edit = new QLineEdit(QStringLiteral("zs1descenders pqgjy"), &host);
+        hostLayout.addWidget(edit);
+
+        auto* bar = new QProgressBar(&host);
+        bar->setTextVisible(true);
+        bar->setFormat(QStringLiteral("Scanning pgy %p%"));
+        bar->setValue(42);
+        hostLayout.addWidget(bar);
+
+        auto* badge = new QLabel(QStringLiteral("PUBLIC pgy"), &host);
+        badge->setProperty("badge", true);
+        badge->setProperty("tone", "public");
+        hostLayout.addWidget(badge);
+
+        host.show();
+
+        fits(btnExport, "btnReceiveExportKey");
+        fits(btnCopy,   "btnReceiveCopy");
+        fits(btnPlain,  "QPushButton (generic)");
+        fits(combo,     "QComboBox");
+        fits(edit,      "QLineEdit");
+        fits(bar,       "QProgressBar");
+        fits(badge,     "QLabel[badge=true]");
+
+        // The badge was the one true hard-clamp (max-height:22px). Guard the class
+        // directly: its styled height must clear its line box with breathing room,
+        // proving no max-height clamp near the line box can creep back in.
+        QVERIFY2(badge->sizeHint().height() >= QFontMetrics(badge->font()).height() + 4,
+                 "QLabel[badge=true] must not be clamped near its line box "
+                 "(regression guard for the removed max-height:22px clip).");
+
+        qApp->setStyleSheet(prevSheet);     // never leak the sheet to later tests
     }
 
     // NOTE on visibility throughout the D-series: the Receive widgets live on tab

@@ -83,6 +83,9 @@ QPushButton {
     background-color: #2a2e37; color: #e6e6e6;
     border: 1px solid #343a44; border-radius: 8px;
     padding: 8px 16px; font-size: 12pt; font-weight: 600;
+    min-height: 24px;                     /* STANDARD control-height floor, sized to the 14pt line box.
+                                             Text controls size from font metrics (min-height + symmetric
+                                             padding) and grow with the font — never clamp with max-height. */
 }
 QPushButton:hover    { background-color: #333945; }
 QPushButton:pressed  { background-color: #2a2e37; }
@@ -96,7 +99,7 @@ QPushButton:default:hover { background-color: #2a9d2a; border-color: #2a9d2a; }
 QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QDoubleSpinBox {
     background-color: #1d2027; color: #e6e6e6;
     border: 1px solid #343a44; border-radius: 8px;
-    padding: 7px 10px; selection-background-color: #1f7a1f;
+    padding: 7px 10px; min-height: 24px; selection-background-color: #1f7a1f;
 }
 QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus { border: 1px solid #1f7a1f; }
 QLineEdit:read-only { color: #9aa0a6; background-color: #15171c; }
@@ -104,7 +107,7 @@ QLineEdit:read-only { color: #9aa0a6; background-color: #15171c; }
 QComboBox {
     background-color: #1d2027; color: #e6e6e6;
     border: 1px solid #343a44; border-radius: 8px;
-    padding: 7px 10px; min-height: 18px;
+    padding: 7px 10px; min-height: 24px;
 }
 QComboBox:hover { border-color: #3d4450; }
 QComboBox::drop-down { border: none; width: 22px; }
@@ -142,7 +145,7 @@ QStatusBar { background-color: #0f1115; color: #9aa0a6; border-top: 1px solid #2
 QStatusBar::item { border: none; }
 QProgressBar {
     background-color: #1d2027; border: 1px solid #2a2d35; border-radius: 8px;
-    text-align: center; color: #e6e6e6; min-height: 18px;
+    text-align: center; color: #e6e6e6; min-height: 24px;
 }
 QProgressBar::chunk { background-color: #1f7a1f; border-radius: 7px; }
 
@@ -238,18 +241,31 @@ QLabel#homeHeroCaption {
     text-transform: uppercase;
     letter-spacing: 1px;
 }
-/* Polish P0-1 + P1: the PRIVATE balance is the hero, GREEN (#34c759 — WCAG-AA on
- * the dark card, unlike #1f7a1f which fails as text) at 40pt/700 (~3x body). The
- * user's private money carries the loudest green, not the chrome. */
+/* Polish P0-1 + P1 + item 1 (trust-aware): the PRIVATE balance is the hero at
+ * 40pt/700 (~3x body). Its COLOUR is state-driven via the heroconfident property set
+ * by updateHomeFixIt(): confident GREEN (#34c759 — WCAG-AA on the dark card, unlike
+ * #1f7a1f which fails as text) ONLY on the synced edge; neutral GREY (#9aa0a6) while
+ * the number is cached / warming / mid-sync, so a not-yet-final balance is never
+ * celebrated and never misread as final spendable money. */
 QLabel#homeHeroPrivate {
-    color: #34c759;
+    color: #9aa0a6;                        /* default: not-yet-confident (warming/fresh) */
     font-size: 40pt;
     font-weight: 700;
 }
+QLabel#homeHeroPrivate[heroconfident="true"]  { color: #34c759; }   /* synced edge only */
+QLabel#homeHeroPrivate[heroconfident="false"] { color: #9aa0a6; }   /* cached/warming/mid-sync */
 QLabel#homeHeroTotal {
     color: #9aa0a6;                        /* secondary/dim Total subline */
     font-size: 13pt;
     font-weight: 500;
+}
+/* Item 1: inline "not final yet" / "Last updated … · refreshing" qualifier shown
+ * under the number only while warming. Quiet, smaller than the Total subline. */
+QLabel#homeHeroQualifier {
+    color: #9aa0a6;
+    font-size: 11pt;
+    font-weight: 500;
+    font-style: italic;
 }
 /* Polish P1/UX-22: a one-line friendly helper under the hero when balance == 0. */
 QLabel#homeHeroHelper {
@@ -357,7 +373,7 @@ QPushButton#btnReceiveCopy {
     background-color: #1f7a1f; color: #ffffff;
     border: 1px solid #1f7a1f; border-radius: 8px;
     padding: 10px 18px; font-size: 12pt; font-weight: 700;
-    min-height: 20px;
+    min-height: 24px;
 }
 QPushButton#btnReceiveCopy:hover   { background-color: #2a9d2a; border-color: #2a9d2a; }
 QPushButton#btnReceiveCopy:pressed { background-color: #1a6b1a; }
@@ -430,8 +446,8 @@ QLabel#publicWarning[deshield="true"] {
 QLabel[badge="true"] {
     border-radius: 10px;
     padding: 2px 8px;
-    min-height: 20px;
-    max-height: 22px;
+    min-height: 24px;                     /* >= 12pt line box + 2*2 padding + 1px border; grows with the
+                                             font. max-height REMOVED — clamping a text control clips it. */
     font-size: 12pt;
     font-weight: 600;
 }
@@ -508,10 +524,48 @@ QPlainTextEdit#privKeyTextEdit {
     font-size: 12pt;
     selection-background-color: #1f7a1f;
 }
+/* Copy All is the SECONDARY action; only Save (privKeySaveBtn) stays green primary,
+ * so the advanced screen has one obvious press instead of an all-green blur. */
 QPushButton#privKeyCopyBtn {
+    background-color: transparent; color: #c6cbd2;
+    border: 1px solid #3a3f47; border-radius: 8px;
+    padding: 8px 18px; font-size: 12pt; font-weight: 600;
+}
+QPushButton#privKeyCopyBtn:hover   { background-color: #2a2d35; border-color: #4a4f57; }
+QPushButton#privKeyCopyBtn:pressed { background-color: #20232a; }
+
+/* Advanced-export orientation header: amber caution card (matches the homeFixItCard
+ * amber language) so the user reads "this is the advanced tool, not your backup"
+ * before the keys. */
+QLabel#privKeyIntro {
+    background-color: rgba(217, 130, 43, 0.10);
+    color: #e6b06a;
+    border: 1px solid #2a2d35;
+    border-left: 3px solid #d9822b;
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-size: 12pt;
+    font-weight: 600;
+}
+/* Inline 'Saved to <path>' confirmation after a successful key-file write: calm green
+ * (same private/green language as the key text), hidden until a save succeeds. */
+QLabel#privKeyDoneLbl {
+    color: #34c759;
+    font-size: 12pt;
+    font-weight: 600;
+    padding: 6px 2px 4px 2px;
+}
+/* Quiet helper text under the keys: "closing is safe". Calm, not alarming. */
+QLabel#privKeyCloseHint {
+    color: #8b9098;
+    font-size: 11pt;
+    padding: 2px 2px 6px 2px;
+}
+/* Save promoted to the filled primary action in the advanced export dialog. */
+QPushButton#privKeySaveBtn {
     background-color: #1f7a1f; color: #ffffff;
     border: 1px solid #1f7a1f; border-radius: 8px;
     padding: 8px 18px; font-size: 12pt; font-weight: 700;
 }
-QPushButton#privKeyCopyBtn:hover   { background-color: #2a9d2a; border-color: #2a9d2a; }
-QPushButton#privKeyCopyBtn:pressed { background-color: #1a6b1a; }
+QPushButton#privKeySaveBtn:hover   { background-color: #2a9d2a; border-color: #2a9d2a; }
+QPushButton#privKeySaveBtn:pressed { background-color: #1a6b1a; }

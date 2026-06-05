@@ -9,6 +9,7 @@
 #include "ui_connection.h"
 #include "ui_createzclassicconfdialog.h"
 #include "rpc.h"
+#include "guistartup.h"     // [gui-startup] daemon-spawned / getinfo milestones
 
 #include "precompiled.h"
 
@@ -42,8 +43,9 @@ ConnectionLoader::ConnectionLoader(MainWindow* main, RPC* rpc) {
     ezCard->setContentsMargins(16, 8, 16, 8);
     ezCard->setText(QObject::tr(
         "<b>Setting up ZClassic</b><br>"
-        "The first run takes about <b>10–20 minutes</b> while your wallet "
-        "prepares itself. You can leave it running — it is safe to come back later.<br><br>"
+        "The first run downloads the security files and a copy of the blockchain, "
+        "then catches up with the network — this can take a while, but you only do "
+        "it once. You can leave it running and come back later; it is safe.<br><br>"
         "&nbsp;&nbsp;<b>Step 1.</b> Getting the security files ready<br>"
         "&nbsp;&nbsp;<b>Step 2.</b> Starting your wallet<br>"
         "&nbsp;&nbsp;<b>Step 3.</b> Catching up with the network"));
@@ -167,8 +169,25 @@ void ConnectionLoader::doAutoConnect(bool tryEzclassicdStart) {
     // handleStartupFailure() surfaces — never a silent hang on a dead URL. A
     // non-embedded external daemon is the user's own responsibility to provision.
     // (downloadParams() is retained but no longer on the startup path.)
-    if (!verifyParams())
+    if (!verifyParams()) {
         main->logger->write("zk-params not all present locally; deferring to the daemon's hash-verified peer-fetch");
+        // Item 3: params are missing, so the daemon will peer-fetch ~1.7GB before it even
+        // binds its RPC port (ZC_LoadParams runs before AppInitServers). Latch this so the
+        // refused-connection warmup branch below shows the accurate "one-time 1.7GB, 10-20
+        // min" copy instead of a frozen "Almost ready" line for the whole download. Latch-
+        // only (never cleared back to false here): once the params land, getinfo succeeds
+        // and the snapshot/IBD pollers overwrite the status text every poll regardless.
+        ezParamFetchLikely = true;
+    }
+
+    // COOKIE-AUTH proactive migration (runs at most once, before the FIRST connect of
+    // this run). If a legacy GUI-owned conf still carries rpcuser=zcl-qt-wallet +
+    // rpcpassword=<rand>, strip them in place so the daemon switches to cookie auth on
+    // its next start and any already-desynced shared secret is healed with zero user
+    // action. No-op for an external/daemon=1 conf or once already migrated. Cheap and
+    // idempotent, so calling it on each doAutoConnect entry (gated by the QSettings
+    // flag) is fine; the rewrite itself happens at most once.
+    this->migrateConfToCookie();
 
     // Priority 2: Try to connect to detect zclassic.conf and connect to it.
     auto config = autoDetectZClassicConf();
@@ -221,8 +240,25 @@ void ConnectionLoader::doAutoConnect(bool tryEzclassicdStart) {
                 (ezWarmupTimer.isValid() && ezWarmupTimer.elapsed() < 120000)) {
                 // Static fallback FIRST (covers the brief pre-RPC-bind window and an
                 // older daemon with no getbootstrapinfo).
-                this->showInformation(QObject::tr("Step 2 of 3: Starting your wallet…"),
-                    QObject::tr("Almost ready — getting things going (this can take a minute)…"));
+                //
+                // Item 3: on a FRESH install the daemon peer-fetches ~1.7GB of zk-params
+                // in ZC_LoadParams BEFORE it binds its RPC port (ZC_LoadParams precedes
+                // AppInitServers in init.cpp). During that 10-20 min the port is fully
+                // REFUSING, so this branch — not getbootstrapinfo — is all the user sees,
+                // and the generic "Almost ready (this can take a minute)" reads as a hang.
+                // When we know the params were missing at connect, paint the accurate,
+                // reassuring one-time-download copy instead (the same wording that already
+                // lived on the dead z.cash downloadParams() path). The instant the port
+                // binds and the snapshot phase starts, the probeBootstrapProgress call
+                // below takes over with real percent.
+                if (ezParamFetchLikely) {
+                    this->showInformation(QObject::tr("Step 1 of 3: Getting the security files ready…"),
+                        QObject::tr("One-time download of about 1.7 GB — on a typical home "
+                            "connection this takes 10–20 minutes. You only do this once."));
+                } else {
+                    this->showInformation(QObject::tr("Step 2 of 3: Starting your wallet…"),
+                        QObject::tr("Almost ready — getting things going (this can take a minute)…"));
+                }
                 // Bob-fix: getinfo here came back CONNECTION-REFUSED (the RPC port is not
                 // yet answering getinfo, OR the connection-level request failed) — which is
                 // exactly the multi-minute snapshot-download window on a slow link. Plain
@@ -260,7 +296,9 @@ void ConnectionLoader::doAutoConnect(bool tryEzclassicdStart) {
     } 
 }
 
-static QString randomPassword() {
+// [[maybe_unused]]: no longer called on the conf-write path (cookie auth replaced the
+// shared rpcpassword). Retained intentionally per CONF-1 history; silence -Wunused-function.
+[[maybe_unused]] static QString randomPassword() {
     // CONF-1: CSPRNG, >= 128 bits. The previous implementation drew 10 chars from
     // rand()%62 (~59.5 bits, time-seeded and predictable) and leaked the heap
     // buffer; both are gone. 32 base62 chars ≈ 190 bits. See src/securerandom.h
@@ -359,8 +397,17 @@ void ConnectionLoader::createZClassicConf() {
     // peer, and the zclassicd we drive already pins its own compiled bootstrap
     // peers / seeds as -addnode on every start. Baking a wrong peer into the
     // user's permanent conf only causes repeated failed connections.
-    out << "rpcuser=zcl-qt-wallet\n";
-    out << "rpcpassword=" % randomPassword() << "\n";
+    // COOKIE-AUTH: do NOT write a shared rpcuser/rpcpassword. With no rpcpassword in
+    // the conf the daemon auto-generates <datadir>/.cookie on every start
+    // (httprpc.cpp InitRPCAuthentication, gated on mapArgs["-rpcpassword"]=="") and the
+    // GUI authenticates by reading that cookie on each connect attempt. With no
+    // persisted shared secret, the rpcpassword desync that produced the HTTP-401
+    // dead-end cannot occur for an embedded node — the 401 class is eliminated by
+    // construction, not patched. The embedded launch additionally forces an absolute
+    // -rpccookiefile (startEmbeddedZClassicd) so the GUI reads the exact file the
+    // daemon wrote, with no testnet3/ or custom-datadir= guessing. randomPassword() is
+    // retained for compatibility but is no longer on the conf-write path.
+    // (Was: rpcuser=zcl-qt-wallet + rpcpassword=<randomPassword()>.)
     if (!datadir.isEmpty()) {
         out << "datadir=" % datadir % "\n";
     }
@@ -705,6 +752,24 @@ bool ConnectionLoader::startEmbeddedZClassicd(const QStringList& extraArgs) {
     // separately, so capping it is safe -- but during a repair relaunch the caller's
     // -reindex must run full validation, so we skip -checkblocks then.
     QStringList launchArgs;
+    // COOKIE-AUTH (MANDATORY): force an ABSOLUTE -rpccookiefile so the daemon writes
+    // its auth cookie to the EXACT path the GUI will read (GetAuthCookieFile honors an
+    // absolute -rpccookiefile, rpc/protocol.cpp). This removes the net-specific
+    // testnet3/ subdir + custom-datadir= path-guessing as a failure mode entirely.
+    // Computed from the SAME conf the GUI reads, so launch path == read path. We only
+    // know the conf/datadir once it has been detected; ezDataDir is set in
+    // doAutoConnect from config->zclassicDir before this runs on the embedded path.
+    {
+        auto detected = autoDetectZClassicConf();
+        if (detected) {
+            QString cookiePath = cookieFilePathForConf(detected);
+            if (!cookiePath.isEmpty()) {
+                // Logs only the PATH, never cookie contents (matches daemon log).
+                main->logger->write("Embedded launch: pinning -rpccookiefile=" + cookiePath);
+                launchArgs << (QStringLiteral("-rpccookiefile=") + cookiePath);
+            }
+        }
+    }
     launchArgs << "-dbcache=450"          // bigger chainstate cache
                << "-par=0"                // auto-detect cores: parallel script
                                           // verification (startup verify + IBD;
@@ -715,6 +780,13 @@ bool ConnectionLoader::startEmbeddedZClassicd(const QStringList& extraArgs) {
     // verification would defeat the point of a full re-validation.
     if (extraArgs.isEmpty())
         launchArgs << "-checkblocks=12";
+    // Opt-in "Help the network: open my port automatically" (default OFF). When the
+    // user has enabled it, ask the embedded daemon to forward our own P2P listen
+    // port via NAT-PMP/PCP (no UPnP) so NAT/firewalled users become reachable for
+    // inbound peers. Pure net plumbing; the daemon defaults this OFF too, so the
+    // flag is only ever present when the user explicitly opted in.
+    if (Settings::getInstance()->getOpenPortNatpmp())
+        launchArgs << "-natpmp=1";
     // NOTIFY-SRV: wire the daemon's -walletnotify/-blocknotify to our `--notify %s`
     // connector so wallet/block events PUSH a refresh instead of waiting for the poll.
     // ONLY when the socket+token were actually provisioned above (notifyReady). The arg
@@ -740,6 +812,9 @@ bool ConnectionLoader::startEmbeddedZClassicd(const QStringList& extraArgs) {
     ezclassicd->start(zclassicdProgram, launchArgs);
 #endif // Q_OS_LINUX
 
+    // [gui-startup] We own this daemon and just spawned it. First-write-wins, so a
+    // later repair-relaunch never overwrites the original cold-start spawn time.
+    GuiStartup::markDaemonSpawned();
 
     return true;
 }
@@ -1260,6 +1335,21 @@ void ConnectionLoader::offerCorruptionRepair() {
         if (confirm == QMessageBox::Yes)
             this->redownloadChain();
     } else { // "Not now" or dialog closed
+        if (ezManualRepair) {
+            // MANUAL-REPAIR-BACKOUT FIX: this repair was opened by the user from a HEALTHY,
+            // connected wallet (Help -> Repair), and launchBlockchainRepair() already stopped
+            // the node before this dialog. "Not now" means the user changed their mind — so
+            // bring the node back via the normal warmup/connect path instead of stranding them
+            // on a false "couldn't finish starting up" error. ezAlive-guarded (the loader is not
+            // a QObject); doAutoConnect restarts the embedded node and doRPCSetConnection frees
+            // this loader on success.
+            main->logger->write("Manual repair declined; relaunching the node the user backed out of");
+            ezManualRepair = false;
+            ezWarmupTimer.start();
+            auto alive = ezAlive;
+            QTimer::singleShot(0, [=]() { if (alive && *alive) doAutoConnect(); });
+            return;
+        }
         this->showError(QObject::tr("ZClassic couldn't finish starting up.\n\n"
             "You can open ZClassic again whenever you're ready, and choose a repair "
             "option then. Your wallet and coins are safe."));
@@ -1668,6 +1758,11 @@ void ConnectionLoader::clearHealLedger() {
     s.remove("heal/attempts.salvage");
     s.remove("heal/attempts.anchorRelaunch");
     s.remove("heal/attempts.extractRetry");
+    // AUTH_RESTART: a one-time cookie-migration/desync glitch must NOT permanently latch
+    // NEEDS_MANUAL. Clearing it on a clean getinfo lets a future, unrelated desync (very
+    // unlikely with cookie auth) self-heal again. Contrast warmupRestart, deliberately
+    // kept above to escalate an OSCILLATING node.
+    s.remove("heal/attempts.authRestart");
     // NOTE: heal/attempts.warmupRestart is intentionally NOT removed here (see above).
 }
 
@@ -1775,6 +1870,9 @@ void ConnectionLoader::handleWarmupWedged() {
 void ConnectionLoader::startManualRepair() {
     QSettings().setValue("heal/manualOnly", false);
     QSettings().setValue("heal/inProgress", false);
+    // Mark this as the user-initiated repair entry so "Not now" relaunches the (healthy,
+    // just-stopped) node instead of showing the false startup-failure dead-end.
+    ezManualRepair = true;
 
     // The datadir is needed to back up wallet.dat + set chain data aside. Recover it
     // the same way doAutoConnect does, since this loader is created cold.
@@ -1825,6 +1923,10 @@ void ConnectionLoader::doRPCSetConnection(Connection* conn) {
     if (ezWarmupTimer.isValid())
         main->logger->write(QString("Startup: node RPC online %1 ms after launch")
                                 .arg(ezWarmupTimer.elapsed()));
+    // [gui-startup] RPC is live: the node answered getinfo and we are attached. This
+    // is the universal "attached" instant for both the owned-daemon and the
+    // foreign/already-running-node paths. First-write-wins.
+    GuiStartup::markFirstGetInfo();
     ezWarmupTimer.invalidate();
     ezNodeQuitDuringStartup = false;
     // W1: the node is genuinely up; clear the repair-relaunch suppression so the
@@ -1967,13 +2069,35 @@ void ConnectionLoader::refreshZClassicdState(Connection* connection, std::functi
             if (err == QNetworkReply::NetworkError::ConnectionRefusedError) {   
                 refused();
             } else if (err == QNetworkReply::NetworkError::AuthenticationRequiredError) {
+                // 401. NEVER log the credential — only that auth failed (CONF-3).
                 main->logger->write("Authentication failed");
-                QString explanation = QString() % 
-                        QObject::tr("ZClassic couldn't sign in to its node.\n\n"
-                        "The saved username or password wasn't accepted. "
-                        "You can correct it under Edit → Settings.");
 
-                this->showError(explanation);
+                // OWNERSHIP + EMBEDDED gate (mirrors the getinfo-SUCCESS lambda above,
+                // which branches on ezclassicd != nullptr). The 401 ERROR path used to
+                // dead-end identically for owned and foreign nodes — that asymmetry was
+                // the bug. For OUR embedded node a 401 is a recoverable cookie/cred
+                // desync (a hand-edited/partial-write conf the proactive cookie
+                // migration couldn't reach, or a cookie not yet rewritten): heal it with
+                // a single bounded cookie-only restart. With cookie auth in place this
+                // branch is rarely reached at all; it is belt-and-suspenders.
+                if (Settings::getInstance()->useEmbedded() && ezclassicd != nullptr) {
+                    if (this->handleEmbeddedAuthFailure())
+                        return;   // heal started/escalated — do NOT fall through to showError
+                }
+
+                // EXTERNAL / FOREIGN node (useEmbedded()==false or a daemon we did not
+                // launch): we must NEVER restart or rewrite it. Route to a friendly
+                // fallback dialog (it branches conf-vs-Settings internally so it is never
+                // a dead end) instead of the bare critical box.
+                main->logger->write("Authentication failed against an external/foreign node; offering a fix");
+                d->hide();
+                rpc->setEZClassicd(nullptr);
+                rpc->noConnection();
+                if (main) { main->show(); main->raise(); main->activateWindow(); }
+                ezProgrammaticClose = true;
+                d->close();
+                ezProgrammaticClose = false;
+                if (main) main->showExternalNodeAuthFailed();
             } else if (err == QNetworkReply::NetworkError::InternalServerError && 
                     !res.is_discarded()) {
                 // The server is loading, so just poll until it succeeds
@@ -2063,8 +2187,15 @@ void ConnectionLoader::refreshZClassicdState(Connection* connection, std::functi
                     if (!renderedBootstrapVerify) {
                         if (ezProgress) ezProgress->setRange(0, 0);
                         {
+                            // DOTS FIX: the old code unconditionally chopped the LAST 3 chars
+                            // before re-adding dots, so any status NOT ending in "..." got
+                            // mangled (e.g. "Verifying blocks... (56%)" -> "Verifying blocks... (5...").
+                            // Strip only a trailing run of dots, then re-append the animated count.
                             static int dots = 0;
-                            status = status.left(status.length() - 3) + QString(".").repeated(dots);
+                            QString base = status;
+                            while (base.endsWith(QLatin1Char('.')))
+                                base.chop(1);
+                            status = base + QString(".").repeated(dots);
                             dots++;
                             if (dots > 3)
                                 dots = 0;
@@ -2422,10 +2553,347 @@ bool ConnectionLoader::verifyParams() {
     return true;
 }
 
+// COOKIE-AUTH: absolute path of the daemon's auth cookie, computed from the SAME conf
+// the GUI reads so the launch-time -rpccookiefile and the read-time path are identical.
+// Base = conf datadir= override if present, else the conf's directory. On testnet the
+// daemon would normally place the cookie under testnet3/, but because we PIN an absolute
+// -rpccookiefile to THIS path the daemon writes it here regardless — no subdir guessing.
+QString ConnectionLoader::cookieFilePathForConf(const std::shared_ptr<ConnectionConfig>& cfg) {
+    if (!cfg)
+        return QString();
+    QString base = !cfg->dataDirOverride.isEmpty() ? cfg->dataDirOverride : cfg->zclassicDir;
+    if (base.isEmpty())
+        return QString();
+    return QDir::cleanPath(QDir(base).filePath(QStringLiteral(".cookie")));
+}
+
+// COOKIE-AUTH: read the raw "__cookie__:<base64>" line the daemon wrote (single getline,
+// exactly like the daemon's GetAuthCookie). Returns nullopt when the file is
+// absent/empty (daemon still pre-RPC). The cookie is a SECRET: NEVER log its contents.
+QString ConnectionLoader::readAuthCookie(const std::shared_ptr<ConnectionConfig>& cfg) {
+    // Returns an EMPTY QString to mean "no cookie yet" (C++14 codebase, no std::optional).
+    // A valid cookie line is always non-empty, so empty is an unambiguous sentinel.
+    QString path = cookieFilePathForConf(cfg);
+    if (path.isEmpty())
+        return QString();
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
+        return QString();
+    QTextStream in(&f);
+    QString line = in.readLine();   // first line only; daemon writes no trailing newline
+    f.close();
+    return line.trimmed();           // empty if the file was empty -> treated as "absent"
+}
+
+// FOREIGN-NODE CREDENTIAL DISCOVERY. See header. Reads the standard pidfile then the
+// running daemon's /proc/<pid>/cmdline to recover RPC creds for a node we did NOT launch
+// (creds only on its command line). Returns the password (or EMPTY) + fills outUser.
+// SECRET-SAFE: never logs the password/cookie/cmdline bytes; only "found", at most once.
+QString ConnectionLoader::discoverCredsFromRunningDaemon(const std::shared_ptr<ConnectionConfig>& cfg, QString& outUser) {
+    outUser = QString();
+#ifdef Q_OS_LINUX
+    if (!cfg)
+        return QString();
+
+    // Resolve the datadir base EXACTLY as cookieFilePathForConf (dataDirOverride else
+    // the conf's own directory) so the pidfile and cookie paths stay consistent.
+    QString base = !cfg->dataDirOverride.isEmpty() ? cfg->dataDirOverride : cfg->zclassicDir;
+    if (base.isEmpty())
+        return QString();
+
+    // Standard pidfile is <datadir>/zclassicd.pid (bob's -pid= writes exactly this). On
+    // testnet a RELATIVE -pid resolves under testnet3/, so also try that as a fallback.
+    QStringList pidCandidates;
+    pidCandidates << QDir::cleanPath(QDir(base).filePath(QStringLiteral("zclassicd.pid")));
+    if (Settings::getInstance()->isTestnet())
+        pidCandidates << QDir::cleanPath(QDir(base).filePath(QStringLiteral("testnet3/zclassicd.pid")));
+
+    qint64 pid = 0;
+    for (const QString& pidPath : pidCandidates) {
+        QFile pf(pidPath);
+        if (!pf.open(QIODevice::ReadOnly | QIODevice::Text))
+            continue;
+        QTextStream pin(&pf);
+        bool ok = false;
+        qint64 v = pin.readLine().trimmed().toLongLong(&ok);
+        pf.close();
+        if (ok && v > 0) { pid = v; break; }
+    }
+    if (pid <= 0)
+        return QString();   // no pidfile -> fall back (do NOT scan unrelated zclassicd)
+
+    // Read /proc/<pid>/cmdline: NUL-separated args (same-user readable; cross-user EACCES
+    // -> open fails -> fall back). A stale/recycled PID is rejected by the basename check.
+    QFile cf(QStringLiteral("/proc/%1/cmdline").arg(pid));
+    if (!cf.open(QIODevice::ReadOnly))
+        return QString();
+    QByteArray raw = cf.readAll();
+    cf.close();
+    if (raw.isEmpty())
+        return QString();
+
+    QList<QByteArray> rawArgs = raw.split('\0');
+    QStringList args;
+    for (const QByteArray& a : rawArgs) {
+        if (!a.isEmpty())
+            args << QString::fromLocal8Bit(a);
+    }
+    if (args.isEmpty())
+        return QString();
+
+    // RIGHT-PROCESS TARGETING. The program name (args[0]) must look like a zclassicd. This
+    // rejects a recycled PID now owned by some other program.
+    QString prog = QFileInfo(args.first()).fileName();
+    if (!prog.contains(QStringLiteral("zclassicd"), Qt::CaseInsensitive))
+        return QString();
+
+    // Scan args. If a -datadir= is present it MUST resolve to OUR base, else this is some
+    // unrelated zclassicd and we fall back. When no -datadir= is present we trust the
+    // pidfile anchor (the pidfile lived under OUR base).
+    QString cmdUser, cmdPass, cmdCookieFile, cmdDataDir;
+    for (const QString& a : args) {
+        int eq = a.indexOf(QLatin1Char('='));
+        if (eq < 0)
+            continue;
+        QString val = a.mid(eq + 1);
+        if (a.startsWith(QStringLiteral("-rpcuser=")))            cmdUser       = val;
+        else if (a.startsWith(QStringLiteral("-rpcpassword=")))   cmdPass       = val;
+        else if (a.startsWith(QStringLiteral("-rpccookiefile="))) cmdCookieFile = val;
+        else if (a.startsWith(QStringLiteral("-datadir=")))       cmdDataDir    = val;
+    }
+
+    if (!cmdDataDir.isEmpty()) {
+        QString a = QDir::cleanPath(QDir(cmdDataDir).absolutePath());
+        QString b = QDir::cleanPath(QDir(base).absolutePath());
+        if (a != b)
+            return QString();   // a DIFFERENT node's datadir -> never send its creds
+    }
+
+    // Path A: explicit -rpcpassword on the command line (bob's case). Use the cmdline's
+    // -rpcuser verbatim — EMPTY when none was given (daemon then matches a ":<pass>"
+    // header). Do NOT substitute "__cookie__": that literal is only correct for cookie
+    // auth, and a node started with -rpcpassword and no -rpcuser uses an empty username.
+    if (!cmdPass.isEmpty()) {
+        outUser = cmdUser;
+        if (!QSettings().value("conf/cmdlineCredsLogged", false).toBool()) {
+            main->logger->write("Discovered RPC credentials from the running node's command line");
+            QSettings().setValue("conf/cmdlineCredsLogged", true);
+        }
+        return cmdPass;   // SECRET: returned only, never logged
+    }
+
+    // Path B: the node was started with -rpccookiefile=<path> instead. Follow it and read
+    // that cookie with the same single-getline as readAuthCookie.
+    if (!cmdCookieFile.isEmpty()) {
+        QFile ckf(cmdCookieFile);
+        if (ckf.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            QTextStream cin(&ckf);
+            QString cookieLine = cin.readLine().trimmed();
+            ckf.close();
+            int colon = cookieLine.indexOf(QLatin1Char(':'));
+            if (colon > 0) {
+                outUser = cookieLine.left(colon);
+                if (!QSettings().value("conf/cmdlineCredsLogged", false).toBool()) {
+                    main->logger->write("Discovered RPC cookie from the running node's command line");
+                    QSettings().setValue("conf/cmdlineCredsLogged", true);
+                }
+                return cookieLine.mid(colon + 1);   // SECRET: returned only, never logged
+            }
+        }
+    }
+
+    return QString();   // nothing usable on the cmdline -> fall back
+#else
+    Q_UNUSED(cfg);
+    return QString();   // /proc is Linux-only; macOS/Windows fall through to QSettings/prompt
+#endif
+}
+
+// PROACTIVE one-time migration of a legacy GUI-owned conf to cookie auth. Strips ONLY
+// the rpcuser=/rpcpassword= lines IN PLACE (preserving server=/datadir=/proxy=/testnet=
+// verbatim — we do NOT reuse createZClassicConf, which is modal + truncates and would
+// clobber a custom datadir=). Gated to a GUI-owned (rpcuser=="zcl-qt-wallet"), embedded,
+// non-external (daemon=1 ABSENT) conf so a user's external-node creds are never touched.
+// Runs at most once (QSettings conf/cookieMigrated). Re-asserts 0600 + the read-back
+// leak-warn. NEVER logs the stripped credential.
+void ConnectionLoader::migrateConfToCookie() {
+    // Embedded-only: never rewrite a conf the user pointed us at as an external node.
+    if (!Settings::getInstance()->useEmbedded())
+        return;
+    if (QSettings().value("conf/cookieMigrated", false).toBool())
+        return;
+
+    QString confLocation = locateZClassicConfFile();
+    if (confLocation.isEmpty())
+        return;   // no conf yet -> createZClassicConf writes a cookie-mode one anyway
+
+    QFile in(confLocation);
+    if (!in.open(QIODevice::ReadOnly | QIODevice::Text))
+        return;
+
+    QStringList kept;
+    bool sawGuiRpcUser   = false;   // rpcuser=zcl-qt-wallet  -> GUI-owned signal
+    bool sawDaemonFlag   = false;   // daemon=1               -> deliberately external
+    bool hadRpcPassword  = false;
+    {
+        QTextStream ts(&in);
+        while (!ts.atEnd()) {
+            QString line = ts.readLine();
+            int s = line.indexOf(QLatin1Char('='));
+            QString name  = (s < 0 ? line : line.left(s)).trimmed().toLower();
+            QString value = (s < 0 ? QString() : line.mid(s + 1)).trimmed();
+            if (name == QLatin1String("rpcuser")) {
+                if (value == QLatin1String("zcl-qt-wallet")) sawGuiRpcUser = true;
+                continue;   // strip (do not keep)
+            }
+            if (name == QLatin1String("rpcpassword")) {
+                hadRpcPassword = true;
+                continue;   // strip (do not keep) — value NEVER logged
+            }
+            if (name == QLatin1String("daemon") && value == QLatin1String("1"))
+                sawDaemonFlag = true;
+            kept << line;   // preserve EVERY other line verbatim (datadir/proxy/testnet/server)
+        }
+    }
+    in.close();
+
+    // Only migrate a conf that is unmistakably OUR cookie-able conf: GUI rpcuser, a
+    // password to strip, and NOT a deliberately-external (daemon=1) conf. Otherwise mark
+    // migrated (so we never re-scan) and leave the file untouched.
+    if (!sawGuiRpcUser || !hadRpcPassword || sawDaemonFlag) {
+        QSettings().setValue("conf/cookieMigrated", true);
+        return;
+    }
+
+    // DEFENSIVE (belt-and-suspenders): never strip creds out from under a daemon that is
+    // actively LISTENING on the conf's RPC port. The gates above already exclude a
+    // deliberately-external node, but a race (a daemon coming up on this conf as we migrate)
+    // could leave it 401ing. If something answers on 127.0.0.1:<rpcport> right now, SKIP the
+    // rewrite this launch (do NOT set the migrated flag -> retry next clean launch). Reuses
+    // the same 127.0.0.1 QTcpSocket probe shape as portsFree(). NEVER restarts the node.
+    {
+        quint16 rpcPort = Settings::getInstance()->isTestnet() ? 18023 : 8023;
+        QTcpSocket probe;
+        probe.connectToHost(QStringLiteral("127.0.0.1"), rpcPort);
+        bool listening = probe.waitForConnected(150);   // refused/timeout => free
+        probe.abort();
+        if (listening) {
+            main->logger->write("migrateConfToCookie: a daemon is listening on the RPC port; skipping conf strip this launch");
+            return;   // do NOT set the migrated flag -> retry on a future clean launch
+        }
+    }
+
+    // Rewrite 0600 (born owner-only via umask, exactly like createZClassicConf).
+#ifndef Q_OS_WIN
+    mode_t oldMask = ::umask(0077);
+#endif
+    QFile out(confLocation);
+    bool opened = out.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text);
+#ifndef Q_OS_WIN
+    ::umask(oldMask);
+#endif
+    if (!opened) {
+        main->logger->write("migrateConfToCookie: could not rewrite conf; leaving it as-is");
+        return;   // do NOT set the flag -> retry on a future launch
+    }
+    if (!out.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner))
+        main->logger->write("warning: could not restrict zclassic.conf to 0600 (migration)");
+    {
+        QTextStream os(&out);
+        for (const QString& l : kept)
+            os << l << "\n";
+    }
+    out.close();
+
+    // Read-back leak check (same posture as createZClassicConf).
+    {
+        QFile::Permissions p = QFile::permissions(confLocation);
+        const QFile::Permissions leaky =
+            QFileDevice::ReadGroup  | QFileDevice::WriteGroup |
+            QFileDevice::ReadOther  | QFileDevice::WriteOther;
+        if (p & leaky)
+            main->logger->write("WARNING: zclassic.conf could not be secured to 0600 after "
+                                "cookie migration; please chmod 600 it.");
+    }
+
+    QSettings().setValue("conf/cookieMigrated", true);
+    main->logger->write("Migrated GUI-owned zclassic.conf to cookie auth (stripped rpcuser/rpcpassword)");
+}
+
+// REACTIVE 401 self-heal for an OWNED embedded node. See header. Bounded at cap 1 via
+// the EXISTING heal ledger so 401->restart->401 can NEVER loop. Returns true if it
+// handled the 401 (caller must NOT fall through to any showError).
+bool ConnectionLoader::handleEmbeddedAuthFailure() {
+    // INVARIANT (caller already checked, re-assert defensively): owned embedded only.
+    if (!Settings::getInstance()->useEmbedded() || ezclassicd == nullptr)
+        return false;   // not ours -> caller takes the external-node path
+
+    if (healInProgress())
+        return true;    // a heal is already armed; swallow this 401 (do not dead-end)
+
+    // HARD CAP (cap 1): one cookie-only rewrite + relaunch. If that did not fix auth,
+    // escalate to NEEDS_MANUAL (keeps Help->Repair reachable) rather than looping.
+    if (healAttempts("authRestart") >= 1) {
+        this->latchNeedsManual(QObject::tr("ZClassic couldn't sign in to its own node.\n\n"
+            "It already tried to fix this automatically. Please quit and open ZClassic "
+            "again. If it keeps happening, repair the blockchain from the Help menu. "
+            "Your wallet and coins are safe."));
+        return true;
+    }
+    bumpHealAttempt("authRestart");
+    setHealInProgress(true);
+    main->logger->write("AUTH_RESTART heal: owned-node 401 — switching conf to cookie auth and restarting once");
+
+    // (1) Force the conf to cookie-only so the relaunched daemon writes a fresh cookie
+    //     and there is no shared secret left to mismatch. Idempotent + safe even if the
+    //     proactive pass already ran (it just sees nothing to strip).
+    QSettings().setValue("conf/cookieMigrated", false);   // allow the rewrite to run
+    this->migrateConfToCookie();
+
+    // (2) LOOP-HAZARD DEFENSE (verified): a daemon only re-reads its conf on a FRESH
+    //     start, and it holds the RPC port with the OLD credential until it exits. So we
+    //     must FULLY stop + drop the QProcess BEFORE relaunch, or the relaunch would
+    //     re-bind against the same stale auth and 401 forever. Exact handleWarmupWedged
+    //     stop sequence (terminate -> wait -> kill -> deleteLater -> nullptr).
+    if (ezclassicd && ezclassicd->state() != QProcess::NotRunning) {
+        ezclassicd->terminate();
+        ezclassicd->waitForFinished(5000);
+        if (ezclassicd->state() != QProcess::NotRunning)
+            ezclassicd->kill();
+    }
+    if (ezclassicd) {
+        ezclassicd->deleteLater();
+        ezclassicd = nullptr;
+    }
+    ezNodeQuitDuringStartup = false;
+    ezUnexpectedErrPolls = 0;      // fresh start: clear the odd-reply streak counter
+    ezStdErr.clear();
+    ezLastWarmupStatus.clear();
+    ezLastWarmupPct = -1;
+    ezWarmupNoProgress.invalidate();
+
+    if (!this->startEmbeddedZClassicd()) {
+        this->setHealInProgress(false);
+        this->latchNeedsManual(QObject::tr("ZClassic couldn't restart its node.\n\n"
+            "Please open ZClassic again. Your wallet and coins are safe."));
+        return true;
+    }
+    this->setHealInProgress(false);   // relaunch armed
+    ezWarmupTimer.start();
+    // ezAlive guard: ConnectionLoader is not a QObject; bail if the loader was freed
+    // (deferred 'delete this' in doRPCSetConnection) before this fires.
+    auto alive = ezAlive;
+    QTimer::singleShot(1000, [=]() {
+        if (!alive || !*alive) return;
+        doAutoConnect();
+    });
+    return true;
+}
+
 /**
  * Try to automatically detect a zclassic.conf file in the correct location and load parameters
- */ 
-std::shared_ptr<ConnectionConfig> ConnectionLoader::autoDetectZClassicConf() {    
+ */
+std::shared_ptr<ConnectionConfig> ConnectionLoader::autoDetectZClassicConf() {
     auto confLocation = locateZClassicConfFile();
 
     if (confLocation.isNull()) {
@@ -2471,6 +2939,12 @@ std::shared_ptr<ConnectionConfig> ConnectionLoader::autoDetectZClassicConf() {
         if (name == "proxy") {
             zclassicconf->proxy = value;
         }
+        if (name == "datadir") {
+            // COOKIE-AUTH: a custom datadir= means the daemon's .cookie lives under
+            // THAT dir, not the conf's directory. Capture it so cookieFilePathForConf
+            // resolves the cookie (and the forced -rpccookiefile) correctly.
+            zclassicconf->dataDirOverride = value;
+        }
         if (name == "testnet" &&
             value == "1"  &&
             zclassicconf->port.isEmpty()) {
@@ -2481,6 +2955,72 @@ std::shared_ptr<ConnectionConfig> ConnectionLoader::autoDetectZClassicConf() {
     // If rpcport is not in the file, and it was not set by the testnet=1 flag, then go to default
     if (zclassicconf->port.isEmpty()) zclassicconf->port = "8023";
     file.close();
+
+    // COOKIE-AUTH read (touch-point b). When the conf carries NO rpcpassword, the
+    // daemon is in cookie mode: it auto-writes <datadir>/.cookie. Read that cookie
+    // FRESH on this connect attempt (never cached — doAutoConnect re-runs this every
+    // poll, so a late-appearing cookie is picked up next iteration) and feed the
+    // resulting "__cookie__:<b64>" line straight into rpcuser/rpcpassword so the
+    // UNCHANGED makeConnection() builds the correct Basic header. A MISSING/empty
+    // cookie (daemon still in its pre-RPC param/index phase) leaves rpcuser/rpcpassword
+    // empty -> makeConnection sends an empty Basic header the daemon refuses at the
+    // connection level (ConnectionRefusedError) during warmup, which folds into the
+    // patient refused()/warmup branch in doAutoConnect — NOT the 401 dead-end. The
+    // cookie line is a SECRET and is NEVER logged (CONF-3).
+    if (zclassicconf->rpcpassword.isEmpty()) {
+        std::shared_ptr<ConnectionConfig> tmp(zclassicconf,
+                                              [](ConnectionConfig*){ /*non-owning view*/ });
+        QString cookieLine = readAuthCookie(tmp);   // empty => no cookie yet
+        if (!cookieLine.isEmpty()) {
+            const QString& line = cookieLine;
+            int colon = line.indexOf(QLatin1Char(':'));
+            if (colon > 0) {
+                zclassicconf->rpcuser     = line.left(colon);
+                zclassicconf->rpcpassword = line.mid(colon + 1);
+                zclassicconf->cookieAuth  = true;
+            }
+        }
+
+        // FALLBACK 3 (foreign node, zero user action): the conf has no rpcpassword and no
+        // readable cookie. If this is a node WE DID NOT LAUNCH (ezclassicd == nullptr — the
+        // SAME ownership discriminator used by the getinfo-success branch at refreshZClassicd
+        // and the 401 heal gate; NOTE useEmbedded() is TRUE by default even for a foreign
+        // node, so it must NOT be the gate), recover its creds from its own command line via
+        // <datadir>/zclassicd.pid -> /proc/<pid>/cmdline. Inert during our embedded launch
+        // (ezclassicd is set there) and on macOS/Windows (helper returns empty). cookieAuth
+        // is reused as the "populated this attempt, not persisted" marker. NEVER logs creds.
+        if (zclassicconf->rpcpassword.isEmpty() && ezclassicd == nullptr) {
+            QString discUser;
+            QString discPass = discoverCredsFromRunningDaemon(tmp, discUser);
+            if (!discPass.isEmpty()) {
+                zclassicconf->rpcuser     = discUser;
+                zclassicconf->rpcpassword = discPass;
+                zclassicconf->cookieAuth  = true;   // not a persisted secret; read this attempt
+            }
+        }
+
+        // FALLBACK 4 (cross-platform): still empty -> use creds the user typed into
+        // Edit -> Settings (saved in QSettings connection/rpcuser+rpcpassword). This is the
+        // load-bearing fix that makes manually-entered Settings creds win even when a conf
+        // exists — today autoDetect always wins over loadFromSettings (only reached on the
+        // no-conf doManualConnect path), so without this the typed creds were ignored. Only
+        // adopt when BOTH are non-empty (same emptiness guard loadFromSettings uses), and
+        // ONLY for a node we did NOT launch (ezclassicd == nullptr) — for our own embedded
+        // node cookie auth is the sole path, so stale Settings creds must never override it
+        // (they would 401 our own node); leave empty -> warmup/refused until the cookie lands.
+        if (zclassicconf->rpcpassword.isEmpty() && ezclassicd == nullptr) {
+            QSettings s;
+            QString sUser = s.value("connection/rpcuser").toString();
+            QString sPass = s.value("connection/rpcpassword").toString();
+            if (!sUser.isEmpty() && !sPass.isEmpty()) {
+                zclassicconf->rpcuser     = sUser;
+                zclassicconf->rpcpassword = sPass;
+                zclassicconf->cookieAuth  = true;   // populated this attempt, not from conf
+            }
+        }
+        // else: ALL sources empty -> empty Basic header -> refused/retry; a real 401 then
+        // routes to the now-editable Settings prompt (never the file dead-end).
+    }
 
     // In addition to the zclassic.conf file, also double check the params. 
 

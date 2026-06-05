@@ -35,7 +35,7 @@
            <widget class="QGroupBox" name="groupBox">
             <property name="minimumSize">
              <size>
-              <width>250</width>
+              <width>0</width>
               <height>0</height>
              </size>
             </property>
@@ -988,11 +988,11 @@
     </property>
     <addaction name="actionPay_URI"/>
     <addaction name="separator"/>
+    <addaction name="actionBackup_wallet_dat"/>
+    <addaction name="actionExport_transactions"/>
+    <addaction name="separator"/>
     <addaction name="actionImport_Private_Key"/>
     <addaction name="actionExport_All_Private_Keys"/>
-    <addaction name="actionBackup_wallet_dat"/>
-    <addaction name="separator"/>
-    <addaction name="actionExport_transactions"/>
     <addaction name="separator"/>
     <addaction name="actionTurnstile_Migration"/>
     <addaction name="separator"/>

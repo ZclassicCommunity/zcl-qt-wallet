@@ -16,6 +16,7 @@ class QButtonGroup;
 class QPushButton;
 class QToolButton;
 class QWidget;
+class QCheckBox;
 
 using json = nlohmann::json;
 
@@ -103,6 +104,19 @@ public:
 
     Ui::MainWindow*     ui;
 
+    // ---- Deliverable A: read-only "you're helping the network" panel ----
+    // Built in C++ into the existing zclassicd-tab grid (groupBox_5/gridLayout_5)
+    // so the checked-in mainwindow.ui / ui_mainwindow.h are untouched (same idiom as
+    // connection.cpp's ezCard). All labels are populated by RPC::refreshNetworkHelpPanel
+    // from getnetworkinfo + getpeerinfo; nothing here ever writes to the node.
+    void        setupNetworkHelpPanel();          // called once from setupZClassicdTab()
+    QWidget*    netHelpPanel        = nullptr;     // container row (hidden by opt-out)
+    QLabel*     netHelpTitleLabel   = nullptr;     // bold "You're helping the network" heading (hidden by opt-out)
+    QLabel*     netHelpStatusLabel  = nullptr;     // "P2P: ON · port 8033 · N peers (M inbound)"
+    QLabel*     netHelpReachLabel   = nullptr;     // "Inbound: reachable / not yet"
+    QLabel*     netHelpBlurbLabel   = nullptr;     // friendly blurb + how-to link (RichText)
+    QCheckBox*  netHelpNatpmpChk     = nullptr;     // "Help the network — open my port automatically" (drives Settings::setOpenPortNatpmp; embedded-gated + honestly enabled/disabled each poll by RPC::refreshNetworkHelpPanel)
+
     // Phase-3c redesign (Quiet+): private-by-default RECEIVE widgets, built
     // programmatically by setupReceivePrivacyDisclosure(). Public alongside `ui`
     // (the L1 widget tests assert the private-by-default IA through these): the
@@ -128,6 +142,16 @@ public:
     // banner reserved for syncing/error). Swapped by setSyncStatus().
     QLabel*             syncQuietPill    = nullptr;
 
+    // PR-1 (snappiness): the banner stylesheet is otherwise re-applied on EVERY
+    // poll tick (5s during sync) with a byte-identical string, forcing a full
+    // QStyleSheetStyle re-parse + unpolish/repolish + relayout of the banner
+    // subtree -> a periodic micro-hitch right while the user watches sync
+    // progress. applyBannerStyle() caches the last-applied sheet here and only
+    // calls setStyleSheet() when it actually changes, so same-state ticks are a
+    // no-op. Pure main-thread; no async/lifecycle involvement.
+    QString             lastBannerSheet;
+    void applyBannerStyle(const QString& sheet);
+
     void setSyncStatus(bool isSyncing, int blockNumber, int estimatedHeight, double progress);
     void setSyncStatusConnecting();
 
@@ -141,7 +165,10 @@ public:
     //     transparent > 0, hidden when transparent == 0. The caller already has the
     //     transparent amount (balT) and passes it here rather than re-querying.
     // Public so the RPC poller can call it. No-op until setupHomeDashboard() has run.
-    void updateHomeFixIt(double transparent);
+    // `fromCache` is true ONLY for the startup cached-balance restore paint; it forces
+    // the WARMING (de-confidenced) hero state regardless of the isSyncing flag, which
+    // is not yet set on the very first paint. All live callers use the default (false).
+    void updateHomeFixIt(double transparent, bool fromCache = false);
 
     // PRIV-28 eager Sapling provisioning: ensure at least one Sapling z-address
     // exists so the send/shield path never has to block on key generation (the
@@ -204,7 +231,7 @@ public:
     // been peerless/stuck for a sustained window. The wallet can only download/repair the
     // chain for a node IT starts, so it cannot heal the foreign node — instead it shows a
     // CLEAR, ACTIONABLE, PERSISTENT, RETRYABLE message centred on STUCK (not "too old"):
-    // stop the other node (systemctl --user stop zclassicd, or close the other ZClassic),
+    // stop the other node (close the other ZClassic window, or stop the zclassicd process),
     // then reopen this wallet so it manages its own node. Primary relaunches the app; Quit
     // exits; an OPTIONAL "Use the bundled node" appears only when the ports are actually
     // free (re-checked on click). NEVER kills/mutates the foreign node; NEVER a silent hang.
@@ -215,6 +242,25 @@ public:
     // retryable; Retry re-runs the connect flow (a fresh ConnectionLoader/doAutoConnect)
     // rather than leaving the connect dialog frozen forever.
     void showNodeNotRespondingRetry();
+
+    // 401 from a deliberately-EXTERNAL node (useEmbedded()==false / a daemon we did not
+    // launch): for the bundled node a 401 is healed automatically and never reaches here.
+    // A calm, non-terminal dialog that BRANCHES on where the credentials live: when they
+    // come from a detected zclassic.conf the Settings fields are read-only, so it points
+    // the user at the conf file (one-click "Show me the file"); when they come from
+    // Edit -> Settings it offers a one-click "Open Settings". NEVER restarts/touches the
+    // external node and contains NO terminal commands.
+    void showExternalNodeAuthFailed();
+
+    // TRUE iff the detected zclassic.conf actually carries USABLE credentials — i.e. it
+    // parses a non-empty rpcpassword, OR a <datadir>/.cookie is readable for it. A conf can
+    // EXIST yet hold no creds (e.g. just "server=1", with the running node's creds only on
+    // its command line); the three GUI gates that key on "a conf path exists" must instead
+    // key on this so a cred-less conf leaves the Settings fields EDITABLE (never a dead end).
+    // Small DEDICATED reader (does NOT call ConnectionLoader::autoDetectZClassicConf, which
+    // has a setUsingZClassicConf side effect); base resolved like cookieFilePathForConf
+    // (conf datadir= override else the conf's own directory). NEVER logs the cookie.
+    bool confHasUsableCreds(const QString& confLocation);
 
     Logger*      logger;
 
@@ -231,6 +277,10 @@ public:
 
 private:
     void closeEvent(QCloseEvent* event);
+    // Narrow-window fix: re-elide the Home hero number to the window's current width on
+    // every resize, so the 40pt balance shrinks (with an ellipsis) instead of pinning a
+    // large minimum width. See relayoutHero() / heroPrivateFull.
+    void resizeEvent(QResizeEvent* event) override;
 
     void setupTrayIcon();
     QSystemTrayIcon* trayIcon       = nullptr;
@@ -264,9 +314,29 @@ private:
     QLabel*      homeHeroPrivate   = nullptr;   // big private (shielded) number
     QLabel*      homeHeroTotal     = nullptr;   // secondary "Total NN ZCL"
     QLabel*      homeHeroHelper    = nullptr;   // UX-22 zero-balance helper line
+    // Narrow-window fix: the hero labels are given QSizePolicy::Minimum + minimumWidth(0)
+    // so their (40pt) sizeHint stops pinning the whole window's min width. To avoid a
+    // mid-glyph hard-clip at narrow widths we ELIDE the displayed text but keep the FULL
+    // string here so (a) text-selection copies the real value and (b) the number re-expands
+    // when the window widens. relayoutHero() recomputes the elided text from these; it is
+    // invoked BOTH where the text is set (updateHomeFixIt) AND from resizeEvent().
+    QString      heroPrivateFull;               // un-elided private-balance string
+    QString      heroTotalFull;                 // un-elided "Total: …" string
+    void         relayoutHero();                // re-elide the hero labels to their current width
+    // Trust-aware hero (item 1): inline qualifier shown under the number while the
+    // balance is cached/warming/mid-sync ("Updating… not final yet" / "Last updated
+    // <when> · refreshing"); hidden on the synced edge. Confidence colour is driven by
+    // the heroconfident dynamic property on homeHeroPrivate (dark.qss owns the green vs
+    // neutral-grey). heroLivePainted is set true ONLY once a LIVE, non-syncing, real
+    // (non-blank) balance has been painted this session, so a cached/warming number is
+    // NEVER shown in confident green and a real synced number is NEVER hidden behind a
+    // stale label.
+    QLabel*      homeHeroQualifier = nullptr;   // "…not final yet" / "Last updated … · refreshing"
+    bool         heroLivePainted   = false;     // a live, synced, real balance has hit the hero this session
     QFrame*      homeFixItCard     = nullptr;   // amber card (hidden unless t>0)
     QLabel*      homeFixItText     = nullptr;   // "X ZCL is PUBLIC ..."
     QPushButton* homeSendBtn       = nullptr;   // quick action (primary when funded)
+    QPushButton* homeBackupBtn     = nullptr;   // always-on Home backup front door
     QPushButton* homeReceiveBtn    = nullptr;   // quick action (primary when empty)
 
     // W1-2: non-blocking amber "back up your wallet" Home card. Replaces the modal
@@ -311,6 +381,13 @@ private:
     Tx   createTxFromSendPage();
     bool confirmTx(Tx tx);
 
+    // Item 2 (send affirmation + humane failure). showSendSuccess: a calm,
+    // non-blocking "you did it" dialog with Copy txid + View on explorer.
+    // humaneSendError: maps common z_sendmany daemon error substrings to plain,
+    // actionable headline copy (raw text is kept under "Show Details" by the caller).
+    void    showSendSuccess(QString txid);
+    QString humaneSendError(const QString& raw);
+
     // PRIV-10/PRIV-19/PRIV-28 fail-open change-shielding helpers (see sendtab.cpp).
     // findUnusedSaplingChangeAddr: an existing Sapling addr not colliding with a
     // recipient, or "". createSaplingAddressSync: blocking last-resort create that
@@ -322,6 +399,13 @@ private:
     // correct basis for the auto-shield change amount (getAllBalances() includes
     // unconfirmed). Null-safe (returns 0 if UTXOs aren't loaded yet).
     double  confirmedSpendableBalance(const QString& addr);
+    // FAIL-OPEN spendable accessor (the load-bearing money-safety primitive). Returns
+    // the CONFIRMED, spendable balance of `addr` (confirmedSpendableBalance) ONLY when
+    // the UTXO set is actually loaded; otherwise it falls back to the minconf=0
+    // getAllBalances() value so a not-yet-loaded UTXO set never zeroes a Send-max or
+    // blocks a legitimate send. Every send-amount/validation site MUST go through this
+    // (not confirmedSpendableBalance directly) so the fail-open can't be forgotten.
+    double  spendableOrFallback(const QString& addr);
     // PRIV-27 one-shot: surface the Sprout-recipient "change stays transparent"
     // constraint at most once per run instead of nagging on every keystroke/build.
     bool sproutChangeWarned = false;
@@ -339,6 +423,11 @@ private:
     void inputComboTextChanged(int index);
     void addAddressSection();
     void maxAmountChecked(int checked);
+    // STALE-MAX FIX: recompute the "Send max" amount in-place when it is currently checked.
+    // The max depends on the from-address balance, the fee, and the other recipients' amounts,
+    // any of which can change AFTER Max is ticked — and Amount1 is read-only while Max is on, so
+    // the user can't hand-correct a stale value. Call this from every input that affects the max.
+    void recomputeMaxIfChecked();
 
     void editSchedule();
 
@@ -379,6 +468,17 @@ private:
     void exportKeys(QString addr = "");
     void backupWalletDat();
     void exportTransactions();
+
+    // --- Unified backup IA (Krug/Sierra): every entry point converges through these
+    // three helpers so there is ONE safe path and ONE success closure to maintain.
+    // fnDefaultBackupDir(): an existing dir to pre-fill the Save dialog (Desktop ->
+    // Documents -> Home). backupWallet(): the single safe wallet.dat copy with a
+    // smart, collision-safe default name+folder. showBackupSuccess(): the one warm
+    // closure (where the file is + you're safe + cloud caveat + how to restore +
+    // Show-in-folder). isWalletDat=false reuses it for the advanced key-file export.
+    QString fnDefaultBackupDir();
+    void    backupWallet();
+    void    showBackupSuccess(const QString& savedPath, bool isWalletDat);
 
     void doImport(QSharedPointer<QList<QString>> keys);
 

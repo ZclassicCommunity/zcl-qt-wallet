@@ -76,6 +76,13 @@ public:
     bool    getNonModalStartup();
     void    setNonModalStartup(bool on);
 
+    // Opt-in (default OFF for the first beta): ask the router to open our P2P
+    // listen port automatically via NAT-PMP/PCP (no UPnP), so NAT/firewalled
+    // users become reachable for inbound peers. When on, connection.cpp passes
+    // -natpmp=1 to the embedded daemon. Maps only our own listen port.
+    bool    getOpenPortNatpmp();
+    void    setOpenPortNatpmp(bool on);
+
     bool    isWalletBackedUp();
     void    setWalletBackedUp(bool backedUp);
 
