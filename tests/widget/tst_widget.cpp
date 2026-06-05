@@ -765,6 +765,425 @@ private slots:
         settleAndDelete(w);
     }
 
+    // ---- P9: auto-shield change EXCLUDES coinbase UTXOs + integer-zatoshi exactness ---
+    // z_sendmany will not spend coinbase UTXOs in a has-change (multi-output) send
+    // (consensus: bad-txns-coinbase-spend-has-transparent-outputs; coinbase goes only to a
+    // single zaddr, whole value consumed). So the auto-shield change MUST be based on the
+    // CONFIRMED, spendable, NON-COINBASE total only -- otherwise the change overshoots the
+    // funds the daemon can actually spend and the send fails "insufficient funds". This
+    // also pins the integer-zatoshi math: the change is EXACTLY 5 - 3 - 0.0001 = 1.9999
+    // (199990000 zat), not a float-drifted value. FAILS if coinbase leaks into the basis
+    // or the math regresses to double arithmetic.
+    void p9_autoShieldExcludesCoinbase() {
+        MainWindow* w = makeWindow();
+        auto* ui = w->ui;
+
+        const QString T  = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        const QString ZS = "zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u";
+
+        QSettings().setValue("options/autoshield", true);
+        QSettings().sync();
+
+        // T holds 9 ZCL: 5 non-coinbase + 4 mined (coinbase). Only the 5 non-coinbase is
+        // eligible to back a shielded change output.
+        auto* bals = new QMap<QString, double>(); (*bals)[T] = 9.0;
+        w->getRPC()->testSetBalances(bals);
+        auto* utxos = new QList<UnspentOutput>();
+        utxos->append(UnspentOutput{ T, "txid0", "5.0", 10,  true, /*coinbase=*/false });
+        utxos->append(UnspentOutput{ T, "txid1", "4.0", 100, true, /*coinbase=*/true  });
+        w->getRPC()->testSetUTXOs(utxos);
+        auto* zs = new QList<QString>(); zs->append(ZS);
+        w->getRPC()->testSetZAddresses(zs);
+
+        ui->inputsCombo->clear();
+        ui->inputsCombo->addItem(T, 9.0);
+        ui->inputsCombo->setCurrentIndex(0);
+        // Recipient is a DIFFERENT Sapling addr so ZS stays free as the change sink.
+        ui->Address1->setText("zs10m00rvkhfm4f7n23e4sxsx275r7ptnggx39ygl0vy46j9mdll5c97gl6dxgpk0njuptg2mn9w5s");
+        ui->Amount1->setText("3");
+
+        Tx tx = w->testCreateTxFromSendPage();
+
+        QVERIFY2(!tx.fromAddr.isEmpty(),
+                 "coinbase-excluded change must NOT abort: 5 non-coinbase ZCL covers 3 + fee");
+        bool changeToSapling = false;
+        for (const auto& to : tx.toAddrs) {
+            if (to.addr == ZS) {
+                changeToSapling = true;
+                // Based on the 5 NON-coinbase ZCL only: 5 - 3 - 0.0001 = 1.9999.
+                QVERIFY2(to.amount > 1.9 && to.amount < 2.0,
+                         qPrintable(QString("change must exclude coinbase (~1.9999), got: %1")
+                                    .arg(to.amount)));
+                // Integer-zatoshi EXACTNESS: exactly 199990000 zat, no float drift.
+                QCOMPARE((qint64)llround(to.amount * 1e8), (qint64)199990000);
+            }
+            QVERIFY2(to.addr != T,
+                     "PRIV-10: change must NEVER be routed back to a transparent address");
+        }
+        QVERIFY2(changeToSapling,
+                 "auto-shield change (from the non-coinbase balance) must route to Sapling");
+
+        QSettings().remove("options/autoshield");
+        QSettings().sync();
+        settleAndDelete(w);
+    }
+
+    // ---- P10: coinbase-only "shield everything" is NOT blocked (no change output) ------
+    // A miner shielding a coinbase-only t-address via "Send max" sends the whole balance
+    // to a single Sapling z-address with NO change -- the daemon legitimately consumes the
+    // coinbase UTXOs in full to that lone zaddr. The auto-shield path must NOT abort this
+    // (it has no non-coinbase change to shield) and must NOT fabricate a change output
+    // (which would make the tx multi-output and the coinbase unspendable). FAILS if the
+    // coinbase exclusion regresses this into a fail-closed abort or adds a stray output.
+    void p10_autoShieldCoinbaseOnlyShieldEverything() {
+        MainWindow* w = makeWindow();
+        auto* ui = w->ui;
+
+        const QString T  = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        const QString ZS = "zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u";
+
+        QSettings().setValue("options/autoshield", true);
+        QSettings().sync();
+
+        // T holds 4 ZCL, ALL of it mined (coinbase). No non-coinbase funds exist.
+        auto* bals = new QMap<QString, double>(); (*bals)[T] = 4.0;
+        w->getRPC()->testSetBalances(bals);
+        auto* utxos = new QList<UnspentOutput>();
+        utxos->append(UnspentOutput{ T, "txidcb", "4.0", 100, true, /*coinbase=*/true });
+        w->getRPC()->testSetUTXOs(utxos);
+        // Deliberately seed NO Sapling z-address: the no-change path must not need (nor
+        // try to create) a change sink. If the logic wrongly treated this as change>0 it
+        // would hit the fail-closed create and return an INVALID Tx -- caught below.
+        w->getRPC()->testSetZAddresses(new QList<QString>());
+
+        ui->inputsCombo->clear();
+        ui->inputsCombo->addItem(T, 4.0);
+        ui->inputsCombo->setCurrentIndex(0);
+        ui->Address1->setText(ZS);     // single Sapling recipient
+        ui->Amount1->setText("3.9999"); // send everything: 4.0 - 0.0001 fee
+
+        Tx tx = w->testCreateTxFromSendPage();
+
+        QVERIFY2(!tx.fromAddr.isEmpty(),
+                 "coinbase-only 'shield everything' must NOT abort (no non-coinbase change "
+                 "to shield; the daemon consumes the coinbase fully to the lone z-recipient)");
+        QCOMPARE(tx.toAddrs.size(), 1);                // recipient only, NO change output
+        QCOMPARE(tx.toAddrs[0].addr, ZS);
+        for (const auto& to : tx.toAddrs)
+            QVERIFY2(to.addr != T,
+                     "no transparent output may be built for a coinbase shield");
+
+        QSettings().remove("options/autoshield");
+        QSettings().sync();
+        settleAndDelete(w);
+    }
+
+    // ---- P11: SAFE-RACE — the pre-send gate aborts when the eligible set diverges ------
+    // The auto-shield change is sized against the GUI's cached UTXO snapshot but the
+    // z_sendmany fires later (after the confirm dwell). If a confirmed non-coinbase t-UTXO
+    // lands at the from-addr in that gap, the daemon would re-select a larger live set and
+    // emit the surplus as PUBLIC transparent change. verifyAutoShieldUnchanged() re-polls
+    // (via the injected testSetRepollUTXOs seam) right before send and MUST abort on any
+    // divergence, proceed when unchanged, and be a no-op for non-auto-shield sends.
+    void p11_autoShieldGateAbortsOnSnapshotRace() {
+        const QString T  = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        const QString ZS = "zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u";
+        const QString RECIP = "zs10m00rvkhfm4f7n23e4sxsx275r7ptnggx39ygl0vy46j9mdll5c97gl6dxgpk0njuptg2mn9w5s";
+
+        QSettings().setValue("options/autoshield", true);
+        QSettings().sync();
+
+        // Build an auto-shield-change Tx: T holds 5 ZCL (non-coinbase), send 3 to RECIP,
+        // change 1.9999 -> ZS. The build stamps autoShieldGuardActive + builtEligibleZat=5e8.
+        auto buildGuardedTx = [&](MainWindow* w) -> Tx {
+            auto* ui = w->ui;
+            auto* bals = new QMap<QString, double>(); (*bals)[T] = 5.0;
+            w->getRPC()->testSetBalances(bals);
+            auto* utxos = new QList<UnspentOutput>();
+            utxos->append(UnspentOutput{ T, "txid0", "5.0", 10, true, /*coinbase=*/false });
+            w->getRPC()->testSetUTXOs(utxos);
+            auto* zs = new QList<QString>(); zs->append(ZS);
+            w->getRPC()->testSetZAddresses(zs);
+            ui->inputsCombo->clear();
+            ui->inputsCombo->addItem(T, 5.0);
+            ui->inputsCombo->setCurrentIndex(0);
+            ui->Address1->setText(RECIP);
+            ui->Amount1->setText("3");
+            Tx tx = w->testCreateTxFromSendPage();
+            return tx;
+        };
+
+        // (a) DIVERGENCE: a 2 ZCL non-coinbase UTXO confirmed at T between build and send.
+        {
+            MainWindow* w = makeWindow();
+            Tx tx = buildGuardedTx(w);
+            QVERIFY2(tx.autoShieldGuardActive, "an explicit-change auto-shield send must arm the gate");
+            auto* fresh = new QList<UnspentOutput>();
+            fresh->append(UnspentOutput{ T, "txid0", "5.0", 10, true, false });
+            fresh->append(UnspentOutput{ T, "txid1", "2.0", 10, true, false });   // newly confirmed
+            w->getRPC()->testSetRepollUTXOs(fresh);
+            armModalDismisser();                          // the gate pops a blocking warning
+            QVERIFY2(!w->testVerifyAutoShield(tx),
+                     "a grown eligible set MUST abort the send (would leak surplus public change)");
+            settleAndDelete(w);
+        }
+
+        // (b) NO DIVERGENCE: the fresh re-poll matches the build snapshot -> send proceeds.
+        {
+            MainWindow* w = makeWindow();
+            Tx tx = buildGuardedTx(w);
+            auto* fresh = new QList<UnspentOutput>();
+            fresh->append(UnspentOutput{ T, "txid0", "5.0", 10, true, false });
+            w->getRPC()->testSetRepollUTXOs(fresh);
+            QVERIFY2(w->testVerifyAutoShield(tx),
+                     "an unchanged eligible set MUST let the send proceed");
+            settleAndDelete(w);
+        }
+
+        // (c) NO-OP: a non-auto-shield Tx (guard inactive) is never re-polled -> proceeds
+        // immediately. No re-poll seam is installed; if the gate wrongly re-polled it would
+        // hit the no-seam path and return false.
+        {
+            MainWindow* w = makeWindow();
+            Tx plain; plain.fromAddr = T; plain.fee = 0.0001;
+            ToFields f; f.addr = RECIP; f.amount = 1.0; plain.toAddrs.append(f);
+            QVERIFY2(!plain.autoShieldGuardActive, "a hand-built Tx must default to guard-inactive");
+            QVERIFY2(w->testVerifyAutoShield(plain),
+                     "a non-auto-shield send must pass the gate with no re-poll");
+            settleAndDelete(w);
+        }
+
+        QSettings().remove("options/autoshield");
+        QSettings().sync();
+    }
+
+    // ---- P12: multi-recipient coinbase-only send aborts (daemon allows coinbase only to
+    // a SINGLE zaddr). The (eligible, total] coinbase-aware guard must catch it up front
+    // with the shield-mined-funds message instead of letting the daemon reject.
+    void p12_multiRecipientCoinbaseAborts() {
+        MainWindow* w = makeWindow();
+        auto* ui = w->ui;
+        const QString T  = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        const QString R1 = "zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u";
+        const QString R2 = "zs10m00rvkhfm4f7n23e4sxsx275r7ptnggx39ygl0vy46j9mdll5c97gl6dxgpk0njuptg2mn9w5s";
+
+        QSettings().setValue("options/autoshield", true);
+        QSettings().sync();
+
+        auto* bals = new QMap<QString, double>(); (*bals)[T] = 4.0;
+        w->getRPC()->testSetBalances(bals);
+        auto* utxos = new QList<UnspentOutput>();
+        utxos->append(UnspentOutput{ T, "cb0", "2.0", 100, true, /*coinbase=*/true });
+        utxos->append(UnspentOutput{ T, "cb1", "2.0", 100, true, /*coinbase=*/true });
+        w->getRPC()->testSetUTXOs(utxos);
+        auto* zs = new QList<QString>(); zs->append(R1);
+        w->getRPC()->testSetZAddresses(zs);
+
+        ui->inputsCombo->clear();
+        ui->inputsCombo->addItem(T, 4.0);
+        ui->inputsCombo->setCurrentIndex(0);
+        ui->Address1->setText(R1);
+        ui->Amount1->setText("2");
+        ui->addAddressButton->click();                  // add a second recipient
+        auto* addr2 = ui->sendToWidgets->findChild<QLineEdit*>("Address2");
+        auto* amt2  = ui->sendToWidgets->findChild<QLineEdit*>("Amount2");
+        QVERIFY2(addr2 && amt2, "second recipient (Address2/Amount2) must be created");
+        addr2->setText(R2);
+        amt2->setText("1.9999");                        // total 3.9999 -> needs coinbase
+
+        armModalDismisser();
+        Tx tx = w->testCreateTxFromSendPage();
+        QVERIFY2(tx.fromAddr.isEmpty(),
+                 "multi-recipient coinbase-only send must abort (coinbase -> single zaddr only)");
+
+        QSettings().remove("options/autoshield");
+        QSettings().sync();
+        settleAndDelete(w);
+    }
+
+    // ---- P13: changeZat==0 boundary. Exactly amount+fee non-coinbase -> NO change output
+    // and the gate stays inactive; one zatoshi more -> a 1-zat Sapling change IS built and
+    // the gate arms. Pins the integer boundary the float code used to get wrong.
+    void p13_changeBoundaryExactZero() {
+        const QString T  = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        const QString ZS = "zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u";
+        const QString R  = "zs10m00rvkhfm4f7n23e4sxsx275r7ptnggx39ygl0vy46j9mdll5c97gl6dxgpk0njuptg2mn9w5s";
+
+        QSettings().setValue("options/autoshield", true);
+        QSettings().sync();
+
+        // (a) Exact zero: eligible 3.0001 == amount 3 + fee 0.0001 -> no change, no guard.
+        {
+            MainWindow* w = makeWindow(); auto* ui = w->ui;
+            auto* bals = new QMap<QString, double>(); (*bals)[T] = 3.0001;
+            w->getRPC()->testSetBalances(bals);
+            auto* utxos = new QList<UnspentOutput>();
+            utxos->append(UnspentOutput{ T, "txid0", "3.0001", 10, true, false });
+            w->getRPC()->testSetUTXOs(utxos);
+            auto* zs = new QList<QString>(); zs->append(ZS);
+            w->getRPC()->testSetZAddresses(zs);
+            ui->inputsCombo->clear(); ui->inputsCombo->addItem(T, 3.0001); ui->inputsCombo->setCurrentIndex(0);
+            ui->Address1->setText(R); ui->Amount1->setText("3");
+
+            Tx tx = w->testCreateTxFromSendPage();
+            QVERIFY2(!tx.fromAddr.isEmpty(), "exact-spend boundary must not abort");
+            QCOMPARE(tx.toAddrs.size(), 1);                       // recipient only, NO change row
+            // No change output, but the WHOLE confirmed balance is consumed -> the full-
+            // consume race guard arms: a UTXO confirming during the dwell would let the daemon
+            // leave a surplus as public change, so the gate re-verifies the total before send.
+            QVERIFY2(tx.autoShieldGuardActive && tx.autoShieldFullConsume,
+                     "exact full-consume (no change) must arm the full-consume race guard");
+            settleAndDelete(w);
+        }
+        // (b) +1 zatoshi: eligible 3.00010001 -> a 1-zat change row is built and the gate arms.
+        {
+            MainWindow* w = makeWindow(); auto* ui = w->ui;
+            auto* bals = new QMap<QString, double>(); (*bals)[T] = 3.00010001;
+            w->getRPC()->testSetBalances(bals);
+            auto* utxos = new QList<UnspentOutput>();
+            utxos->append(UnspentOutput{ T, "txid0", "3.00010001", 10, true, false });
+            w->getRPC()->testSetUTXOs(utxos);
+            auto* zs = new QList<QString>(); zs->append(ZS);
+            w->getRPC()->testSetZAddresses(zs);
+            ui->inputsCombo->clear(); ui->inputsCombo->addItem(T, 3.00010001); ui->inputsCombo->setCurrentIndex(0);
+            ui->Address1->setText(R); ui->Amount1->setText("3");
+
+            Tx tx = w->testCreateTxFromSendPage();
+            QVERIFY2(tx.autoShieldGuardActive, "a 1-zat change must arm the snapshot guard");
+            bool changeToZS = false;
+            for (const auto& to : tx.toAddrs)
+                if (to.addr == ZS) { changeToZS = true; QCOMPARE((qint64)llround(to.amount * 1e8), (qint64)1); }
+            QVERIFY2(changeToZS, "the 1-zat change must route to Sapling");
+            settleAndDelete(w);
+        }
+
+        QSettings().remove("options/autoshield");
+        QSettings().sync();
+    }
+
+    // ---- P14: custom-fee change sizing. The change and the stamped target must reflect a
+    // non-default fee, in exact zatoshis (5 - 3 - 0.001 = 1.999).
+    void p14_customFeeChangeSizing() {
+        MainWindow* w = makeWindow(); auto* ui = w->ui;
+        const QString T  = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        const QString ZS = "zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u";
+        const QString R  = "zs10m00rvkhfm4f7n23e4sxsx275r7ptnggx39ygl0vy46j9mdll5c97gl6dxgpk0njuptg2mn9w5s";
+
+        QSettings().setValue("options/autoshield", true); QSettings().sync();
+        Settings::getInstance()->setAllowCustomFees(true);
+
+        auto* bals = new QMap<QString, double>(); (*bals)[T] = 5.0;
+        w->getRPC()->testSetBalances(bals);
+        auto* utxos = new QList<UnspentOutput>();
+        utxos->append(UnspentOutput{ T, "txid0", "5.0", 10, true, false });
+        w->getRPC()->testSetUTXOs(utxos);
+        auto* zs = new QList<QString>(); zs->append(ZS);
+        w->getRPC()->testSetZAddresses(zs);
+        ui->inputsCombo->clear(); ui->inputsCombo->addItem(T, 5.0); ui->inputsCombo->setCurrentIndex(0);
+        ui->Address1->setText(R); ui->Amount1->setText("3");
+        ui->minerFeeAmt->setText("0.001");              // non-default custom fee
+
+        Tx tx = w->testCreateTxFromSendPage();
+        bool ok = false;
+        for (const auto& to : tx.toAddrs)
+            if (to.addr == ZS) { ok = true; QCOMPARE((qint64)llround(to.amount * 1e8), (qint64)199900000); }
+        QVERIFY2(ok, "change must route to Sapling and reflect the custom fee (1.999)");
+        QCOMPARE(tx.builtTargetZat, (qint64)300100000);  // 3.0 + 0.001
+
+        Settings::getInstance()->setAllowCustomFees(false);
+        QSettings().remove("options/autoshield"); QSettings().sync();
+        settleAndDelete(w);
+    }
+
+    // ---- P15: coinbase-aware band message. A single-recipient PARTIAL coinbase spend
+    // (target fits the confirmed total but exceeds the non-coinbase eligible, and is not a
+    // full-consume shield) must abort up front with the shield-mined-funds guidance.
+    void p15_coinbaseBandMessageAborts() {
+        MainWindow* w = makeWindow(); auto* ui = w->ui;
+        const QString T  = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        const QString ZS = "zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u";
+        const QString R  = "zs10m00rvkhfm4f7n23e4sxsx275r7ptnggx39ygl0vy46j9mdll5c97gl6dxgpk0njuptg2mn9w5s";
+
+        QSettings().setValue("options/autoshield", true); QSettings().sync();
+
+        // 2 non-coinbase + 5 coinbase. Send 3: fits the 7 total, exceeds the 2 non-coinbase
+        // eligible, and is NOT a full-consume single-recipient shield -> band abort.
+        auto* bals = new QMap<QString, double>(); (*bals)[T] = 7.0;
+        w->getRPC()->testSetBalances(bals);
+        auto* utxos = new QList<UnspentOutput>();
+        utxos->append(UnspentOutput{ T, "txid0", "2.0", 10,  true, /*coinbase=*/false });
+        utxos->append(UnspentOutput{ T, "cb0",   "5.0", 100, true, /*coinbase=*/true  });
+        w->getRPC()->testSetUTXOs(utxos);
+        auto* zs = new QList<QString>(); zs->append(ZS);
+        w->getRPC()->testSetZAddresses(zs);
+        ui->inputsCombo->clear(); ui->inputsCombo->addItem(T, 7.0); ui->inputsCombo->setCurrentIndex(0);
+        ui->Address1->setText(R); ui->Amount1->setText("3");
+
+        armModalDismisser();
+        Tx tx = w->testCreateTxFromSendPage();
+        QVERIFY2(tx.fromAddr.isEmpty(),
+                 "partial coinbase spend (target in (eligible, total]) must abort with the "
+                 "shield-mined-funds message, not silently build a doomed tx");
+
+        QSettings().remove("options/autoshield"); QSettings().sync();
+        settleAndDelete(w);
+    }
+
+    // ---- P16: full-consume "shield everything" is ALSO race-guarded ---------------------
+    // A single-Sapling-recipient shield of the whole (mixed coinbase + non-coinbase) balance
+    // builds NO change output, but is still leak-prone: if a non-coinbase UTXO confirms during
+    // the dwell the daemon can fund the frozen amount from non-coinbase alone and leave the
+    // surplus as PUBLIC change. The full-consume guard must arm and the gate must abort on a
+    // grown total (regression guard for the reviewer-found leak in the exemption path).
+    void p16_autoShieldFullConsumeRaceAborts() {
+        MainWindow* w = makeWindow(); auto* ui = w->ui;
+        const QString T = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        const QString R = "zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u";
+
+        QSettings().setValue("options/autoshield", true); QSettings().sync();
+
+        // T holds 3 non-coinbase + 2 coinbase (total 5). Shield EVERYTHING to one zs recipient.
+        auto* bals = new QMap<QString, double>(); (*bals)[T] = 5.0;
+        w->getRPC()->testSetBalances(bals);
+        auto* utxos = new QList<UnspentOutput>();
+        utxos->append(UnspentOutput{ T, "nc0", "3.0", 10,  true, /*coinbase=*/false });
+        utxos->append(UnspentOutput{ T, "cb0", "2.0", 100, true, /*coinbase=*/true  });
+        w->getRPC()->testSetUTXOs(utxos);
+        auto* zs = new QList<QString>(); zs->append(R);
+        w->getRPC()->testSetZAddresses(zs);
+        ui->inputsCombo->clear(); ui->inputsCombo->addItem(T, 5.0); ui->inputsCombo->setCurrentIndex(0);
+        ui->Address1->setText(R); ui->Amount1->setText("4.9999");   // whole balance minus fee
+
+        Tx tx = w->testCreateTxFromSendPage();
+        QVERIFY2(tx.autoShieldGuardActive && tx.autoShieldFullConsume,
+                 "mixed full-consume shield must arm the full-consume race guard");
+        QCOMPARE(tx.toAddrs.size(), 1);                            // recipient only, NO change row
+        QVERIFY2(tx.builtTargetZat == (qint64)500000000, "full-consume target is the whole 5.0 ZCL");
+
+        // (a) total GREW (a 2.5 non-coinbase confirmed during the dwell) -> MUST abort.
+        {
+            auto* grown = new QList<UnspentOutput>();
+            grown->append(UnspentOutput{ T, "nc0", "3.0", 10,  true, false });
+            grown->append(UnspentOutput{ T, "cb0", "2.0", 100, true, true  });
+            grown->append(UnspentOutput{ T, "nc1", "2.5", 10,  true, false });
+            w->getRPC()->testSetRepollUTXOs(grown);
+            armModalDismisser();
+            QVERIFY2(!w->testVerifyAutoShield(tx),
+                     "a grown total in a full-consume send MUST abort (surplus would leak public change)");
+        }
+        // (b) total UNCHANGED -> the send still proceeds.
+        {
+            auto* same = new QList<UnspentOutput>();
+            same->append(UnspentOutput{ T, "nc0", "3.0", 10,  true, false });
+            same->append(UnspentOutput{ T, "cb0", "2.0", 100, true, true  });
+            w->getRPC()->testSetRepollUTXOs(same);
+            QVERIFY2(w->testVerifyAutoShield(tx), "an unchanged total => full-consume gate passes");
+        }
+
+        QSettings().remove("options/autoshield"); QSettings().sync();
+        settleAndDelete(w);
+    }
+
     // ---- P8: P0-2 — the at-rest "● Synced" pill ↔ loud banner swap ---------------
     // The headline visual-polish change: when fully caught up, the full-width
     // colored "Synced" bar is DEMOTED to a quiet inline pill (green lives on the
