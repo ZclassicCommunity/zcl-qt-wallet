@@ -468,6 +468,31 @@ QLabel[badge="true"][tone="deshield"] {
 }
 
 /* ============================================================================
+ * SEND FORM "don't make me think" affordances.
+ *  - sendPrivacyBadge: live private/public verdict above the form. When a verdict
+ *    is set it carries badge/tone (styled above); at rest (no tone) it is a quiet
+ *    neutral hint, not an alarm.
+ *  - sendAddressBalance: a read-only QLineEdit that should read as a STATUS value,
+ *    not a clickable input (no border / focus ring, bold).
+ *  - sendTotalsLine: the running "You'll send X + fee = Z" summary, quiet + secondary.
+ * ============================================================================ */
+QLabel#sendPrivacyBadge {
+    padding: 6px 10px;
+    color: #9aa0a6;                  /* neutral resting hint */
+    font-style: italic;
+}
+QLineEdit#sendAddressBalance {
+    border: none;
+    background: transparent;
+    font-weight: 700;
+    color: #e6e6e6;
+}
+QLabel#sendTotalsLine {
+    color: #c7ccd1;
+    font-weight: 600;
+}
+
+/* ============================================================================
  * SOFTENED PUBLIC WARNING CALLOUT (Polish P1). The Receive transparent (t-Addr)
  * warning reuses lblSproutWarning. Instead of a full-bold red crash-message, it
  * is an AMBER callout card (amber = PUBLIC/transparent everywhere): tinted bg +

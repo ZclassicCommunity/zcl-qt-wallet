@@ -244,12 +244,22 @@
        </attribute>
        <layout class="QVBoxLayout" name="verticalLayout_4">
         <item>
+         <widget class="QLabel" name="sendPrivacyBadge">
+          <property name="text">
+           <string>Set who you are paying to see if this send is private</string>
+          </property>
+          <property name="wordWrap">
+           <bool>true</bool>
+          </property>
+         </widget>
+        </item>
+        <item>
          <widget class="QGroupBox" name="groupBox_4">
           <property name="autoFillBackground">
            <bool>false</bool>
           </property>
           <property name="title">
-           <string>From</string>
+           <string>Pay from</string>
           </property>
           <property name="flat">
            <bool>false</bool>
@@ -267,7 +277,7 @@
              <item>
               <widget class="QLabel" name="label_5">
                <property name="text">
-                <string>Address Balance</string>
+                <string>Available to send</string>
                </property>
               </widget>
              </item>
@@ -354,7 +364,10 @@
                <item>
                 <widget class="QGroupBox" name="verticalGroupBox">
                  <property name="title">
-                  <string>Recipient</string>
+                  <string/>
+                 </property>
+                 <property name="flat">
+                  <bool>true</bool>
                  </property>
                  <layout class="QVBoxLayout" name="sendAddressLayout">
                   <item>
@@ -362,14 +375,14 @@
                     <item>
                      <widget class="QLabel" name="label_4">
                       <property name="text">
-                       <string>Address</string>
+                       <string>Pay to</string>
                       </property>
                      </widget>
                     </item>
                     <item>
                      <widget class="QLineEdit" name="Address1">
                       <property name="placeholderText">
-                       <string>Address</string>
+                       <string>Paste a z-address (private) or t-address (public)</string>
                       </property>
                      </widget>
                     </item>
@@ -403,7 +416,14 @@
                        <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
                       </property>
                       <property name="placeholderText">
-                       <string>Amount</string>
+                       <string>0.00</string>
+                      </property>
+                     </widget>
+                    </item>
+                    <item>
+                     <widget class="QLabel" name="amountUnit1">
+                      <property name="text">
+                       <string>ZCL</string>
                       </property>
                      </widget>
                     </item>
@@ -415,9 +435,12 @@
                      </widget>
                     </item>
                     <item>
-                     <widget class="QCheckBox" name="Max1">
+                     <widget class="QPushButton" name="Max1">
+                      <property name="checkable">
+                       <bool>true</bool>
+                      </property>
                       <property name="text">
-                       <string>Max Available</string>
+                       <string>Send all</string>
                       </property>
                      </widget>
                     </item>
@@ -443,7 +466,7 @@
                        <string/>
                       </property>
                       <property name="text">
-                       <string>Memo</string>
+                       <string>Add private note</string>
                       </property>
                      </widget>
                     </item>
@@ -579,7 +602,7 @@
           <item>
            <widget class="QLabel" name="minerFeeLabel">
             <property name="text">
-             <string>Miner Fee</string>
+             <string>Network fee</string>
             </property>
            </widget>
           </item>
@@ -592,7 +615,14 @@
              </sizepolicy>
             </property>
             <property name="text">
-             <string>0</string>
+             <string/>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QLabel" name="feeUnit">
+            <property name="text">
+             <string>ZCL</string>
             </property>
            </widget>
           </item>
@@ -604,9 +634,22 @@
            </widget>
           </item>
           <item>
-           <widget class="QLabel" name="label_17">
+           <spacer name="horizontalSpacer_totals">
+            <property name="orientation">
+             <enum>Qt::Horizontal</enum>
+            </property>
+            <property name="sizeHint" stdset="0">
+             <size>
+              <width>20</width>
+              <height>20</height>
+             </size>
+            </property>
+           </spacer>
+          </item>
+          <item>
+           <widget class="QLabel" name="sendTotalsLine">
             <property name="text">
-             <string notr="true"/>
+             <string/>
             </property>
            </widget>
           </item>
@@ -632,7 +675,10 @@
              </size>
             </property>
             <property name="text">
-             <string>Send</string>
+             <string>Review &amp; send</string>
+            </property>
+            <property name="default">
+             <bool>true</bool>
             </property>
             <property name="flat">
              <bool>false</bool>
