@@ -604,6 +604,27 @@ Tx MainWindow::createTxFromSendPage() {
             return Tx();   // invalid: empty fromAddr -> sendButton aborts the send
         }
 
+        // Coinbase-only shortfall: the target fits the CONFIRMED total but NOT the
+        // non-coinbase eligible set, so the gap is mined (coinbase) money. A has-change
+        // send cannot spend coinbase (consensus: bad-txns-coinbase-spend-has-transparent-
+        // outputs), and a partial coinbase spend can't leave change either, so the daemon
+        // would reject cryptically. Steer the user to the dedicated shield instead.
+        // EXCEPTION: a single Sapling-recipient "shield everything" (target == the whole
+        // confirmed total) legitimately consumes coinbase to one zaddr with NO change --
+        // that path is allowed and handled by the changeZat<=0 branch below.
+        if (targetZat > eligibleZat
+                && !(tx.toAddrs.size() == 1
+                     && Settings::getInstance()->isSaplingAddress(tx.toAddrs[0].addr)
+                     && targetZat == confirmedTotalZat)) {
+            QMessageBox::warning(this, tr("Shield your mined funds first"),
+                tr("Part of this address's balance is newly mined (coinbase) coins, which "
+                   "can only be moved by shielding the whole balance to a private address "
+                   "first.\n\nUse \"Shield my public funds\" to move them privately, then "
+                   "send again."),
+                QMessageBox::Ok);
+            return Tx();   // invalid: empty fromAddr -> sendButton aborts the send
+        }
+
         // NOTE: z_sendmany does not pin inputs, so the no-leak reasoning below is sized
         // against the UTXO snapshot polled HERE. The pre-send gate verifyAutoShieldUnchanged()
         // re-polls and ABORTS if this exact eligible set changes before the deferred send, so
