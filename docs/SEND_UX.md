@@ -33,6 +33,11 @@ only sums values already on screen; the authoritative amount still comes solely 
 `maxAmountChecked`/`recomputeMaxIfChecked` path (only the widget class + a `toggled(bool)`
 signal adapter changed).
 
+**Memo note:** the "private note" framing lives only in the button label + tooltips. The memo
+text label (`MemoTxt%N`) is stored **raw** and is byte-identical to canonical, because
+`createTxFromSendPage` reads it verbatim as the on-chain memo — so no decoration is ever added
+to the payload. (An earlier draft prefixed the label and was caught + reverted in review.)
+
 ## Deferred (next pass)
 - Human-readable From-combo items (label + type word + spaced balance) — touches the `(`-split
   contract that recovers `tx.fromAddr`; land alone with a byte-identical round-trip assertion.

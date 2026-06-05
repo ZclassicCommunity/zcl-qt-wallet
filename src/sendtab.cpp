@@ -99,6 +99,14 @@ void MainWindow::setupSendTab() {
         if (pos == 1) {
             QString txt = ui->minerFeeAmt->text();
             ui->lblMinerFeeUSD->setText(Settings::getUSDFormat(txt.toDouble()));
+            // Re-sync the read-only state + hint each time Send is shown, so toggling
+            // "Allow custom fees" in Settings is reflected without a restart.
+            bool custom = Settings::getInstance()->getAllowCustomFees();
+            ui->minerFeeAmt->setReadOnly(!custom);
+            QString feeHint = custom ? QString()
+                : tr("Default network fee. Turn on “Allow custom fees” in Settings to change it.");
+            ui->minerFeeAmt->setToolTip(feeHint);
+            ui->minerFeeLabel->setToolTip(feeHint);
         }
     });
     //Fees validator
