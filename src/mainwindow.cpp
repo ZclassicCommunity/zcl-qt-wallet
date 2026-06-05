@@ -3262,13 +3262,18 @@ void MainWindow::setupRecieveTab() {
         QOverload<int>::of(&QComboBox::currentIndexChanged), [=] (int index) {
         QString addr = ui->listRecieveAddresses->itemText(index);
         if (addr.isEmpty()) {
-            ui->txtRecieve->clear();
+            // Calm loading state instead of a blank field+QR (reads as "broken"); the
+            // copy/request controls are disabled by updateReceiveQRandPayload() so the
+            // page never offers a silent dead-click during the warmup window.
+            ui->txtRecieve->setPlainText(tr("Preparing your address…"));
             ui->qrcodeDisplay->clear();
+            updateReceiveQRandPayload();
             return;
         }
 
+        // txtRecieve's plain text MUST stay the exact raw address — Copy reads it verbatim.
         ui->txtRecieve->setPlainText(addr);
-        ui->qrcodeDisplay->setQrcodeString(addr);
+        updateReceiveQRandPayload();   // builds the QR (bare addr, or zclassic: URI if amount set)
     });
 
     // Phase-3c: private-by-default IA. Build the disclosure LAST so it can reparent
@@ -3278,6 +3283,60 @@ void MainWindow::setupRecieveTab() {
     // also frames the QR (P0-5), adds the primary Copy button (P1/UX-24), and hangs
     // the demoted "Export private key" action behind the advanced panel (P0-4).
     setupReceivePrivacyDisclosure();
+}
+
+// Build the optional zclassic: payment-request URI for the SELECTED receive address from the
+// request-amount (+ z-only memo) fields. Returns "" when no amount is set (caller then uses the
+// bare address). CORRECTNESS: the address is the RAW value recovered by AddressCombo::currentText()
+// (the '(' split), never re-parsed display text; the amount goes through getDecimalString so it
+// round-trips through the Send-side parser's toDouble(); the memo is PERCENT-ENCODED and appended
+// ONLY for a z-address, so it can never inject a '&'/'=' that would break payZClassicURI's
+// arg.split('&')/kv.split('=') (which require exactly-2 parts) and matches the parser's t-addr
+// memo-drop. This is the symmetric inverse of payZClassicURI — a scanned request re-enters Send.
+QString MainWindow::buildReceivePaymentUri() {
+    if (!txtReceiveAmount) return QString();
+    QString addr = ui->listRecieveAddresses->currentText();   // raw addr (combo '(' split)
+    if (addr.isEmpty()) return QString();
+    double amt = txtReceiveAmount->text().trimmed().toDouble();
+    if (amt <= 0) return QString();                            // no amount -> no request URI
+    QString uri = QStringLiteral("zclassic:") % addr % QStringLiteral("?amt=") % Settings::getDecimalString(amt);
+    if (txtReceiveMemo && Settings::isZAddress(addr)) {
+        QString memo = txtReceiveMemo->text().trimmed();
+        if (!memo.isEmpty())
+            // HEX-encode the memo: that is the encoding payZClassicURI actually decodes (it
+            // hex-decodes a `^[0-9A-F]+$` memo value), so the text round-trips back to the
+            // payer EXACTLY. Hex is also injection-safe — only [0-9a-f], never a raw '&'/'='
+            // that could break the parser's split('&')/split('=') arity. (Percent-encoding
+            // would NOT round-trip: the parser never percent-decodes, and an all-hex plain
+            // memo like "2024" would be mis-hex-decoded.)
+            uri = uri % QStringLiteral("&memo=") % QString::fromUtf8(memo.toUtf8().toHex());
+    }
+    return uri;
+}
+
+// Refresh the Receive QR + the request-payload affordances from the current address + request
+// fields. Presentation only — never mutates the combo or txtRecieve's raw-address plain text.
+void MainWindow::updateReceiveQRandPayload() {
+    QString addr = ui->listRecieveAddresses->currentText();   // raw addr
+    bool haveAddr = !addr.isEmpty();
+    bool isZ = haveAddr && Settings::isZAddress(addr);
+
+    // Memo is only deliverable to a shielded (z) address.
+    if (txtReceiveMemo) {
+        txtReceiveMemo->setEnabled(haveAddr && isZ);
+        txtReceiveMemo->setToolTip(isZ ? QString()
+            : tr("Memos are only delivered to shielded (z) addresses."));
+    }
+    // Never a silent dead-click during warmup: disable the actions until an address is ready.
+    if (txtReceiveAmount) txtReceiveAmount->setEnabled(haveAddr);
+
+    QString uri = buildReceivePaymentUri();
+    bool haveRequest = !uri.isEmpty();
+    if (btnReceiveCopyRequest) btnReceiveCopyRequest->setVisible(haveRequest);
+
+    if (!haveAddr) { ui->qrcodeDisplay->clear(); return; }
+    // Bake the amount/memo into the QR when a request is set; else the bare address.
+    ui->qrcodeDisplay->setQrcodeString(haveRequest ? uri : addr);
 }
 
 // Phase-3c (Quiet+): restructure the Receive page so it is PRIVATE BY DEFAULT.
@@ -3301,13 +3360,23 @@ void MainWindow::setupReceivePrivacyDisclosure() {
     // first view; relabel it to something privacy-forward.
     ui->groupBox_6->setTitle(tr("Receive privately"));
 
-    // ---- 1) Green PRIVATE indicator (the resting-state affordance) ----------
+    // ---- 0) Plain-language "Get paid" framing (the at-rest answer to "what is this?") --
+    auto* lblReceiveHeadline = new QLabel(tr("Get paid"), ui->groupBox_6);
+    lblReceiveHeadline->setObjectName("lblReceiveHeadline");
+    auto* lblReceiveSubhead = new QLabel(tr("Share the address below to receive ZCL."), ui->groupBox_6);
+    lblReceiveSubhead->setObjectName("lblReceiveSubhead");
+    lblReceiveSubhead->setWordWrap(true);
+
+    // ---- 1) Green PRIVATE indicator — the shared badge pill (Send-tab parity) -------
     lblReceivePrivate = new QLabel(ui->groupBox_6);
-    lblReceivePrivate->setObjectName("lblReceivePrivate");   // qss hook (green badge)
-    // P2-8: lead the caption with "Private"; the "shielded (z)" technical detail
-    // lives in the tooltip only, so the standalone label stays in plain user words.
-    lblReceivePrivate->setText(tr("●  Private address"));
+    lblReceivePrivate->setObjectName("lblReceivePrivate");   // qss hook
+    // Answer "is this safe to share publicly?" right on the resting line (today only in a
+    // tooltip). Use the standardized green badge tokens so Receive matches Send. The
+    // "shielded (z) Sapling" technical detail stays in the tooltip, plain words on the line.
+    lblReceivePrivate->setText(tr("●  Private — safe to share"));
     lblReceivePrivate->setTextFormat(Qt::PlainText);
+    lblReceivePrivate->setProperty("badge", "true");
+    lblReceivePrivate->setProperty("tone", "private");
     lblReceivePrivate->setToolTip(tr(
         "This is a shielded (z) Sapling address. The amount, sender and recipient are "
         "encrypted on the blockchain — private by default."));
@@ -3401,18 +3470,24 @@ void MainWindow::setupReceivePrivacyDisclosure() {
         btnCopy->setObjectName("btnReceiveCopy");
         btnCopy->setCursor(Qt::PointingHandCursor);
         btnCopy->setToolTip(tr("Copy this address to the clipboard"));
-        QObject::connect(btnCopy, &QPushButton::clicked, [this]() {
+        QObject::connect(btnCopy, &QPushButton::clicked, [this, btnCopy]() {
             QString addr = ui->txtRecieve->toPlainText().trimmed();
-            if (addr.isEmpty())
+            if (!Settings::isValidAddress(addr))
                 addr = ui->listRecieveAddresses->currentText();
-            if (addr.isEmpty()) {
-                // NO-FEEDBACK FIX: during the brief address-refresh window the field is empty;
-                // the most prominent Receive button must not be a silent no-op. Say so.
+            // Guard on VALIDITY, not just non-emptiness: during the warmup window txtRecieve
+            // holds the "Preparing your address…" placeholder (non-empty), which must never be
+            // copied as if it were an address.
+            if (!Settings::isValidAddress(addr)) {
                 ui->statusBar->showMessage(tr("No address to copy yet"), 3 * 1000);
                 return;
             }
             QGuiApplication::clipboard()->setText(addr);
             ui->statusBar->showMessage(tr("Address copied to clipboard"), 3 * 1000);
+            // Inline confirmation right at the cursor (the status bar is far at the window
+            // bottom). `this` is the singleShot context so the restore is cancelled if the
+            // window dies first (btnCopy is its child).
+            btnCopy->setText(tr("Copied ✓"));
+            QTimer::singleShot(1500, this, [btnCopy]() { btnCopy->setText(tr("Copy")); });
         });
         if (auto* combaRow = qobject_cast<QHBoxLayout*>(ui->horizontalLayout_10)) {
             // Insert Copy right after the combo (index 1), before New Address.
@@ -3452,13 +3527,64 @@ void MainWindow::setupReceivePrivacyDisclosure() {
         recvRow->addLayout(qrCol);
     }
 
+    // ---- 3b) REQUEST AMOUNT (optional) — the idiotproof "they pay the right amount" flow.
+    // An optional amount (+ z-only memo) bakes a zclassic:<addr>?amt=&memo= payment-URI into
+    // the QR + a "Copy payment request" action, so the payer's wallet pre-fills the exact
+    // amount. The URI grammar is symmetric with payZClassicURI (the Send-side parser), so a
+    // scanned/pasted request round-trips straight into Send. The address is always the RAW
+    // value (never re-parsed display text); the memo is percent-encoded so it can't inject a
+    // '&'/'=' that would break the parser; amount goes through getDecimalString.
+    auto* reqRow = new QHBoxLayout();
+    auto* lblReqCap = new QLabel(tr("Request amount (optional)"), ui->groupBox_6);
+    lblReqCap->setObjectName("lblReceiveAddressCaption");   // reuse the dim caption style
+    txtReceiveAmount = new QLineEdit(ui->groupBox_6);
+    txtReceiveAmount->setObjectName("txtReceiveAmount");
+    txtReceiveAmount->setPlaceholderText(tr("0.00"));
+    txtReceiveAmount->setAlignment(Qt::AlignRight);
+    txtReceiveAmount->setValidator(new QRegExpValidator(QRegExp("[0-9]{0,8}\\.?[0-9]{0,8}"), this));
+    txtReceiveAmount->setMaximumWidth(140);
+    auto* lblReqUnit = new QLabel(tr("ZCL"), ui->groupBox_6);
+    txtReceiveMemo = new QLineEdit(ui->groupBox_6);
+    txtReceiveMemo->setObjectName("txtReceiveMemo");
+    txtReceiveMemo->setPlaceholderText(tr("Add a note for the sender (optional)"));
+    reqRow->addWidget(lblReqCap);
+    reqRow->addWidget(txtReceiveAmount);
+    reqRow->addWidget(lblReqUnit);
+    reqRow->addWidget(txtReceiveMemo);
+    // Rebuild the QR/payload live as the amount/memo change.
+    QObject::connect(txtReceiveAmount, &QLineEdit::textChanged, this, [this](const QString&){ updateReceiveQRandPayload(); });
+    QObject::connect(txtReceiveMemo,   &QLineEdit::textChanged, this, [this](const QString&){ updateReceiveQRandPayload(); });
+
+    // "Copy payment request" — copies the same zclassic: URI; hidden until an amount is set.
+    btnReceiveCopyRequest = new QPushButton(tr("Copy payment request"), ui->groupBox_6);
+    btnReceiveCopyRequest->setObjectName("btnReceiveCopyRequest");
+    btnReceiveCopyRequest->setCursor(Qt::PointingHandCursor);
+    btnReceiveCopyRequest->setVisible(false);
+    QObject::connect(btnReceiveCopyRequest, &QPushButton::clicked, this, [this]() {
+        QString uri = buildReceivePaymentUri();
+        if (uri.isEmpty()) return;
+        QGuiApplication::clipboard()->setText(uri);
+        ui->statusBar->showMessage(tr("Payment request copied to clipboard"), 3 * 1000);
+        btnReceiveCopyRequest->setText(tr("Copied ✓"));
+        QTimer::singleShot(1500, this, [this]() { btnReceiveCopyRequest->setText(tr("Copy payment request")); });
+    });
+    if (auto* combaRow = qobject_cast<QHBoxLayout*>(ui->horizontalLayout_10))
+        combaRow->addWidget(btnReceiveCopyRequest);
+
     // ---- 4) Splice everything in ABOVE the address-combo row ----------------
     // groupLayout currently: [0]=horizontalLayout_9 (now-empty radios row),
     // [1]=horizontalLayout_10 (combo + New Address), [2]=lblSproutWarning.
-    // Insert: badge, advanced-toggle, advanced-panel at the very top (in order).
-    groupLayout->insertWidget(0, lblReceivePrivate);
-    groupLayout->insertWidget(1, btnReceiveAdvanced);
-    groupLayout->insertWidget(2, receiveAdvancedPanel);
+    // Insert (top to bottom): headline, subhead, badge, advanced-toggle, advanced-panel,
+    // then the request-amount row just above the address+QR area.
+    groupLayout->insertWidget(0, lblReceiveHeadline);
+    groupLayout->insertWidget(1, lblReceiveSubhead);
+    groupLayout->insertWidget(2, lblReceivePrivate);
+    groupLayout->insertWidget(3, btnReceiveAdvanced);
+    groupLayout->insertWidget(4, receiveAdvancedPanel);
+    // Place the request-amount row just after the public/sprout warning (i.e. directly
+    // above the address+QR area), or at the end if the warning isn't in this layout.
+    int warnIdx = groupLayout->indexOf(ui->lblSproutWarning);
+    groupLayout->insertLayout(warnIdx >= 0 ? warnIdx + 1 : groupLayout->count(), reqRow);
 
     // ---- 5) Wire the toggle -------------------------------------------------
     QObject::connect(btnReceiveAdvanced, &QToolButton::toggled, [=](bool checked) {

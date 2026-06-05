@@ -378,6 +378,25 @@ QPushButton#btnReceiveCopy {
 QPushButton#btnReceiveCopy:hover   { background-color: #2a9d2a; border-color: #2a9d2a; }
 QPushButton#btnReceiveCopy:pressed { background-color: #1a6b1a; }
 
+/* "Copy payment request" — same primary-green as Copy (shown only when an amount is set). */
+QPushButton#btnReceiveCopyRequest {
+    background-color: #1f7a1f; color: #ffffff;
+    border: 1px solid #1f7a1f; border-radius: 8px;
+    padding: 10px 18px; font-size: 12pt; font-weight: 700;
+    min-height: 24px;
+}
+QPushButton#btnReceiveCopyRequest:hover   { background-color: #2a9d2a; border-color: #2a9d2a; }
+QPushButton#btnReceiveCopyRequest:pressed { background-color: #1a6b1a; }
+
+/* "Get paid" headline + subhead (plain-language framing, parity with the Send tab). */
+QLabel#lblReceiveHeadline { font-size: 16pt; font-weight: 700; color: #e6e6e6; }
+QLabel#lblReceiveSubhead  { color: #9aa0a6; }
+
+/* Request-amount inputs — right-aligned amount, same border/radius as the Send fields. */
+QLineEdit#txtReceiveAmount, QLineEdit#txtReceiveMemo {
+    border: 1px solid #3a3f4b; border-radius: 6px; padding: 6px 8px;
+}
+
 QLabel#lblReceiveAddressCaption {
     color: #9aa0a6;
     font-size: 11pt;

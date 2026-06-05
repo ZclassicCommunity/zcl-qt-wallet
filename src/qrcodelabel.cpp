@@ -62,7 +62,9 @@ void QRCodeLabel::setQrcodeString(QString stra) {
     qrModules.clear();
     qrSize = 0;
     if(!str.isEmpty()) {
-        qrcodegen::QrCode qr = qrcodegen::QrCode::encodeText(str.toUtf8().constData(), qrcodegen::QrCode::Ecc::LOW);
+        // MEDIUM error-correction (15%): scans far more reliably off a screen photo than
+        // LOW, and keeps the longer zclassic:?amt=&memo= payment-request payload scannable.
+        qrcodegen::QrCode qr = qrcodegen::QrCode::encodeText(str.toUtf8().constData(), qrcodegen::QrCode::Ecc::MEDIUM);
         qrSize = qr.getSize() > 0 ? qr.getSize() : 0;
         if(qrSize > 0) {
             qrModules.resize(qrSize * qrSize);
