@@ -27,7 +27,7 @@ preserve the privacy-load-bearing spine.
   warning is kept. Privacy is strengthened (badge says "safe to share"; memo disabled for t-addrs),
   never weakened.
 - **URI is parser-safe.** Amount via `getDecimalString` (round-trips through the parser's
-  `toDouble()`); memo **percent-encoded** and appended **only** for a z-address, so it can never
+  `toDouble()`); memo **hex-encoded** (the encoding payZClassicURI decodes) and appended **only** for a z-address, so it can never
   inject a `&`/`=` that would break `payZClassicURI`'s `split('&')`/`split('=')`.
 - **No daemon/RPC/address-creation change** — `addNewZaddr`/`addNewTAddr` untouched; no auto-mint.
 

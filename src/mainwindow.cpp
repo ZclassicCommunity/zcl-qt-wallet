@@ -3303,7 +3303,13 @@ QString MainWindow::buildReceivePaymentUri() {
     if (txtReceiveMemo && Settings::isZAddress(addr)) {
         QString memo = txtReceiveMemo->text().trimmed();
         if (!memo.isEmpty())
-            uri = uri % QStringLiteral("&memo=") % QString::fromUtf8(QUrl::toPercentEncoding(memo));
+            // HEX-encode the memo: that is the encoding payZClassicURI actually decodes (it
+            // hex-decodes a `^[0-9A-F]+$` memo value), so the text round-trips back to the
+            // payer EXACTLY. Hex is also injection-safe — only [0-9a-f], never a raw '&'/'='
+            // that could break the parser's split('&')/split('=') arity. (Percent-encoding
+            // would NOT round-trip: the parser never percent-decodes, and an all-hex plain
+            // memo like "2024" would be mis-hex-decoded.)
+            uri = uri % QStringLiteral("&memo=") % QString::fromUtf8(memo.toUtf8().toHex());
     }
     return uri;
 }
@@ -3466,11 +3472,12 @@ void MainWindow::setupReceivePrivacyDisclosure() {
         btnCopy->setToolTip(tr("Copy this address to the clipboard"));
         QObject::connect(btnCopy, &QPushButton::clicked, [this, btnCopy]() {
             QString addr = ui->txtRecieve->toPlainText().trimmed();
-            if (addr.isEmpty())
+            if (!Settings::isValidAddress(addr))
                 addr = ui->listRecieveAddresses->currentText();
-            if (addr.isEmpty()) {
-                // NO-FEEDBACK FIX: during the brief address-refresh window the field is empty;
-                // the most prominent Receive button must not be a silent no-op. Say so.
+            // Guard on VALIDITY, not just non-emptiness: during the warmup window txtRecieve
+            // holds the "Preparing your address…" placeholder (non-empty), which must never be
+            // copied as if it were an address.
+            if (!Settings::isValidAddress(addr)) {
                 ui->statusBar->showMessage(tr("No address to copy yet"), 3 * 1000);
                 return;
             }
