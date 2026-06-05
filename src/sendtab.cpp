@@ -604,12 +604,18 @@ Tx MainWindow::createTxFromSendPage() {
             return Tx();   // invalid: empty fromAddr -> sendButton aborts the send
         }
 
+        // NOTE: z_sendmany does not pin inputs, so the no-leak reasoning below holds for
+        // the UTXO snapshot we polled (the steady state). If a t-UTXO confirms to the
+        // from-addr between this poll and the deferred send, the daemon re-selects against
+        // the larger live set and can emit the surplus as PUBLIC change. Closing that race
+        // (re-poll immediately before send, or daemon-side input pinning) is a separate
+        // follow-up; this computation still makes the common case strictly better.
         const qint64 changeZat = eligibleZat - targetZat;
         if (changeZat > 0) {
             // There is non-coinbase change to shield. Route it to a Sapling z-address;
             // the extra output keeps the send multi-output, so the daemon stays on its
-            // non-coinbase selection path and consumes the eligible set exactly --
-            // residual 0, no public transparent change.
+            // non-coinbase selection path and (against the polled snapshot) consumes the
+            // eligible set exactly -- residual 0, no public transparent change.
             QString changeAddr = findUnusedSaplingChangeAddr(tx);
 
             // No existing usable Sapling address -> create one NOW. Blocking RPC, but only
@@ -634,10 +640,12 @@ Tx MainWindow::createTxFromSendPage() {
         }
         // changeZat <= 0: the send consumes all eligible non-coinbase funds (and, for a
         // single z-recipient "shield everything", possibly coinbase too). We add NO change
-        // output: a non-positive change is not a real output, and the daemon never emits
-        // transparent change in this shape -- it fully shields to the lone z-recipient
-        // (change 0) or rejects the send outright, so it can never silently leak. (A
-        // coinbase-only address shielded via "Send max" lands here and succeeds.)
+        // output: a non-positive change is not a real output. Against the snapshot we
+        // polled, the daemon emits no transparent change in this shape -- it fully shields
+        // to the lone z-recipient (change 0) or rejects the send outright. (A coinbase-only
+        // address shielded via "Send max" lands here and succeeds.) The snapshot-race
+        // caveat noted above applies: a UTXO confirming before the deferred send can still
+        // surface surplus public change until the race is closed.
     }
 
     return tx;
