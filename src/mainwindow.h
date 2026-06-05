@@ -143,6 +143,11 @@ public:
     QToolButton*        btnReceiveAdvanced    = nullptr;   // "▸ Other address types (advanced)"
     QWidget*            receiveAdvancedPanel  = nullptr;   // collapsible container for the radios
     QLabel*             lblReceivePrivate     = nullptr;   // green "Private — shielded (z) address" badge
+    // Request-amount affordances (the zclassic: payment-URI flow). Built in
+    // setupReceivePrivacyDisclosure(); read by updateReceiveQRandPayload/buildReceivePaymentUri.
+    QLineEdit*          txtReceiveAmount      = nullptr;   // optional "Request amount"
+    QLineEdit*          txtReceiveMemo        = nullptr;   // optional z-only note for the sender
+    QPushButton*        btnReceiveCopyRequest = nullptr;   // "Copy payment request" (shown when amount>0)
     bool                receiveAdvancedExpanded = false;
 
     QLabel*             statusLabel;
@@ -482,6 +487,9 @@ private:
     // Built programmatically (no structural .ui churn); reuses lblSproutWarning
     // for the red PUBLIC caption exactly as before.
     void setupReceivePrivacyDisclosure();
+    // Receive payment-request helpers (presentation only; never mutate the combo / raw address).
+    QString buildReceivePaymentUri();   // zclassic:<addr>?amt=&memo= or "" when no amount set
+    void    updateReceiveQRandPayload();
     // Show/hide the advanced disclosure panel; keeps the toggle arrow + collapsed
     // state in sync and, when collapsing, returns to the private (Sapling) view.
     void setReceiveAdvancedExpanded(bool expanded);
