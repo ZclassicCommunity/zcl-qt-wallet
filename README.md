@@ -9,16 +9,26 @@ A private, single-file ZClassic wallet — with a full ZClassic node built right
 
 ## Download & run
 
-**Latest release: v2.1.2-beta5** — always grab whatever GitHub marks as **Latest**:
+**Latest release: v2.1.2-beta6** — always grab whatever GitHub marks as **Latest**:
 **https://github.com/ZclassicCommunity/zcl-qt-wallet/releases/latest**
 
 Download the **one** file for your computer and open it:
 
 | Your computer | Download | First-time open |
 |---|---|---|
-| **Windows** | `zclwallet-v2.1.2-beta5-win64.exe` | Double-click. If you see **"Windows protected your PC"**, click **More info → Run anyway**. |
-| **macOS** (Apple Silicon) | `macOS-zclwallet-v2.1.2-beta5.dmg` | Open the `.dmg`, drag **ZclWallet** out, then **right-click the app → Open**. On **macOS 15+**, if there's no "Open" button, go to **System Settings → Privacy & Security → Open Anyway**. _(This is normal for community apps.)_ |
-| **Linux** | `linux-zclwallet-v2.1.2-beta5` | `chmod +x linux-zclwallet-v2.1.2-beta5 && ./linux-zclwallet-v2.1.2-beta5` — or right-click → Properties → *Allow executing as program*, then double-click. _(glibc ≥ 2.29; no Qt install needed.)_ |
+| **Windows** | `zclwallet-v2.1.2-beta6-win64.exe` | Double-click. If you see **"Windows protected your PC"**, click **More info → Run anyway**. |
+| **macOS** (Apple Silicon) | `zclwallet-v2.1.2-beta6-macos-arm64.dmg` | Open the `.dmg` and drag **ZclWallet** to Applications. On first launch macOS says **"Apple could not verify … is free from malware"** — that's expected (the app is signed but not yet notarized). See **[Opening on macOS](#opening-on-macos)** just below. |
+| **Linux** | `zclwallet-v2.1.2-beta6-linux-x86_64` | `chmod +x zclwallet-v2.1.2-beta6-linux-x86_64 && ./zclwallet-v2.1.2-beta6-linux-x86_64` — or right-click → Properties → *Allow executing as program*, then double-click. _(glibc ≥ 2.29; no Qt install needed.)_ |
+
+### Opening on macOS
+
+The first time you open the wallet, macOS shows **"Apple could not verify "ZclWallet" is free from malware that may harm your Mac."** This is **normal** for a community app that isn't notarized by Apple — the download is fine. Do this once:
+
+- **macOS 14 Sonoma / 15 Sequoia:** double-click the app, click **Done**, then open **System Settings → Privacy & Security**, scroll down to *Security*, and click **Open Anyway** next to the ZclWallet message → confirm with Touch ID / password.
+- **macOS 13 and earlier:** **right-click (Control-click) the app → Open → Open.**
+- **Any version (Terminal):** `xattr -dr com.apple.quarantine /Applications/ZclWallet.app`, then open it normally.
+
+After the first time, it opens like any other app. _(A future build will be notarized so this prompt goes away.)_
 
 ## What happens on first launch
 

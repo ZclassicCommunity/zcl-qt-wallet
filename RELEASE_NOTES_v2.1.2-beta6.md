@@ -44,11 +44,24 @@ on every machine, and making your money safe and your privacy clear.
   wallet** before upgrading.
 
 ## 📦 Downloads
-- **Linux** — single portable file (`zclwallet-v2.1.2-beta6`), glibc 2.31+.
+- **Linux** — `zclwallet-v2.1.2-beta6-linux-x86_64` (glibc 2.31+; `chmod +x` and run).
 - **Windows** — `zclwallet-v2.1.2-beta6-win64.exe`.
-- **macOS** — `.dmg` (ad-hoc signed; right-click → Open on first launch).
+- **macOS** — `zclwallet-v2.1.2-beta6-macos-arm64.dmg` (Apple Silicon; see **Opening on macOS** below).
 
-Verify with the published `SHA256SUMS` + signatures before running.
+Verify your download against `SHA256SUMS.txt` first if you like.
+
+## 🍎 Opening on macOS (please read)
+On first launch macOS will say **"Apple could not verify "ZclWallet" is free from malware."**
+This is **expected** — the app is signed but not yet *notarized* (no Apple Developer ID yet). The
+download is fine; here's how to open it (once):
+
+- **macOS 14 Sonoma / 15 Sequoia:** double-click → click **Done** → open
+  **System Settings → Privacy & Security**, scroll to *Security*, click **Open Anyway** next to the
+  ZclWallet message → authenticate.
+- **macOS 13 and earlier:** **right-click (Control-click) the app → Open → Open.**
+- **Any version (Terminal):** `xattr -dr com.apple.quarantine /Applications/ZclWallet.app`
+
+(We plan to notarize a future build so this prompt goes away entirely.)
 
 ## Upgrading
 Just replace the old file with the new one. Your wallet data is untouched.

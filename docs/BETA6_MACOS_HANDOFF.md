@@ -46,8 +46,11 @@ src/scripts/mkmacdmg.sh -q /path/to/static/Qt -z /path/to/zclassic -v 2.1.2-beta
 
 ## Signing reality
 - No Apple Developer ID here → the script does an **ad-hoc** sign (`-s -`). That fixes the Apple
-  Silicon SIGKILL but does **not** notarize, so Gatekeeper still says "unidentified developer."
-  Users **right-click → Open** once, or `xattr -dr com.apple.quarantine /Applications/ZclWallet.app`.
+  Silicon SIGKILL but does **not** notarize, so on first launch Gatekeeper says **"Apple could not
+  verify … is free from malware."** Users open it once via: **macOS 14/15** → System Settings →
+  Privacy & Security → **Open Anyway**; **macOS 13-** → **right-click → Open → Open**; or any
+  version → `xattr -dr com.apple.quarantine /Applications/ZclWallet.app`. (This is documented for
+  users in the README's "Opening on macOS" section + the release notes.)
 - If you have a Developer ID: replace `-s -` with your identity, add `--options runtime`, then
   `xcrun notarytool submit` + `stapler staple`. Your call — tell me if you'll notarize so I word
   the download page accordingly.
