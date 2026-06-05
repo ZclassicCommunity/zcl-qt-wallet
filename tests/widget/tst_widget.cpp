@@ -765,6 +765,119 @@ private slots:
         settleAndDelete(w);
     }
 
+    // ---- P9: auto-shield change EXCLUDES coinbase UTXOs + integer-zatoshi exactness ---
+    // z_sendmany will not spend coinbase UTXOs in a has-change (multi-output) send
+    // (consensus: bad-txns-coinbase-spend-has-transparent-outputs; coinbase goes only to a
+    // single zaddr, whole value consumed). So the auto-shield change MUST be based on the
+    // CONFIRMED, spendable, NON-COINBASE total only -- otherwise the change overshoots the
+    // funds the daemon can actually spend and the send fails "insufficient funds". This
+    // also pins the integer-zatoshi math: the change is EXACTLY 5 - 3 - 0.0001 = 1.9999
+    // (199990000 zat), not a float-drifted value. FAILS if coinbase leaks into the basis
+    // or the math regresses to double arithmetic.
+    void p9_autoShieldExcludesCoinbase() {
+        MainWindow* w = makeWindow();
+        auto* ui = w->ui;
+
+        const QString T  = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        const QString ZS = "zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u";
+
+        QSettings().setValue("options/autoshield", true);
+        QSettings().sync();
+
+        // T holds 9 ZCL: 5 non-coinbase + 4 mined (coinbase). Only the 5 non-coinbase is
+        // eligible to back a shielded change output.
+        auto* bals = new QMap<QString, double>(); (*bals)[T] = 9.0;
+        w->getRPC()->testSetBalances(bals);
+        auto* utxos = new QList<UnspentOutput>();
+        utxos->append(UnspentOutput{ T, "txid0", "5.0", 10,  true, /*coinbase=*/false });
+        utxos->append(UnspentOutput{ T, "txid1", "4.0", 100, true, /*coinbase=*/true  });
+        w->getRPC()->testSetUTXOs(utxos);
+        auto* zs = new QList<QString>(); zs->append(ZS);
+        w->getRPC()->testSetZAddresses(zs);
+
+        ui->inputsCombo->clear();
+        ui->inputsCombo->addItem(T, 9.0);
+        ui->inputsCombo->setCurrentIndex(0);
+        // Recipient is a DIFFERENT Sapling addr so ZS stays free as the change sink.
+        ui->Address1->setText("zs10m00rvkhfm4f7n23e4sxsx275r7ptnggx39ygl0vy46j9mdll5c97gl6dxgpk0njuptg2mn9w5s");
+        ui->Amount1->setText("3");
+
+        Tx tx = w->testCreateTxFromSendPage();
+
+        QVERIFY2(!tx.fromAddr.isEmpty(),
+                 "coinbase-excluded change must NOT abort: 5 non-coinbase ZCL covers 3 + fee");
+        bool changeToSapling = false;
+        for (const auto& to : tx.toAddrs) {
+            if (to.addr == ZS) {
+                changeToSapling = true;
+                // Based on the 5 NON-coinbase ZCL only: 5 - 3 - 0.0001 = 1.9999.
+                QVERIFY2(to.amount > 1.9 && to.amount < 2.0,
+                         qPrintable(QString("change must exclude coinbase (~1.9999), got: %1")
+                                    .arg(to.amount)));
+                // Integer-zatoshi EXACTNESS: exactly 199990000 zat, no float drift.
+                QCOMPARE((qint64)llround(to.amount * 1e8), (qint64)199990000);
+            }
+            QVERIFY2(to.addr != T,
+                     "PRIV-10: change must NEVER be routed back to a transparent address");
+        }
+        QVERIFY2(changeToSapling,
+                 "auto-shield change (from the non-coinbase balance) must route to Sapling");
+
+        QSettings().remove("options/autoshield");
+        QSettings().sync();
+        settleAndDelete(w);
+    }
+
+    // ---- P10: coinbase-only "shield everything" is NOT blocked (no change output) ------
+    // A miner shielding a coinbase-only t-address via "Send max" sends the whole balance
+    // to a single Sapling z-address with NO change -- the daemon legitimately consumes the
+    // coinbase UTXOs in full to that lone zaddr. The auto-shield path must NOT abort this
+    // (it has no non-coinbase change to shield) and must NOT fabricate a change output
+    // (which would make the tx multi-output and the coinbase unspendable). FAILS if the
+    // coinbase exclusion regresses this into a fail-closed abort or adds a stray output.
+    void p10_autoShieldCoinbaseOnlyShieldEverything() {
+        MainWindow* w = makeWindow();
+        auto* ui = w->ui;
+
+        const QString T  = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        const QString ZS = "zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u";
+
+        QSettings().setValue("options/autoshield", true);
+        QSettings().sync();
+
+        // T holds 4 ZCL, ALL of it mined (coinbase). No non-coinbase funds exist.
+        auto* bals = new QMap<QString, double>(); (*bals)[T] = 4.0;
+        w->getRPC()->testSetBalances(bals);
+        auto* utxos = new QList<UnspentOutput>();
+        utxos->append(UnspentOutput{ T, "txidcb", "4.0", 100, true, /*coinbase=*/true });
+        w->getRPC()->testSetUTXOs(utxos);
+        // Deliberately seed NO Sapling z-address: the no-change path must not need (nor
+        // try to create) a change sink. If the logic wrongly treated this as change>0 it
+        // would hit the fail-closed create and return an INVALID Tx -- caught below.
+        w->getRPC()->testSetZAddresses(new QList<QString>());
+
+        ui->inputsCombo->clear();
+        ui->inputsCombo->addItem(T, 4.0);
+        ui->inputsCombo->setCurrentIndex(0);
+        ui->Address1->setText(ZS);     // single Sapling recipient
+        ui->Amount1->setText("3.9999"); // send everything: 4.0 - 0.0001 fee
+
+        Tx tx = w->testCreateTxFromSendPage();
+
+        QVERIFY2(!tx.fromAddr.isEmpty(),
+                 "coinbase-only 'shield everything' must NOT abort (no non-coinbase change "
+                 "to shield; the daemon consumes the coinbase fully to the lone z-recipient)");
+        QCOMPARE(tx.toAddrs.size(), 1);                // recipient only, NO change output
+        QCOMPARE(tx.toAddrs[0].addr, ZS);
+        for (const auto& to : tx.toAddrs)
+            QVERIFY2(to.addr != T,
+                     "no transparent output may be built for a coinbase shield");
+
+        QSettings().remove("options/autoshield");
+        QSettings().sync();
+        settleAndDelete(w);
+    }
+
     // ---- P8: P0-2 — the at-rest "● Synced" pill ↔ loud banner swap ---------------
     // The headline visual-polish change: when fully caught up, the full-width
     // colored "Synced" bar is DEMOTED to a quiet inline pill (green lives on the

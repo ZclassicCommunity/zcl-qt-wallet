@@ -84,8 +84,8 @@ public:
     void testSetBalances(QMap<QString, double>* b) { delete allBalances; allBalances = b; }
     void testSetZAddresses(QList<QString>* z)       { delete zaddresses; zaddresses = z; }
     void testSetTAddresses(QList<QString>* t)       { delete taddresses; taddresses = t; }
-    // MAJOR-2: install the wallet's UTXO set so confirmedSpendableBalance() (the
-    // confirmed-only change basis) can be driven without a daemon.
+    // Install the wallet's UTXO set so confirmedSpendableZat() (the confirmed,
+    // non-coinbase change basis) can be driven without a daemon.
     void testSetUTXOs(QList<UnspentOutput>* u)      { delete utxos; utxos = u; }
     // MAJOR-3: control the result of the next newZaddr(true) sync-create. A non-empty
     // string makes the create SUCCEED (returns that address); leaving it empty makes

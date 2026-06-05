@@ -276,11 +276,12 @@ private:
     // ONLY ever returns a real Sapling address (never degrades to Sprout/transparent).
     QString findUnusedSaplingChangeAddr(const Tx& tx);
     QString createSaplingAddressSync();
-    // MAJOR-2: CONFIRMED (confirmations>0), spendable balance of `addr`, summed from
-    // the wallet's UTXO set. z_sendmany spends only confirmed notes, so this is the
-    // correct basis for the auto-shield change amount (getAllBalances() includes
-    // unconfirmed). Null-safe (returns 0 if UTXOs aren't loaded yet).
-    double  confirmedSpendableBalance(const QString& addr);
+    // CONFIRMED (confirmations>0), spendable balance of `addr` in integer zatoshis,
+    // summed from the wallet's UTXO set -- the correct, drift-free basis for the
+    // auto-shield change amount (z_sendmany spends only confirmed notes; getAllBalances()
+    // includes unconfirmed). includeCoinbase=false additionally excludes coinbase UTXOs to
+    // match the daemon's has-change input set. Null-safe (returns 0 if UTXOs not loaded).
+    qint64  confirmedSpendableZat(const QString& addr, bool includeCoinbase);
     // PRIV-27 one-shot: surface the Sprout-recipient "change stays transparent"
     // constraint at most once per run instead of nagging on every keystroke/build.
     bool sproutChangeWarned = false;

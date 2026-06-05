@@ -1198,10 +1198,16 @@ bool RPC::processUnspent(const json& reply, QMap<QString, double>* balancesMap, 
             anyUnconfirmed = true;
         }
 
+        // "generated" marks a coinbase UTXO (transparent listunspent only; z_listunspent
+        // omits it). The auto-shield change basis must exclude coinbase, since z_sendmany
+        // refuses to spend it to a transparent output or alongside change. (find()/end()
+        // is used rather than contains() -- the bundled nlohmann::json 3.3 predates it.)
+        bool coinbase = it.find("generated") != it.end() && it["generated"].get<json::boolean_t>();
+
         newUtxos->push_back(
             UnspentOutput{ qsAddr, QString::fromStdString(it["txid"]),
                             Settings::getDecimalString(it["amount"].get<json::number_float_t>()),
-                            (int)confirmations, it["spendable"].get<json::boolean_t>() });
+                            (int)confirmations, it["spendable"].get<json::boolean_t>(), coinbase });
 
         (*balancesMap)[qsAddr] = (*balancesMap)[qsAddr] + it["amount"].get<json::number_float_t>();
     }

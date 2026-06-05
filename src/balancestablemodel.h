@@ -6,9 +6,15 @@
 struct UnspentOutput {
     QString address;
     QString txid;
-    QString amount;    
+    QString amount;
     int     confirmations;
     bool    spendable;
+    // listunspent "generated": true for a coinbase UTXO. z_sendmany cannot spend
+    // coinbase to a transparent output or alongside change (consensus rule
+    // bad-txns-coinbase-spend-has-transparent-outputs), so the auto-shield change
+    // basis must EXCLUDE these. C++14 default member init keeps this an aggregate,
+    // so existing brace-initializers without the field still compile (coinbase=false).
+    bool    coinbase = false;
 };
 
 class BalancesTableModel : public QAbstractTableModel

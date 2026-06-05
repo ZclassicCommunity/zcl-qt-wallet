@@ -10,6 +10,16 @@
 
 using json = nlohmann::json;
 
+// Convert a ZCL amount to integer zatoshis (1 ZCL = 1e8 zat). Wallet money is otherwise
+// carried as double; the auto-shield change must be computed in integer zatoshis so the
+// daemon's selected inputs are consumed EXACTLY (a fraction-of-a-zatoshi drift would make
+// z_sendmany either reject the tx or emit a public transparent-change output). The input
+// MUST be a <=8-decimal-place amount (the send/fee QRegExpValidators guarantee this), so
+// llround is exact and no half-zatoshi tie can occur for any value within MAX_MONEY.
+static inline qint64 toZat(double zcl) {
+    return static_cast<qint64>(llround(zcl * 1e8));
+}
+
 void MainWindow::setupSendTab() {
     // Create the validator for send to/amount fields
     auto amtValidator = new QRegExpValidator(QRegExp("[0-9]{0,8}\\.?[0-9]{0,8}"));    
@@ -503,7 +513,6 @@ Tx MainWindow::createTxFromSendPage() {
 
     // For each addr/amt in the sendTo tab
     int totalItems = ui->sendToWidgets->children().size() - 2;   // The last one is a spacer, so ignore that
-    double totalAmt = 0;
     bool   sproutRecipient = false;
     for (int i=0; i < totalItems; i++) {
         QString addr = ui->sendToWidgets->findChild<QLineEdit*>(QString("Address") % QString::number(i+1))->text().trimmed();
@@ -516,7 +525,6 @@ Tx MainWindow::createTxFromSendPage() {
         sendChangeToSapling = sendChangeToSapling && !Settings::getInstance()->isSproutAddress(addr);
 
         double  amt  = ui->sendToWidgets->findChild<QLineEdit*>(QString("Amount")  % QString::number(i+1))->text().trimmed().toDouble();
-        totalAmt += amt;
         QString memo = ui->sendToWidgets->findChild<QLabel*>(QString("MemoTxt")  % QString::number(i+1))->text().trimmed();
 
         tx.toAddrs.push_back( ToFields{addr, amt, memo, memo.toUtf8().toHex()} );
@@ -548,73 +556,108 @@ Tx MainWindow::createTxFromSendPage() {
     }
 
     // PRIV-10 / PRIV-19 / PRIV-28 — auto-shield, FAIL CLOSED on privacy. With
-    // auto-shield ON and a transparent from-addr, the change MUST be routed to a
-    // Sapling z-address. If a usable Sapling address exists we use it; if NONE
-    // exists we auto-create one (synchronous newZaddr(true) -- the last-resort
-    // fallback per DECISION #2; the common case is covered by
-    // ensureSaplingProvisioned() at first funding). If a Sapling change address
-    // STILL cannot be obtained, we do NOT proceed silently (z_sendmany would then
-    // route the change to a PUBLIC t-address) -- we ABORT the send and return an
-    // INVALID Tx. Fail CLOSED, never open.
+    // auto-shield ON and a transparent from-addr, any change MUST be routed to a
+    // Sapling z-address, never left on a PUBLIC t-address.
+    //
+    // The change amount is computed in INTEGER ZATOSHIS against the exact set of UTXOs
+    // z_sendmany will actually spend. Three daemon facts drive this (verified against
+    // the running daemon and its source); getting any of them wrong is what made the
+    // old double-arithmetic, coinbase-blind change either bounce with "insufficient
+    // funds" or leak a public transparent-change output:
+    //   1. z_sendmany has NO change-address parameter: taddr change ALWAYS flows to a
+    //      fresh keypool t-addr. The only way to shield it is to hand-build an explicit
+    //      Sapling output that consumes the spendable inputs EXACTLY (so the daemon's
+    //      own residual change is 0). Integer math removes the float drift that
+    //      otherwise left a few stray zatoshis as public change.
+    //   2. The daemon will NOT spend COINBASE UTXOs in a multi-output / has-change send
+    //      (consensus forbids coinbase->transparent; it spends coinbase only to a single
+    //      zaddr, whole value consumed). So the eligible set EXCLUDES coinbase, matching
+    //      the daemon's find_utxos(false) selection. (On ZClassic mainnet Overwinter is
+    //      active, so the daemon's t-input count cap is 0 and the eligible set is spent
+    //      in full with no truncation.)
+    //   3. z_sendmany spends ONLY confirmed notes (minconf 1), so unconfirmed UTXOs are
+    //      excluded -- a change based on getAllBalances() (which sums unconfirmed) would
+    //      be unfundable.
     if (Settings::getInstance()->getAutoShield() && sendChangeToSapling) {
-        QString changeAddr = findUnusedSaplingChangeAddr(tx);
+        // Eligible = CONFIRMED, spendable, NON-coinbase (what the daemon spends for a
+        // has-change send). The coinbase-inclusive total is the affordability ceiling:
+        // the daemon CAN spend coinbase, but only to a single zaddr with full
+        // consumption (no change), so it is fundable even when not "eligible" for change.
+        const qint64 eligibleZat       = confirmedSpendableZat(tx.fromAddr, /*includeCoinbase=*/false);
+        const qint64 confirmedTotalZat = confirmedSpendableZat(tx.fromAddr, /*includeCoinbase=*/true);
 
-        // No existing usable Sapling address -> create one NOW. This is a blocking
-        // RPC, but only on the (rare) first-ever send before any Sapling key exists.
-        if (changeAddr.isEmpty())
-            changeAddr = createSaplingAddressSync();
+        qint64 sendZat = 0;
+        for (const ToFields& t : tx.toAddrs)        // recipients only -- change not added yet
+            sendZat += toZat(t.amount);
+        const qint64 targetZat = sendZat + toZat(tx.fee);
 
-        if (changeAddr.isEmpty()) {
-            // MAJOR-1 fail-closed: we could not obtain a Sapling change sink, so the
-            // change would otherwise stay PUBLIC. Surface a blocking warning (mirrors
-            // shieldPublicFunds()'s style) and abort by returning an invalid Tx.
-            QMessageBox::warning(this, tr("Could not shield"),
-                tr("Could not shield — a Sapling change address could not be created, "
-                   "so your change would stay PUBLIC. Please try again in a moment."),
-                QMessageBox::Ok);
-            return Tx();   // invalid: empty fromAddr -> doSendTxValidations aborts the send
-        }
-
-        // MAJOR-2 funds-safety: base the change on the CONFIRMED, spendable balance of
-        // the from-addr. getAllBalances() SUMS unconfirmed (confirmations==0) utxos,
-        // but z_sendmany spends ONLY confirmed notes, so a change computed from the
-        // unconfirmed-inclusive total would emit an UNFUNDABLE change output and the
-        // daemon would reject the whole tx with insufficient-funds. If the confirmed
-        // spendable balance can't cover amount+fee, surface the existing not-enough-
-        // funds message UP FRONT and abort rather than emitting an unfundable change.
-        const double confirmed = confirmedSpendableBalance(tx.fromAddr);
-        if (confirmed < totalAmt + tx.fee) {
+        // Not enough CONFIRMED funds (coinbase included) to cover amount+fee. Surface the
+        // friendly message UP FRONT and abort rather than letting the daemon reject later.
+        if (targetZat > confirmedTotalZat) {
             QMessageBox::critical(this, tr("Transaction Error"),
                 tr("Not enough confirmed funds. You're trying to send %1 (including the "
                    "fee), but this address only holds %2 in confirmed, spendable funds. "
                    "Wait for your incoming funds to confirm and try again.")
-                   .arg(Settings::getZCLDisplayFormat(totalAmt + tx.fee))
-                   .arg(Settings::getZCLDisplayFormat(confirmed)),
+                   .arg(Settings::getZCLDisplayFormat((double)targetZat / 1e8))
+                   .arg(Settings::getZCLDisplayFormat((double)confirmedTotalZat / 1e8)),
                 QMessageBox::Ok);
-            return Tx();   // invalid: abort the send
+            return Tx();   // invalid: empty fromAddr -> sendButton aborts the send
         }
 
-        double change = confirmed - totalAmt - tx.fee;
-        if (Settings::getDecimalString(change) != "0") {
+        const qint64 changeZat = eligibleZat - targetZat;
+        if (changeZat > 0) {
+            // There is non-coinbase change to shield. Route it to a Sapling z-address;
+            // the extra output keeps the send multi-output, so the daemon stays on its
+            // non-coinbase selection path and consumes the eligible set exactly --
+            // residual 0, no public transparent change.
+            QString changeAddr = findUnusedSaplingChangeAddr(tx);
+
+            // No existing usable Sapling address -> create one NOW. Blocking RPC, but only
+            // on the (rare) first-ever send before any Sapling key exists; the common case
+            // is covered by ensureSaplingProvisioned() at first funding.
+            if (changeAddr.isEmpty())
+                changeAddr = createSaplingAddressSync();
+
+            if (changeAddr.isEmpty()) {
+                // Fail CLOSED: with no Sapling change sink the change would otherwise stay
+                // PUBLIC. Surface a blocking warning and abort with an invalid Tx.
+                QMessageBox::warning(this, tr("Could not shield"),
+                    tr("Could not shield — a Sapling change address could not be created, "
+                       "so your change would stay PUBLIC. Please try again in a moment."),
+                    QMessageBox::Ok);
+                return Tx();   // invalid: empty fromAddr -> sendButton aborts the send
+            }
+
             QString changeMemo = tr("Change from ") + tx.fromAddr;
-            tx.toAddrs.push_back(ToFields{ changeAddr, change, changeMemo, changeMemo.toUtf8().toHex() });
+            tx.toAddrs.push_back(ToFields{ changeAddr, (double)changeZat / 1e8,
+                                           changeMemo, changeMemo.toUtf8().toHex() });
         }
+        // changeZat <= 0: the send consumes all eligible non-coinbase funds (and, for a
+        // single z-recipient "shield everything", possibly coinbase too). We add NO change
+        // output: a non-positive change is not a real output, and the daemon never emits
+        // transparent change in this shape -- it fully shields to the lone z-recipient
+        // (change 0) or rejects the send outright, so it can never silently leak. (A
+        // coinbase-only address shielded via "Send max" lands here and succeeds.)
     }
 
     return tx;
 }
 
-// MAJOR-2 — sum the CONFIRMED (confirmations > 0), spendable UTXOs the GUI already
-// holds for `addr`. z_sendmany only spends confirmed notes, so this (not the
-// unconfirmed-inclusive getAllBalances() total) is the correct basis for the
-// auto-shield change amount. Null-safe: returns 0 if the UTXO set isn't loaded yet.
-double MainWindow::confirmedSpendableBalance(const QString& addr) {
+// Sum, in integer zatoshis, the CONFIRMED (confirmations > 0), spendable UTXOs the GUI
+// holds for `addr`. z_sendmany spends only confirmed notes, so this -- not the
+// unconfirmed-inclusive getAllBalances() total -- is the correct basis for the auto-shield
+// change. With includeCoinbase=false the result also excludes coinbase UTXOs, matching the
+// daemon's input set for a has-change (multi-output) send; includeCoinbase=true gives the
+// full confirmed-spendable ceiling (the daemon can still spend coinbase, but only to a
+// single zaddr with full consumption). Null-safe: returns 0 if the UTXO set isn't loaded.
+qint64 MainWindow::confirmedSpendableZat(const QString& addr, bool includeCoinbase) {
     if (!rpc || !rpc->getUTXOs())
-        return 0.0;
-    double sum = 0.0;
+        return 0;
+    qint64 sum = 0;
     for (const UnspentOutput& u : *rpc->getUTXOs()) {
-        if (u.address == addr && u.confirmations > 0 && u.spendable)
-            sum += u.amount.toDouble();
+        if (u.address == addr && u.confirmations > 0 && u.spendable
+                && (includeCoinbase || !u.coinbase))
+            sum += toZat(u.amount.toDouble());
     }
     return sum;
 }
