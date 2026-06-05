@@ -1282,6 +1282,97 @@ private slots:
         settleAndDelete(w);
     }
 
+    // ---- P17: exact non-coinbase consume with IDLE COINBASE is race-guarded --------------
+    // changeZat==0 leg: target == the non-coinbase eligible set while coinbase sits idle
+    // (target < confirmedTotal). No change row is built, but the daemon funds the non-coinbase
+    // set EXACTLY (zero change) -- a clean, fundable shield, race-prone like changeZat>0: if a
+    // non-coinbase UTXO confirms during the dwell, the surplus leaks as PUBLIC change. The
+    // ELIGIBLE guard must arm and the gate must abort on a grown eligible set. (Regression for
+    // the review-found unguarded leak leg; the prior comment wrongly claimed "nothing to guard".)
+    void p17_autoShieldExactNonCoinbaseConsumeRaceGuard() {
+        MainWindow* w = makeWindow(); auto* ui = w->ui;
+        const QString T = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        const QString R = "zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u";
+
+        QSettings().setValue("options/autoshield", true); QSettings().sync();
+
+        // 5 non-coinbase + 4 coinbase. Send EXACTLY the non-coinbase 5 (4.9999 + 0.0001 fee).
+        auto* bals = new QMap<QString, double>(); (*bals)[T] = 9.0;
+        w->getRPC()->testSetBalances(bals);
+        auto* utxos = new QList<UnspentOutput>();
+        utxos->append(UnspentOutput{ T, "nc0", "5.0", 10,  true, /*coinbase=*/false });
+        utxos->append(UnspentOutput{ T, "cb0", "4.0", 100, true, /*coinbase=*/true  });
+        w->getRPC()->testSetUTXOs(utxos);
+        auto* zs = new QList<QString>(); zs->append(R);
+        w->getRPC()->testSetZAddresses(zs);
+        ui->inputsCombo->clear(); ui->inputsCombo->addItem(T, 9.0); ui->inputsCombo->setCurrentIndex(0);
+        ui->Address1->setText(R); ui->Amount1->setText("4.9999");
+
+        Tx tx = w->testCreateTxFromSendPage();
+        QVERIFY2(!tx.fromAddr.isEmpty(), "exact non-coinbase consume must not abort");
+        QCOMPARE(tx.toAddrs.size(), 1);                       // recipient only, NO change row
+        QVERIFY2(tx.autoShieldGuardActive && !tx.autoShieldFullConsume,
+                 "changeZat==0 with idle coinbase must arm the ELIGIBLE guard (not full-consume)");
+        QCOMPARE(tx.builtEligibleZat, (qint64)500000000);     // sized against the 5.0 non-coinbase
+        for (const auto& to : tx.toAddrs)
+            QVERIFY2(to.addr != T, "no transparent output for the exact-consume shield");
+
+        // (a) eligible GREW (a 2.0 non-coinbase confirmed during the dwell) -> MUST abort.
+        {
+            auto* grown = new QList<UnspentOutput>();
+            grown->append(UnspentOutput{ T, "nc0", "5.0", 10,  true, false });
+            grown->append(UnspentOutput{ T, "cb0", "4.0", 100, true, true  });
+            grown->append(UnspentOutput{ T, "nc1", "2.0", 10,  true, false });
+            w->getRPC()->testSetRepollUTXOs(grown);
+            armModalDismisser();
+            QVERIFY2(!w->testVerifyAutoShield(tx),
+                     "a grown non-coinbase eligible set MUST abort (surplus would leak public change)");
+        }
+        // (b) UNCHANGED -> the send proceeds.
+        {
+            auto* same = new QList<UnspentOutput>();
+            same->append(UnspentOutput{ T, "nc0", "5.0", 10,  true, false });
+            same->append(UnspentOutput{ T, "cb0", "4.0", 100, true, true  });
+            w->getRPC()->testSetRepollUTXOs(same);
+            QVERIFY2(w->testVerifyAutoShield(tx), "an unchanged eligible set => gate passes");
+        }
+
+        QSettings().remove("options/autoshield"); QSettings().sync();
+        settleAndDelete(w);
+    }
+
+    // ---- P18: doSendTxValidations must use INTEGER zatoshis (no float false-abort) --------
+    // A "send max" / shield of the whole balance makes amount+fee == balance, which floats a
+    // fraction-of-a-zatoshi ABOVE the balance (0.1199 + 0.0001 -> 0.120000000002 vs a 0.12
+    // balance -> 0.119999999996). The generic insufficient-funds guard must NOT false-abort
+    // "Not enough funds" — the exact dead-end the user hit on the combined bundle.
+    void p18_doSendTxValidationsNoFloatFalseAbort() {
+        MainWindow* w = makeWindow();
+        const QString T = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        const QString R = "zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u";
+
+        auto* bals = new QMap<QString, double>(); (*bals)[T] = 0.12;
+        w->getRPC()->testSetBalances(bals);
+        auto* utxos = new QList<UnspentOutput>();
+        utxos->append(UnspentOutput{ T, "txid0", "0.12", 56, true, /*coinbase=*/false });
+        w->getRPC()->testSetUTXOs(utxos);
+
+        Tx tx; tx.fromAddr = T; tx.fee = 0.0001;
+        ToFields f; f.addr = R; f.amount = 0.1199;            // Max shield: 0.1199 + 0.0001 == 0.12
+        tx.toAddrs.append(f);
+
+        const QString err = w->doSendTxValidations(tx);
+        QVERIFY2(err.isEmpty(),
+                 qPrintable("shielding the whole balance (amount+fee==balance) must NOT false-abort: " + err));
+
+        // And a genuine overspend STILL aborts (don't over-correct): send 0.13 of a 0.12 balance.
+        Tx over; over.fromAddr = T; over.fee = 0.0001;
+        ToFields g; g.addr = R; g.amount = 0.13; over.toAddrs.append(g);
+        QVERIFY2(!w->doSendTxValidations(over).isEmpty(), "a real overspend must still be blocked");
+
+        settleAndDelete(w);
+    }
+
     // ---- P8: P0-2 — the at-rest "● Synced" pill ↔ loud banner swap ---------------
     // The headline visual-polish change: when fully caught up, the full-width
     // colored "Synced" bar is DEMOTED to a quiet inline pill (green lives on the

@@ -734,11 +734,21 @@ Tx MainWindow::createTxFromSendPage() {
             tx.autoShieldGuardActive = true;
             tx.autoShieldFullConsume = true;
             tx.builtTargetZat        = targetZat;
+        } else {
+            // changeZat == 0 with coinbase left idle (targetZat == eligibleZat <
+            // confirmedTotalZat). This leg is ONLY ever the exact non-coinbase consume: a
+            // changeZat < 0 (targetZat > eligibleZat) that is not the targetZat==confirmedTotal
+            // shield was already band-aborted above. The daemon funds the non-coinbase eligible
+            // set EXACTLY with ZERO change -- a clean, fundable shielding tx (NOT a reject) --
+            // so it is race-prone exactly like the changeZat>0 path: if a non-coinbase t-UTXO
+            // confirms at the from-addr during the confirm dwell, the live eligible set grows
+            // and the daemon emits the surplus as PUBLIC transparent change. Arm the
+            // eligible-set guard so verifyAutoShieldUnchanged() re-polls and aborts fail-closed
+            // if the live non-coinbase eligible total moved.
+            tx.autoShieldGuardActive = true;
+            tx.builtEligibleZat      = eligibleZat;
+            tx.builtTargetZat        = targetZat;
         }
-        // Remaining changeZat <= 0 (targetZat < confirmedTotalZat): coinbase is present and
-        // the spend consumes exactly the non-coinbase eligible set, leaving coinbase behind.
-        // The daemon cannot fund a clean transparent-free spend in this shape (it rejects),
-        // so there is no surplus that could leak -- nothing to guard.
     }
 
     return tx;
@@ -1345,11 +1355,18 @@ QString MainWindow::doSendTxValidations(Tx tx) {
     if (!Settings::getInstance()->isSyncing()) {
         auto bals = rpc ? rpc->getAllBalances() : nullptr;
         if (bals && bals->contains(tx.fromAddr)) {
-            double displayed = bals->value(tx.fromAddr);          // minconf=0 total (incl. 0-conf)
-            double confirmed = spendableOrFallback(tx.fromAddr);  // confirmed-spendable, fails open
-            double total     = tx.fee;
+            // Compare in INTEGER ZATOSHIS, never double. A "send max" / shield makes
+            // total == amount+fee land a fraction-of-a-zatoshi ABOVE the balance in IEEE-754
+            // (e.g. 0.1199 + 0.0001 -> 0.120000000002 vs a 0.12 balance -> 0.119999999996),
+            // which false-aborts "Not enough funds" with BOTH sides displaying "0.12" -- the
+            // exact dead-end the user hit. Rounding each value to the nearest zatoshi removes
+            // the drift (the spendableOrFallback -> confirmedSpendableZat rewire fixed the
+            // auto-shield block but NOT this generic guard).
+            const qint64 displayedZat = toZat(bals->value(tx.fromAddr));    // minconf=0 total
+            const qint64 confirmedZat = toZat(spendableOrFallback(tx.fromAddr));
+            qint64 totalZat = toZat(tx.fee);
             for (auto toAddr : tx.toAddrs)
-                total += toAddr.amount;
+                totalZat += toZat(toAddr.amount);
 
             // Three-way guard so the user is never dead-ended:
             //  1) confirmed >= total            -> PASS (proceed exactly as today). NEVER
@@ -1361,21 +1378,20 @@ QString MainWindow::doSendTxValidations(Tx tx) {
             //                                       today's "only holds %2" message.
             // The daemon's own insufficient-funds rejection (mapped by humaneSendError)
             // remains the final backstop; this is just an EARLIER, friendlier check.
-            if (confirmed >= total) {
+            if (confirmedZat >= totalZat) {
                 // ok -- fall through, do not block
             }
-            else if (displayed >= total) {
-                double stillConfirming = total - confirmed;
-                if (stillConfirming < 0) stillConfirming = 0;
+            else if (displayedZat >= totalZat) {
+                const qint64 stillZat = (totalZat > confirmedZat) ? (totalZat - confirmedZat) : 0;
                 return tr("%1 of these funds is still confirming (about a few minutes). "
                           "You can shield or send it as soon as it confirms.")
-                       .arg(Settings::getZCLDisplayFormat(stillConfirming));
+                       .arg(Settings::getZCLDisplayFormat((double)stillZat / 1e8));
             }
             else {
                 return tr("Not enough funds. You're trying to send %1 (including the fee), "
                           "but this address only holds %2.")
-                       .arg(Settings::getZCLDisplayFormat(total))
-                       .arg(Settings::getZCLDisplayFormat(displayed));
+                       .arg(Settings::getZCLDisplayFormat((double)totalZat / 1e8))
+                       .arg(Settings::getZCLDisplayFormat((double)displayedZat / 1e8));
             }
         }
     }
