@@ -1028,8 +1028,11 @@ private slots:
             Tx tx = w->testCreateTxFromSendPage();
             QVERIFY2(!tx.fromAddr.isEmpty(), "exact-spend boundary must not abort");
             QCOMPARE(tx.toAddrs.size(), 1);                       // recipient only, NO change row
-            QVERIFY2(!tx.autoShieldGuardActive, "no change output => snapshot guard inactive");
-            QVERIFY2(w->testVerifyAutoShield(tx), "inactive guard => gate passes without re-poll");
+            // No change output, but the WHOLE confirmed balance is consumed -> the full-
+            // consume race guard arms: a UTXO confirming during the dwell would let the daemon
+            // leave a surplus as public change, so the gate re-verifies the total before send.
+            QVERIFY2(tx.autoShieldGuardActive && tx.autoShieldFullConsume,
+                     "exact full-consume (no change) must arm the full-consume race guard");
             settleAndDelete(w);
         }
         // (b) +1 zatoshi: eligible 3.00010001 -> a 1-zat change row is built and the gate arms.
@@ -1121,6 +1124,61 @@ private slots:
         QVERIFY2(tx.fromAddr.isEmpty(),
                  "partial coinbase spend (target in (eligible, total]) must abort with the "
                  "shield-mined-funds message, not silently build a doomed tx");
+
+        QSettings().remove("options/autoshield"); QSettings().sync();
+        settleAndDelete(w);
+    }
+
+    // ---- P16: full-consume "shield everything" is ALSO race-guarded ---------------------
+    // A single-Sapling-recipient shield of the whole (mixed coinbase + non-coinbase) balance
+    // builds NO change output, but is still leak-prone: if a non-coinbase UTXO confirms during
+    // the dwell the daemon can fund the frozen amount from non-coinbase alone and leave the
+    // surplus as PUBLIC change. The full-consume guard must arm and the gate must abort on a
+    // grown total (regression guard for the reviewer-found leak in the exemption path).
+    void p16_autoShieldFullConsumeRaceAborts() {
+        MainWindow* w = makeWindow(); auto* ui = w->ui;
+        const QString T = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        const QString R = "zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u";
+
+        QSettings().setValue("options/autoshield", true); QSettings().sync();
+
+        // T holds 3 non-coinbase + 2 coinbase (total 5). Shield EVERYTHING to one zs recipient.
+        auto* bals = new QMap<QString, double>(); (*bals)[T] = 5.0;
+        w->getRPC()->testSetBalances(bals);
+        auto* utxos = new QList<UnspentOutput>();
+        utxos->append(UnspentOutput{ T, "nc0", "3.0", 10,  true, /*coinbase=*/false });
+        utxos->append(UnspentOutput{ T, "cb0", "2.0", 100, true, /*coinbase=*/true  });
+        w->getRPC()->testSetUTXOs(utxos);
+        auto* zs = new QList<QString>(); zs->append(R);
+        w->getRPC()->testSetZAddresses(zs);
+        ui->inputsCombo->clear(); ui->inputsCombo->addItem(T, 5.0); ui->inputsCombo->setCurrentIndex(0);
+        ui->Address1->setText(R); ui->Amount1->setText("4.9999");   // whole balance minus fee
+
+        Tx tx = w->testCreateTxFromSendPage();
+        QVERIFY2(tx.autoShieldGuardActive && tx.autoShieldFullConsume,
+                 "mixed full-consume shield must arm the full-consume race guard");
+        QCOMPARE(tx.toAddrs.size(), 1);                            // recipient only, NO change row
+        QVERIFY2(tx.builtTargetZat == (qint64)500000000, "full-consume target is the whole 5.0 ZCL");
+
+        // (a) total GREW (a 2.5 non-coinbase confirmed during the dwell) -> MUST abort.
+        {
+            auto* grown = new QList<UnspentOutput>();
+            grown->append(UnspentOutput{ T, "nc0", "3.0", 10,  true, false });
+            grown->append(UnspentOutput{ T, "cb0", "2.0", 100, true, true  });
+            grown->append(UnspentOutput{ T, "nc1", "2.5", 10,  true, false });
+            w->getRPC()->testSetRepollUTXOs(grown);
+            armModalDismisser();
+            QVERIFY2(!w->testVerifyAutoShield(tx),
+                     "a grown total in a full-consume send MUST abort (surplus would leak public change)");
+        }
+        // (b) total UNCHANGED -> the send still proceeds.
+        {
+            auto* same = new QList<UnspentOutput>();
+            same->append(UnspentOutput{ T, "nc0", "3.0", 10,  true, false });
+            same->append(UnspentOutput{ T, "cb0", "2.0", 100, true, true  });
+            w->getRPC()->testSetRepollUTXOs(same);
+            QVERIFY2(w->testVerifyAutoShield(tx), "an unchanged total => full-consume gate passes");
+        }
 
         QSettings().remove("options/autoshield"); QSettings().sync();
         settleAndDelete(w);

@@ -33,15 +33,18 @@ struct Tx {
     QList<ToFields> toAddrs;
     double          fee;
 
-    // Snapshot-race guard. Stamped ONLY by createTxFromSendPage()'s auto-shield branch
-    // when it builds an explicit Sapling change output; the pre-send gate
-    // (verifyAutoShieldUnchanged) re-polls the from-addr and ABORTS if the live eligible
-    // set no longer matches, so a surplus that confirmed during the confirm dwell cannot
-    // escape as PUBLIC transparent change. Default-off keeps every other send (z-from,
-    // auto-shield off, Sprout recipient, coinbase-only "shield everything") byte-identical:
-    // the gate early-returns true and never re-polls. C++14 default member initializers
-    // keep Tx an aggregate, so the positional Tx{from, to, fee} brace-inits still compile.
-    bool   autoShieldGuardActive = false;  // true only when an explicit Sapling change was built
+    // Snapshot-race guard. Stamped by createTxFromSendPage()'s auto-shield branch whenever
+    // the daemon could emit PUBLIC transparent change at send time -- i.e. an explicit
+    // Sapling change output was built (autoShieldFullConsume=false), OR the send consumes the
+    // whole confirmed balance with no change (autoShieldFullConsume=true). The pre-send gate
+    // (verifyAutoShieldUnchanged) re-polls and ABORTS if the relevant live total no longer
+    // matches what we sized against, so a surplus that confirms during the confirm dwell
+    // cannot escape as public change. Default-off keeps non-auto-shield sends (z-from, auto-
+    // shield off, Sprout recipient) byte-identical: the gate early-returns true, no re-poll.
+    // C++14 default member initializers keep Tx an aggregate, so the positional
+    // Tx{from, to, fee} brace-inits still compile.
+    bool   autoShieldGuardActive = false;  // re-verify before the irrevocable z_sendmany
+    bool   autoShieldFullConsume = false;  // true: no-change full balance spend (check total)
     qint64 builtEligibleZat      = 0;      // confirmedSpendableZat(fromAddr,false) at build time
     qint64 builtTargetZat        = 0;      // recipients (excl. change row) + fee, at build time
 };

@@ -667,15 +667,22 @@ Tx MainWindow::createTxFromSendPage() {
             tx.autoShieldGuardActive = true;
             tx.builtEligibleZat      = eligibleZat;
             tx.builtTargetZat        = targetZat;
+        } else if (targetZat == confirmedTotalZat) {
+            // Full-consume "shield everything": no change output -- the daemon consumes the
+            // WHOLE confirmed balance to the lone recipient (this is the single-Sapling-
+            // recipient shield, and the only changeZat<=0 case the band-abort lets through).
+            // Still race-prone: the recipient amount is frozen at build, so if ANY UTXO
+            // confirms at the from-addr during the dwell the live total exceeds it and the
+            // daemon can fund the frozen amount while leaving the surplus as PUBLIC change.
+            // Arm the guard to re-verify the live confirmed TOTAL is unchanged before sending.
+            tx.autoShieldGuardActive = true;
+            tx.autoShieldFullConsume = true;
+            tx.builtTargetZat        = targetZat;
         }
-        // changeZat <= 0: the send consumes all eligible non-coinbase funds (and, for a
-        // single z-recipient "shield everything", possibly coinbase too). We add NO change
-        // output: a non-positive change is not a real output, and the daemon emits no
-        // transparent change in this shape -- it fully shields to the lone z-recipient
-        // (change 0) or rejects the send outright. (A coinbase-only address shielded via
-        // "Send max" lands here and succeeds.) No change output is built, so the snapshot
-        // guard is left inactive here -- there is no shielded-change amount whose basis
-        // could go stale.
+        // Remaining changeZat <= 0 (targetZat < confirmedTotalZat): coinbase is present and
+        // the spend consumes exactly the non-coinbase eligible set, leaving coinbase behind.
+        // The daemon cannot fund a clean transparent-free spend in this shape (it rejects),
+        // so there is no surplus that could leak -- nothing to guard.
     }
 
     return tx;
@@ -712,18 +719,24 @@ MainWindow::RepollResult MainWindow::repollFromAddrUtxos() {
     autoShieldRepollInFlight = true;
     struct ClearGuard { bool* f; ~ClearGuard() { *f = false; } } _clr{ &autoShieldRepollInFlight };
 
-    bool done = false;
+    // `done` is a shared_ptr, NOT a stack bool captured by reference: the production
+    // listunspent reply is an async Qt slot that is NOT cancelled if our bounded pump times
+    // out. A by-ref capture would let that late reply write into this frame's destroyed stack
+    // (use-after-free). The shared_ptr keeps the flag alive for the late writer; on timeout we
+    // simply ignore it (the send aborts fail-closed) and the heap flag is freed when the last
+    // owner -- the outstanding callback -- runs.
+    auto done = std::make_shared<bool>(false);
     // Fire the re-poll. In production this returns immediately (the listunspent reply lands
     // during the pump below); in the L1 test build the injected set is applied synchronously
-    // (done==true before the loop). false => could not fire (no connection / no test seam).
-    if (!rpc->repollTransparentUnspent([&](bool ok){ done = ok; }))
+    // (*done==true before the loop). false => could not fire (no connection / no test seam).
+    if (!rpc->repollTransparentUnspent([done](bool ok){ *done = ok; }))
         return RepollResult::NoConnection;
 
     QElapsedTimer t; t.start();
-    while (!done && rpc->getConnection() && t.elapsed() < 8000)
+    while (!*done && rpc->getConnection() && t.elapsed() < 8000)
         QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 50);
 
-    if (done)
+    if (*done)
         return RepollResult::Refreshed;
     return rpc->getConnection() ? RepollResult::Timeout : RepollResult::NoConnection;
 }
@@ -744,6 +757,21 @@ bool MainWindow::verifyAutoShieldUnchanged(const Tx& tx) {
         QMessageBox::warning(this, tr("Could not verify balance"),
             tr("Your balance could not be re-checked before sending, so for your privacy "
                "the transaction was NOT sent. Please try again in a moment."),
+            QMessageBox::Ok);
+        return false;
+    }
+
+    // Full-consume (no change) send: safe only while the live confirmed TOTAL still equals
+    // exactly what we sized the spend against. Any new confirmation grows the total beyond
+    // the frozen amount -> the daemon can fund the amount and leave the surplus as PUBLIC
+    // change -> abort. (A coinbase-inclusive total is the right basis: the daemon draws the
+    // whole balance to the single z-recipient.)
+    if (tx.autoShieldFullConsume) {
+        if (confirmedSpendableZat(tx.fromAddr, /*includeCoinbase=*/true) == tx.builtTargetZat)
+            return true;                               // still an exact full consume -> SAFE
+        QMessageBox::warning(this, tr("Balance changed — not sent"),
+            tr("Your balance for this address changed while you were confirming. For your "
+               "privacy the transaction was NOT sent. Please review the amounts and send again."),
             QMessageBox::Ok);
         return false;
     }
