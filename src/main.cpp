@@ -506,6 +506,47 @@ int main(int argc, char* argv[])
         // Leave Qt's probe alone; the offscreen fallback (if compiled in) or Qt's
         // own error path handles it. Do not force xcb into an abort.
     }
+
+    // ROOT-CAUSE FIX for the "Loading locale" -> SIGSEGV at first font lookup on fresh
+    // distros (Fedora 39+/Arch, e.g. bob@t14). This single-file bundle STATICALLY links
+    // Ubuntu-20.04 fontconfig 2.13 (cache version 7); on a host running fontconfig 2.14+
+    // (cache version 9) the old lib faults while parsing the newer /etc/fonts config tree
+    // and reading foreign-version caches on the FIRST QFontDatabase population. We point
+    // fontconfig at our OWN minimal config: it still scans the host font *directories*
+    // (so real fonts are available for fallback), but uses an app-private cachedir and
+    // does NOT <include> the host /etc/fonts/conf.d -- so the old static lib never touches
+    // the incompatible host config/cache. Only-if-unset preserves a power-user override.
+    if (!qEnvironmentVariableIsSet("FONTCONFIG_FILE")) {
+        const QString fcDir   = QDir::homePath() + "/.cache/zcl-qt-wallet";
+        const QString fcCache = fcDir + "/fontconfig";
+        const QString fcConf  = fcDir + "/fonts.conf";
+        if (QDir().mkpath(fcCache)) {
+            QFile cf(fcConf);
+            if (cf.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                QByteArray xml =
+                    "<?xml version=\"1.0\"?>\n"
+                    "<!DOCTYPE fontconfig SYSTEM \"fonts.dtd\">\n"
+                    "<fontconfig>\n"
+                    "  <dir>/usr/share/fonts</dir>\n"
+                    "  <dir>/usr/local/share/fonts</dir>\n"
+                    "  <dir prefix=\"xdg\">fonts</dir>\n"
+                    "  <dir>~/.fonts</dir>\n"
+                    "  <cachedir>" + fcCache.toUtf8() + "</cachedir>\n"
+                    "  <config></config>\n"
+                    "</fontconfig>\n";
+                cf.write(xml);
+                cf.close();
+                qputenv("FONTCONFIG_FILE", fcConf.toUtf8());
+            }
+        }
+    }
+
+    // This widget-only wallet needs no OpenGL context, but Qt's xcb plugin creates a
+    // GLX/EGL "dummy context" at first window-map -- which can SIGSEGV inside a foreign
+    // host GPU driver stack. Disable it; Qt Widgets render via the raster backing store.
+    // Only-if-unset so a power user can re-enable GL.
+    if (!qEnvironmentVariableIsSet("QT_XCB_GL_INTEGRATION"))
+        qputenv("QT_XCB_GL_INTEGRATION", QByteArray("none"));
 #endif
 
     Application app;
