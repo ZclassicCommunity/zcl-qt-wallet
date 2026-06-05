@@ -490,9 +490,12 @@ void MainWindow::memoButtonClicked(int number, bool includeReplyTo) {
         fnAddReplyTo();
 
     if (dialog.exec() == QDialog::Accepted) {
-        QString m = memoDialog.memoTxt->toPlainText().trimmed();
-        // Label the note so the line under the amount reads as a "Private note", not stray text.
-        memoTxt->setText(m.isEmpty() ? QString() : tr("Private note: ") % m);
+        // MONEY-SAFETY: store the RAW memo only. createTxFromSendPage reads this exact
+        // QLabel verbatim as the on-chain memo (and hex-encodes it), so ANY decoration
+        // here would be SENT on-chain, accumulate on re-edit, and escape the 512-byte
+        // dialog limit. The "private note" framing lives in the button label + tooltips,
+        // never in the payload text.
+        memoTxt->setText(memoDialog.memoTxt->toPlainText());
     }
 }
 
