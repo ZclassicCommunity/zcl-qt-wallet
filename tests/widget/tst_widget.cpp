@@ -878,6 +878,85 @@ private slots:
         settleAndDelete(w);
     }
 
+    // ---- P11: SAFE-RACE — the pre-send gate aborts when the eligible set diverges ------
+    // The auto-shield change is sized against the GUI's cached UTXO snapshot but the
+    // z_sendmany fires later (after the confirm dwell). If a confirmed non-coinbase t-UTXO
+    // lands at the from-addr in that gap, the daemon would re-select a larger live set and
+    // emit the surplus as PUBLIC transparent change. verifyAutoShieldUnchanged() re-polls
+    // (via the injected testSetRepollUTXOs seam) right before send and MUST abort on any
+    // divergence, proceed when unchanged, and be a no-op for non-auto-shield sends.
+    void p11_autoShieldGateAbortsOnSnapshotRace() {
+        const QString T  = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        const QString ZS = "zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u";
+        const QString RECIP = "zs10m00rvkhfm4f7n23e4sxsx275r7ptnggx39ygl0vy46j9mdll5c97gl6dxgpk0njuptg2mn9w5s";
+
+        QSettings().setValue("options/autoshield", true);
+        QSettings().sync();
+
+        // Build an auto-shield-change Tx: T holds 5 ZCL (non-coinbase), send 3 to RECIP,
+        // change 1.9999 -> ZS. The build stamps autoShieldGuardActive + builtEligibleZat=5e8.
+        auto buildGuardedTx = [&](MainWindow* w) -> Tx {
+            auto* ui = w->ui;
+            auto* bals = new QMap<QString, double>(); (*bals)[T] = 5.0;
+            w->getRPC()->testSetBalances(bals);
+            auto* utxos = new QList<UnspentOutput>();
+            utxos->append(UnspentOutput{ T, "txid0", "5.0", 10, true, /*coinbase=*/false });
+            w->getRPC()->testSetUTXOs(utxos);
+            auto* zs = new QList<QString>(); zs->append(ZS);
+            w->getRPC()->testSetZAddresses(zs);
+            ui->inputsCombo->clear();
+            ui->inputsCombo->addItem(T, 5.0);
+            ui->inputsCombo->setCurrentIndex(0);
+            ui->Address1->setText(RECIP);
+            ui->Amount1->setText("3");
+            Tx tx = w->testCreateTxFromSendPage();
+            return tx;
+        };
+
+        // (a) DIVERGENCE: a 2 ZCL non-coinbase UTXO confirmed at T between build and send.
+        {
+            MainWindow* w = makeWindow();
+            Tx tx = buildGuardedTx(w);
+            QVERIFY2(tx.autoShieldGuardActive, "an explicit-change auto-shield send must arm the gate");
+            auto* fresh = new QList<UnspentOutput>();
+            fresh->append(UnspentOutput{ T, "txid0", "5.0", 10, true, false });
+            fresh->append(UnspentOutput{ T, "txid1", "2.0", 10, true, false });   // newly confirmed
+            w->getRPC()->testSetRepollUTXOs(fresh);
+            armModalDismisser();                          // the gate pops a blocking warning
+            QVERIFY2(!w->testVerifyAutoShield(tx),
+                     "a grown eligible set MUST abort the send (would leak surplus public change)");
+            settleAndDelete(w);
+        }
+
+        // (b) NO DIVERGENCE: the fresh re-poll matches the build snapshot -> send proceeds.
+        {
+            MainWindow* w = makeWindow();
+            Tx tx = buildGuardedTx(w);
+            auto* fresh = new QList<UnspentOutput>();
+            fresh->append(UnspentOutput{ T, "txid0", "5.0", 10, true, false });
+            w->getRPC()->testSetRepollUTXOs(fresh);
+            QVERIFY2(w->testVerifyAutoShield(tx),
+                     "an unchanged eligible set MUST let the send proceed");
+            settleAndDelete(w);
+        }
+
+        // (c) NO-OP: a non-auto-shield Tx (guard inactive) is never re-polled -> proceeds
+        // immediately. No re-poll seam is installed; if the gate wrongly re-polled it would
+        // hit the no-seam path and return false.
+        {
+            MainWindow* w = makeWindow();
+            Tx plain; plain.fromAddr = T; plain.fee = 0.0001;
+            ToFields f; f.addr = RECIP; f.amount = 1.0; plain.toAddrs.append(f);
+            QVERIFY2(!plain.autoShieldGuardActive, "a hand-built Tx must default to guard-inactive");
+            QVERIFY2(w->testVerifyAutoShield(plain),
+                     "a non-auto-shield send must pass the gate with no re-poll");
+            settleAndDelete(w);
+        }
+
+        QSettings().remove("options/autoshield");
+        QSettings().sync();
+    }
+
     // ---- P8: P0-2 — the at-rest "● Synced" pill ↔ loud banner swap ---------------
     // The headline visual-polish change: when fully caught up, the full-width
     // colored "Synced" bar is DEMOTED to a quiet inline pill (green lives on the

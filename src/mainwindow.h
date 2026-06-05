@@ -32,6 +32,18 @@ struct Tx {
     QString         fromAddr;
     QList<ToFields> toAddrs;
     double          fee;
+
+    // Snapshot-race guard. Stamped ONLY by createTxFromSendPage()'s auto-shield branch
+    // when it builds an explicit Sapling change output; the pre-send gate
+    // (verifyAutoShieldUnchanged) re-polls the from-addr and ABORTS if the live eligible
+    // set no longer matches, so a surplus that confirmed during the confirm dwell cannot
+    // escape as PUBLIC transparent change. Default-off keeps every other send (z-from,
+    // auto-shield off, Sprout recipient, coinbase-only "shield everything") byte-identical:
+    // the gate early-returns true and never re-polls. C++14 default member initializers
+    // keep Tx an aggregate, so the positional Tx{from, to, fee} brace-inits still compile.
+    bool   autoShieldGuardActive = false;  // true only when an explicit Sapling change was built
+    qint64 builtEligibleZat      = 0;      // confirmedSpendableZat(fromAddr,false) at build time
+    qint64 builtTargetZat        = 0;      // recipients (excl. change row) + fee, at build time
 };
 
 // PRIV-11 / UX-12 — the four-way SendCategory enum + the pure free classifier
@@ -72,6 +84,9 @@ public:
     // drive the real confirm dialog, and seeds an empty RPC balances map so
     // confirmTx's rpc->getAllBalances() deref is safe without a live daemon.
     bool testConfirmTx(Tx tx)  { return confirmTx(tx); }
+    // Drive the REAL snapshot-race gate so the L1 race tests can assert it aborts on a
+    // diverging fresh snapshot (injected via RPC::testSetRepollUTXOs) and proceeds otherwise.
+    bool testVerifyAutoShield(const Tx& tx) { return verifyAutoShieldUnchanged(tx); }
     void testSeedBalances();
     // Build the send-page Tx through the REAL createTxFromSendPage() path so the
     // L1 fail-open tests (PRIV-10) exercise the actual production routing.
@@ -282,6 +297,20 @@ private:
     // includes unconfirmed). includeCoinbase=false additionally excludes coinbase UTXOs to
     // match the daemon's has-change input set. Null-safe (returns 0 if UTXOs not loaded).
     qint64  confirmedSpendableZat(const QString& addr, bool includeCoinbase);
+
+    // Snapshot-race gate (SAFE-RACE). verifyAutoShieldUnchanged() is the LAST check before
+    // the irrevocable z_sendmany: for an auto-shield-change send it synchronously re-polls
+    // the from-addr's transparent UTXOs (repollFromAddrUtxos, mirroring
+    // createSaplingAddressSync's bounded pump) and ABORTS fail-closed if the live eligible
+    // non-coinbase total no longer matches what the change was sized against; for any other
+    // send it returns true immediately. Returns false => caller must NOT send.
+    enum class RepollResult { Refreshed, NoConnection, Timeout };
+    RepollResult repollFromAddrUtxos();
+    bool    verifyAutoShieldUnchanged(const Tx& tx);
+    // Reentrancy guard for the blocking re-poll pump (sibling of saplingSyncCreateInFlight),
+    // so a second sendButton click can't nest a second synchronous re-poll.
+    bool    autoShieldRepollInFlight = false;
+
     // PRIV-27 one-shot: surface the Sprout-recipient "change stays transparent"
     // constraint at most once per run instead of nagging on every keystroke/build.
     bool sproutChangeWarned = false;

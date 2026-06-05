@@ -87,6 +87,10 @@ public:
     // Install the wallet's UTXO set so confirmedSpendableZat() (the confirmed,
     // non-coinbase change basis) can be driven without a daemon.
     void testSetUTXOs(QList<UnspentOutput>* u)      { delete utxos; utxos = u; }
+    // SAFE-RACE: install the "fresh" transparent set the NEXT repollTransparentUnspent()
+    // splices in (simulates a UTXO landing/leaving at the from-addr during the confirm
+    // dwell). One-shot: consumed by the re-poll. Never present in the shipped app build.
+    void testSetRepollUTXOs(QList<UnspentOutput>* u) { delete testRepollUTXOs; testRepollUTXOs = u; }
     // MAJOR-3: control the result of the next newZaddr(true) sync-create. A non-empty
     // string makes the create SUCCEED (returns that address); leaving it empty makes
     // the create FAIL (callback never fires), exercising the fail-closed path. The
@@ -103,6 +107,13 @@ public:
     void testFireNotifyPush() { onNotifyPush(); }
     bool testNotifyDebounceActive() const { return notifyDebounce && notifyDebounce->isActive(); }
 #endif
+
+    // SAFE-RACE: synchronously-driven re-poll of ONLY the transparent UTXOs, spliced into
+    // the cached `utxos` WITHOUT dropping the shielded-note rows. Fires the async
+    // listunspent (production) or applies an injected test set, and invokes cb(true) once
+    // fresh data has landed. Returns false (and cb(false)) when it could not fire (no
+    // connection / no test seam), so the caller fails closed. See verifyAutoShieldUnchanged.
+    bool repollTransparentUnspent(const std::function<void(bool)>& cb);
 
     void newZaddr(bool sapling, const std::function<void(json)>& cb);
     void newTaddr(const std::function<void(json)>& cb);
@@ -174,6 +185,12 @@ private:
     void refreshReceivedZTrans(QList<QString> zaddresses);
 
     bool processUnspent     (const json& reply, QMap<QString, double>* newBalances, QList<UnspentOutput>* newUtxos);
+    // SAFE-RACE: build a new owned list = the shielded-note rows kept from `oldUtxos`
+    // (classified by !Settings::isTAddress) + every row of `freshT` (the re-polled
+    // transparent set). Frees both inputs. Used by repollTransparentUnspent so a
+    // transparent-only re-poll never drops the wallet's z-notes.
+    QList<UnspentOutput>* mergeTransparentUnspent(QList<UnspentOutput>* oldUtxos,
+                                                  QList<UnspentOutput>* freshT);
     void updateUI           (bool anyUnconfirmed);
 
     void getInfoThenRefresh(bool force);
@@ -325,6 +342,9 @@ private:
     // (one-shot). Empty => the sync-create fails (fail-closed path). Never present
     // in the shipped app build.
     QString                     testNextZaddrResult;
+    // SAFE-RACE backing store: the transparent set the next repollTransparentUnspent()
+    // splices in (one-shot). nullptr => the re-poll cannot fire (fail-closed).
+    QList<UnspentOutput>*       testRepollUTXOs = nullptr;
 #endif
 };
 
