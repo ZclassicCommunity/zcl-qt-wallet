@@ -315,6 +315,18 @@ void Settings::setShowCachedBalance(bool show) {
     QSettings().setValue("options/showcachedbalance", show);
 }
 
+bool Settings::getShowNFTGallery() {
+    // Default ON: surface the native Collections gallery. Pure GUI / fixtures in
+    // Phase C0; users can hide the tab via this preference (no chain dependency
+    // either way). When OFF the tab is never created, so the rail/tab indices
+    // simply collapse back to the pre-NFT layout.
+    return QSettings().value("options/shownftgallery", true).toBool();
+}
+
+void Settings::setShowNFTGallery(bool show) {
+    QSettings().setValue("options/shownftgallery", show);
+}
+
 bool Settings::getNonModalStartup() {
     // W1-1 default ON: the MainWindow appears at once (already painting cached
     // balances pre-RPC) and the warmup splash is a non-blocking, dismissible

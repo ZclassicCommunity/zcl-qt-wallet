@@ -12,6 +12,9 @@
 #include "rpc.h"
 #include "balancestablemodel.h"
 #include "privacybadgedelegate.h"
+#include "nftgallerymodel.h"
+#include "nftgallerydelegate.h"
+#include "nftimagecache.h"
 #include "settings.h"
 #include "version.h"
 #include "turnstile.h"
@@ -33,6 +36,7 @@
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QGridLayout>
+#include <QListView>      // Phase C0: the native Collections (NFT) gallery view
 #include <QTabBar>
 #include <QSignalBlocker>
 #include <QFileInfo>     // showExternalNodeAuthFailed: open the conf's folder
@@ -163,10 +167,17 @@ MainWindow::MainWindow(QWidget *parent) :
     setupTurnstileDialog();
     setupZClassicdTab();
 
+    // Phase C0: the native Collections (NFT) gallery. Built BEFORE the nav rail
+    // so the rail can pick up its live tab index (4, right after Activity). Gated
+    // on Settings::getShowNFTGallery(); when off, nothing is added and the rail
+    // falls back to the pre-NFT layout. Pure GUI / fixtures, zero chain access.
+    setupNFTTab();
+
     // Phase-3a redesign (Quiet+): replace the top tab bar with a modern left
     // nav rail. Built here, AFTER the tab pages are set up and the zclassicd tab
     // has been removed (above), so the rail's primary destinations map to the
-    // live tab indices (Home/Balance 0, Send 1, Receive 2, Activity 3).
+    // live tab indices (Home/Balance 0, Send 1, Receive 2, Activity 3, and
+    // Collections 4 when the NFT gallery is enabled).
     setupNavRail();
 
     // Narrow-window fix: declare an HONEST, tested minimum width so dragging the edge has
@@ -1288,6 +1299,17 @@ void MainWindow::setupNavRail() {
     makeRailButton(tr("Send"),     1);
     makeRailButton(tr("Receive"),  2);
     makeRailButton(tr("Activity"), 3);   // Transactions
+
+    // Phase C0: the native Collections gallery. setupNFTTab() (called just before
+    // this) appended it after Activity, so its live index is 4. Resolve it via
+    // indexOf so the binding stays correct even if the layout shifts; add the rail
+    // button ONLY when the tab exists (gated on Settings::getShowNFTGallery()),
+    // keeping the rail<->tab mapping consistent when the gallery is disabled.
+    if (nftTab) {
+        int nftIdx = ui->tabWidget->indexOf(nftTab);
+        if (nftIdx >= 0)
+            makeRailButton(tr("Collections"), nftIdx);
+    }
 
     // Spacer pushes the demoted "Advanced" gear to the BOTTOM of the rail.
     railLayout->addStretch(1);
@@ -2977,6 +2999,152 @@ void MainWindow::setupNetworkHelpPanel() {
     netHelpReachLabel->setVisible(!hidden);
     netHelpBlurbLabel->setVisible(!hidden);
     netHelpNatpmpChk->setVisible(!hidden);
+}
+
+// ============================================================================
+// Phase C0: the NATIVE "Collections" NFT gallery (no browser / no QtWebEngine).
+//
+// A QListView in IconMode renders an NFTGalleryModel of fixture NFTItems through
+// the NFTGalleryDelegate (rounded card + thumbnail/shimmer + privacy pill +
+// verify badge). Thumbnails are decoded + SHA-256-verified off the GUI thread by
+// NFTImageCache and delivered back QPixmap-on-GUI-thread. The page is added as a
+// NEW tab AFTER Transactions, and the fixtures are fed lazily the FIRST time the
+// tab is shown. Pure GUI, fixture data, zero chain dependency, off the money path.
+//
+// Gated on Settings::getShowNFTGallery(): when OFF nothing is created, so the
+// nav-rail<->tab index mapping is identical to the pre-NFT layout.
+// ============================================================================
+void MainWindow::setupNFTTab() {
+    if (!Settings::getInstance()->getShowNFTGallery())
+        return;   // gallery disabled -> no tab, no rail button, indices unchanged
+
+    // --- page scaffold (programmatic; no .ui structural change) -------------
+    nftTab = new QWidget();
+    nftTab->setObjectName("nftGalleryTab");
+    auto* outer = new QVBoxLayout(nftTab);
+    outer->setContentsMargins(12, 12, 12, 12);
+    outer->setSpacing(8);
+
+    auto* heading = new QLabel(tr("Collections"), nftTab);
+    heading->setObjectName("nftGalleryHeading");
+    auto* sub = new QLabel(
+        tr("Your NFTs. Each asset is checked against its on-chain hash."), nftTab);
+    sub->setObjectName("nftGallerySubhead");
+    sub->setWordWrap(true);
+    outer->addWidget(heading);
+    outer->addWidget(sub);
+
+    // --- the gallery view --------------------------------------------------
+    auto* view = new QListView(nftTab);
+    view->setObjectName("nftGalleryView");
+    view->setViewMode(QListView::IconMode);
+    view->setResizeMode(QListView::Adjust);   // reflow cards as the window resizes
+    view->setUniformItemSizes(true);          // delegate sizeHint queried once
+    view->setMovement(QListView::Static);     // not user-draggable
+    view->setSpacing(8);
+    view->setWrapping(true);
+    view->setSelectionMode(QAbstractItemView::SingleSelection);
+    view->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    view->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    view->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    view->setMouseTracking(true);             // enable hover State_MouseOver
+
+    nftModel    = new NFTGalleryModel(this);
+    nftImgCache = new NFTImageCache(nftModel, this);
+    view->setModel(nftModel);
+    view->setItemDelegate(new NFTGalleryDelegate(view));
+
+    outer->addWidget(view, 1);
+
+    // --- add as a NEW tab right AFTER Transactions (index 3 -> NFT at 4) ----
+    int activityIdx = ui->tabWidget->indexOf(ui->transactionsTable->parentWidget());
+    int insertAt    = (activityIdx >= 0) ? activityIdx + 1 : ui->tabWidget->count();
+    ui->tabWidget->insertTab(insertAt, nftTab, tr("Collections"));
+
+    // --- feed fixtures lazily the FIRST time the Collections tab is shown ---
+    QObject::connect(ui->tabWidget, &QTabWidget::currentChanged, this, [this](int idx) {
+        if (nftFixturesLoaded || !nftTab)
+            return;
+        if (ui->tabWidget->indexOf(nftTab) != idx)
+            return;
+        loadNFTFixtures();
+    });
+}
+
+// Build the FIXTURE NFT set (bundled :/nft/ PNGs + fake metadata) and feed the
+// model, then kick off the threaded decode+verify for each. One item carries a
+// deliberately-WRONG docHashHex so the red MISMATCH badge is demonstrable, and
+// one is left UNVERIFIED (empty bytes path) so the amber PENDING badge shows.
+void MainWindow::loadNFTFixtures() {
+    if (nftFixturesLoaded || !nftModel)
+        return;
+    nftFixturesLoaded = true;
+
+    QVector<NFTItem> items;
+
+    // Item 0 — VERIFIED (correct on-chain hash for sample1.png).
+    {
+        NFTItem it;
+        it.name           = tr("Aurora #014");
+        it.collection     = tr("Zcl Originals");
+        it.txid           = "a1f3c0de0000000000000000000000000000000000000000000000000000beef";
+        it.docHashHex     = "d8c8de9e96d6909aeb9c39ccec3844c0a6f193eb6fe40c15042893bc44bcb579";
+        it.cachePath      = ":/nft/res/nft/sample1.png";
+        it.receivedHeight = 1842001;
+        it.isPrivate      = true;
+        items.push_back(it);
+    }
+    // Item 1 — VERIFIED (correct on-chain hash for sample2.png), PUBLIC provenance.
+    {
+        NFTItem it;
+        it.name           = tr("Ember Sigil");
+        it.collection     = tr("Foundry");
+        it.txid           = "b2e4d1ff0000000000000000000000000000000000000000000000000000cafe";
+        it.docHashHex     = "1282116b8488feadd177b69e8c2a8fe3d81fcbc558a72d99c3557044ef12b72a";
+        it.cachePath      = ":/nft/res/nft/sample2.png";
+        it.receivedHeight = 1842050;
+        it.isPrivate      = false;
+        items.push_back(it);
+    }
+    // Item 2 — MISMATCH: a deliberately WRONG hash for sample3.png (red x badge).
+    {
+        NFTItem it;
+        it.name           = tr("Verdant Glyph");
+        it.collection     = tr("Wild Series");
+        it.txid           = "c3a5b2ee00000000000000000000000000000000000000000000000000001234";
+        // NOT the real SHA-256 of sample3.png -> the cache reports verifyState=2.
+        it.docHashHex     = "0000000000000000000000000000000000000000000000000000000000000000";
+        it.cachePath      = ":/nft/res/nft/sample3.png";
+        it.receivedHeight = 1842120;
+        it.isPrivate      = true;
+        items.push_back(it);
+    }
+    // Item 3 — PENDING: a valid hash but a missing bytes path, so it never decodes
+    // and stays at verifyState=0 (amber question + shimmer placeholder).
+    {
+        NFTItem it;
+        it.name           = tr("Slate Pending");
+        it.collection     = tr("Drafts");
+        it.txid           = "d4b6c3dd00000000000000000000000000000000000000000000000000005678";
+        it.docHashHex     = "31d55269e7d73e05ce2cd4d0f3998f7fc774ba9c0128e92d0db2d4a9a79c9c84";
+        it.cachePath      = ":/nft/res/nft/does-not-exist.png";   // -> stays pending
+        it.receivedHeight = 0;
+        it.isPrivate      = true;
+        items.push_back(it);
+    }
+
+    nftModel->setItems(items);
+
+    // Kick off the threaded decode + verify for every item that has a real bytes
+    // path. The cache delivers each result back on the GUI thread (onImageReady).
+    // The thumbnail width matches the delegate card's inner thumbnail area.
+    const int thumbPx = 152;   // 168 card - 2*8 padding
+    if (nftImgCache) {
+        for (int row = 0; row < items.size(); ++row) {
+            const NFTItem& it = items.at(row);
+            nftImgCache->request(it.docHashHex, it.cachePath, it.docHashHex, thumbPx);
+        }
+    }
 }
 
 void MainWindow::setupTransactionsTab() {

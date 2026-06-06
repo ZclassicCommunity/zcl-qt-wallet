@@ -613,3 +613,44 @@ QPushButton#privKeySaveBtn {
 }
 QPushButton#privKeySaveBtn:hover   { background-color: #2a9d2a; border-color: #2a9d2a; }
 QPushButton#privKeySaveBtn:pressed { background-color: #1a6b1a; }
+
+/* ============================================================================
+ * Phase C0: native "Collections" NFT gallery. The cards themselves are painted
+ * by NFTGalleryDelegate (QPainter, using the SAME tokens below); these rules
+ * style the page chrome + the QListView container so it sits on the page like
+ * every other tab. App #0f1115, card #15171c, inset #1d2027, hairline #2a2d35,
+ * text #e6e6e6, dim #9aa0a6, private/green #1f7a1f, public/amber #d9822b.
+ * ============================================================================ */
+QWidget#nftGalleryTab { background-color: #0f1115; }
+
+QLabel#nftGalleryHeading {
+    color: #e6e6e6;
+    font-size: 18pt;
+    font-weight: 700;
+    padding: 2px 2px 0px 2px;
+}
+QLabel#nftGallerySubhead {
+    color: #9aa0a6;
+    font-size: 11pt;
+    padding: 0px 2px 6px 2px;
+}
+
+/* The gallery surface sits flat on the page (the delegate draws each card's own
+ * #15171c body + #2a2d35 hairline), so the view itself is borderless/transparent
+ * rather than the default inset table look. */
+QListView#nftGalleryView {
+    background-color: #0f1115;
+    border: none;
+    border-radius: 0px;
+}
+/* Card hover/selection accents are painted by the delegate; keep the view's own
+ * item chrome out of the way so it never double-draws over the card art. */
+QListView#nftGalleryView::item {
+    background: transparent;
+    border: none;
+    padding: 0px;
+}
+QListView#nftGalleryView::item:selected,
+QListView#nftGalleryView::item:hover {
+    background: transparent;
+}

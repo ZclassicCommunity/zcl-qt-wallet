@@ -51,6 +51,9 @@ SOURCES += \
     ../../src/rpc.cpp \
     ../../src/balancestablemodel.cpp \
     ../../src/privacybadgedelegate.cpp \
+    ../../src/nftgallerymodel.cpp \
+    ../../src/nftgallerydelegate.cpp \
+    ../../src/nftimagecache.cpp \
     ../../src/3rdparty/qrcode/BitBuffer.cpp \
     ../../src/3rdparty/qrcode/QrCode.cpp \
     ../../src/3rdparty/qrcode/QrSegment.cpp \
@@ -74,6 +77,9 @@ SOURCES += \
 HEADERS += \
     ../../src/mainwindow.h \
     ../../src/privacybadgedelegate.h \
+    ../../src/nftgallerymodel.h \
+    ../../src/nftgallerydelegate.h \
+    ../../src/nftimagecache.h \
     ../../src/qrcodelabel.h \
     ../../src/fillediconlabel.h \
     ../../src/addresscombo.h \

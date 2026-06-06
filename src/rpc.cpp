@@ -122,7 +122,12 @@ RPC::~RPC() {
 void RPC::setEZClassicd(QProcess* p) {
     ezclassicd = p;
 
-    if (ezclassicd && ui->tabWidget->widget(4) == nullptr) {
+    // NFT-tab index fix: the old "widget(4) == nullptr" sentinel assumed index 4
+    // was always free until the zclassicd page was added. Phase C0 may insert the
+    // Collections gallery at index 4, so test PRESENCE of the page directly
+    // (indexOf < 0) — index-independent and correct with or without the NFT tab.
+    if (ezclassicd && main->zclassicdtab != nullptr
+            && ui->tabWidget->indexOf(main->zclassicdtab) < 0) {
         ui->tabWidget->addTab(main->zclassicdtab, "zclassicd");
     }
 
@@ -282,11 +287,13 @@ void RPC::setConnection(Connection* c) {
     // now-common path, ezclassicd stays null) never got the tab and Advanced was a
     // silent no-op. All fields on the page are RPC-derived (getinfo connections,
     // getnetworksolps, getblockchaininfo, getpeerinfo) and valid for any node; none
-    // read the QProcess. Keep the widget(4)==nullptr guard — it is the genuine
-    // no-double-add sentinel (tab_5/index 4 is the only widget at index>=4, the sole
-    // removeTab is the ctor, the sole adds are here + the now-redundant setEZClassicd
-    // path) and also honors "do not re-add after close" if a close path is ever added.
-    if (main->zclassicdtab != nullptr && ui->tabWidget->widget(4) == nullptr) {
+    // read the QProcess. The no-double-add sentinel honors "do not re-add after
+    // close" if a close path is ever added.
+    // NFT-tab index fix (see setEZClassicd): use indexOf(zclassicdtab) < 0 as the
+    // no-double-add sentinel instead of widget(4)==nullptr, since the Collections
+    // gallery (Phase C0) may now occupy index 4. Still honors "do not re-add" and
+    // is robust to the tab order shifting.
+    if (main->zclassicdtab != nullptr && ui->tabWidget->indexOf(main->zclassicdtab) < 0) {
         ui->tabWidget->addTab(main->zclassicdtab, "zclassicd");
     }
 

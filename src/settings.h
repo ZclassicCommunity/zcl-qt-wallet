@@ -69,6 +69,12 @@ public:
     bool    getShowCachedBalance();
     void    setShowCachedBalance(bool show);
 
+    // Opt-out (default ON): show the native "Collections" NFT gallery tab (Phase
+    // C0). Pure GUI, fixture-driven, off the money path; gating its creation
+    // keeps the nav-rail<->tab index mapping clean when disabled.
+    bool    getShowNFTGallery();
+    void    setShowNFTGallery(bool show);
+
     // W1-1 (opt-out, default ON): show the MainWindow immediately on startup and
     // run the node-warmup splash as a NON-blocking, dismissible overlay instead of
     // blocking the UI behind a nested d->exec() modal loop for 1-2 minutes. When

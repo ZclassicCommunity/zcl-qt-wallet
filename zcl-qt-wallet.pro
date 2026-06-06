@@ -46,6 +46,9 @@ SOURCES += \
     src/rpc.cpp \
     src/balancestablemodel.cpp \
     src/privacybadgedelegate.cpp \
+    src/nftgallerymodel.cpp \
+    src/nftgallerydelegate.cpp \
+    src/nftimagecache.cpp \
     src/3rdparty/qrcode/BitBuffer.cpp \
     src/3rdparty/qrcode/QrCode.cpp \
     src/3rdparty/qrcode/QrSegment.cpp \
@@ -71,6 +74,10 @@ HEADERS += \
     src/rpc.h \
     src/balancestablemodel.h \
     src/privacybadgedelegate.h \
+    src/nft.h \
+    src/nftgallerymodel.h \
+    src/nftgallerydelegate.h \
+    src/nftimagecache.h \
     src/3rdparty/qrcode/BitBuffer.hpp \
     src/3rdparty/qrcode/QrCode.hpp \
     src/3rdparty/qrcode/QrSegment.hpp \

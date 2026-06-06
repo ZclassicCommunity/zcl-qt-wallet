@@ -17,6 +17,8 @@ class QPushButton;
 class QToolButton;
 class QWidget;
 class QCheckBox;
+class NFTGalleryModel;
+class NFTImageCache;
 
 using json = nlohmann::json;
 
@@ -315,6 +317,19 @@ private:
     void setupRecieveTab();
     void setupBalancesTab();
     void setupZClassicdTab();
+
+    // Phase C0: the native (no-browser) "Collections" NFT gallery. Builds a
+    // QListView in IconMode driven by an NFTGalleryModel + NFTGalleryDelegate,
+    // added as a NEW tab AFTER Transactions. Pure GUI, fixture-driven, zero chain
+    // dependency. Gated on Settings::getShowNFTGallery(); when off the tab/rail
+    // button are never created so the existing index mapping is unchanged.
+    void setupNFTTab();
+    // Build + feed the FIXTURE NFT set on first reveal of the Collections tab.
+    void loadNFTFixtures();
+    NFTGalleryModel* nftModel    = nullptr;
+    NFTImageCache*   nftImgCache = nullptr;
+    QWidget*         nftTab      = nullptr;   // the gallery page (added to tabWidget)
+    bool             nftFixturesLoaded = false;
 
     void setupSettingsModal();
     void setupStatusBar();

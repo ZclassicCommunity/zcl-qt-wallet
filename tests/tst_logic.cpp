@@ -32,9 +32,22 @@
 #include "addressbook.h"       // shim
 #include "privacybadgedelegate.h"   // PRIV-13/14: classify/labelFor/colorFor (real)
 #include "securerandom.h"      // CONF-1/NOTIFY-SRV: CSPRNG secret generation (real)
+#include "nft.h"                     // Phase C0: NFTItem POD
+#include "nftgallerymodel.h"         // Phase C0: model under test
+#include "nftgallerydelegate.h"      // Phase C0: delegate sizeHint under test
+#include "nftimagecache.h"           // Phase C0: threaded decode/verify pipeline
 #include <QSet>
+#include <QVector>
 #include <QRegularExpression>
 #include <QFileInfo>
+#include <QImage>
+#include <QPixmap>
+#include <QStyleOptionViewItem>
+#include <QTemporaryDir>
+#include <QSignalSpy>
+#include <QElapsedTimer>
+#include <QCoreApplication>
+#include <QStandardPaths>
 
 #ifndef Q_OS_WIN
 #include <unistd.h>            // getuid() — mirrors the per-user temp-fallback subdir (ITEM 5)
@@ -194,6 +207,12 @@ private slots:
     void addressFromLabel_data();
     void addressFromLabel();
     void addressComboParenStrip();
+
+    // --- NFT gallery (Phase C0): model state + delegate sizeHint + cache pipe ---
+    void nftModelFingerprintGuard();      // flicker-free no-op re-feed
+    void nftModelRolesAndOnImageReady();  // custom roles + verifyState update
+    void nftDelegateSizeHintStable();     // fixed (168x208)*dpr, stable
+    void nftCachePipelineVerifyMismatchPending();  // SHA-256 verify states e2e
 
     // --- SentTxStore at-rest ---  G1 / G4
     void sentTxStore_perms_and_testnetName();   // G4
@@ -1208,6 +1227,196 @@ void TestLogic::sendgate_staleWhenPollStops() {
     // Past the window: stale.
     QVERIFY(Settings::syncGateIsStale(now, now - (W + 1)));
     QVERIFY(Settings::syncGateIsStale(now, now - 10 * W));
+}
+
+// ===========================================================================
+// NFT gallery (Phase C0) — model state, delegate sizeHint, threaded verify pipe.
+// Pure GUI/logic; no daemon, no chain. Runs under QT_QPA_PLATFORM=offscreen via
+// the QTEST_MAIN-provided QApplication (QPixmap/QImage are available offscreen).
+// ===========================================================================
+namespace {
+// Build a small in-memory NFTItem set. Verify state starts pending (0) for all;
+// the cache (or a direct onImageReady) sets it later.
+static QVector<NFTItem> makeNftFixtures() {
+    QVector<NFTItem> v;
+    NFTItem a; a.name = "Aurora";  a.collection = "Originals"; a.txid = "tx-a";
+               a.docHashHex = "aaaa"; a.cachePath = "p-a"; a.isPrivate = true;  v.push_back(a);
+    NFTItem b; b.name = "Ember";   b.collection = "Foundry";   b.txid = "tx-b";
+               b.docHashHex = "bbbb"; b.cachePath = "p-b"; b.isPrivate = false; v.push_back(b);
+    NFTItem c; c.name = "Verdant"; c.collection = "Wild";      c.txid = "tx-c";
+               c.docHashHex = "cccc"; c.cachePath = "p-c"; c.isPrivate = true;  v.push_back(c);
+    return v;
+}
+
+// Write a real PNG to disk and return its path + true SHA-256 hex. Used by the
+// pipeline test so it depends on NO bundled QRC resource.
+static bool writeTestPng(const QString& path, const QColor& fill, QString& outHashHex) {
+    QImage img(48, 48, QImage::Format_RGB32);
+    img.fill(fill);
+    if (!img.save(path, "PNG"))
+        return false;
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly))
+        return false;
+    const QByteArray bytes = f.readAll();
+    outHashHex = QString::fromLatin1(
+        QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
+    return true;
+}
+} // namespace
+
+// Flicker-free guard: a byte-identical re-feed must NOT reset the model (mirrors
+// TxTableModel). modelReset fires once for the first feed, not for the identical
+// second feed, and DOES fire when the content actually changes.
+void TestLogic::nftModelFingerprintGuard() {
+    NFTGalleryModel model;
+    QSignalSpy resetSpy(&model, &QAbstractItemModel::modelReset);
+
+    const QVector<NFTItem> items = makeNftFixtures();
+    model.setItems(items);
+    QCOMPARE(model.rowCount(), items.size());
+    QCOMPARE(resetSpy.count(), 1);
+
+    // Identical re-feed -> no-op (no extra reset).
+    model.setItems(items);
+    QCOMPARE(resetSpy.count(), 1);
+
+    // A real change (one more item) -> a reset fires.
+    QVector<NFTItem> more = items;
+    NFTItem d; d.name = "Slate"; d.docHashHex = "dddd"; more.push_back(d);
+    model.setItems(more);
+    QCOMPARE(model.rowCount(), more.size());
+    QCOMPARE(resetSpy.count(), 2);
+}
+
+// Custom roles read back correctly, and onImageReady() flips the matching row's
+// verifyState to VERIFIED / MISMATCH while leaving an untouched row PENDING.
+void TestLogic::nftModelRolesAndOnImageReady() {
+    NFTGalleryModel model;
+    model.setItems(makeNftFixtures());
+
+    const QModelIndex i0 = model.index(0, 0);
+    QCOMPARE(model.data(i0, NFTGalleryModel::NameRole).toString(),       QString("Aurora"));
+    QCOMPARE(model.data(i0, NFTGalleryModel::CollectionRole).toString(), QString("Originals"));
+    QCOMPARE(model.data(i0, NFTGalleryModel::IsPrivateRole).toBool(),    true);
+    // PENDING by construction.
+    QCOMPARE(model.data(i0, NFTGalleryModel::VerifyStateRole).toInt(),   0);
+    QVERIFY(model.data(i0, NFTGalleryModel::ThumbnailRole).value<QPixmap>().isNull());
+
+    QSignalSpy dataSpy(&model, &QAbstractItemModel::dataChanged);
+
+    // Deliver a VERIFIED thumbnail for row 0's hash ("aaaa").
+    QPixmap pm(8, 8); pm.fill(Qt::green);
+    model.onImageReady("aaaa", pm, /*verified*/1);
+    QCOMPARE(model.data(i0, NFTGalleryModel::VerifyStateRole).toInt(), 1);
+    QVERIFY(!model.data(i0, NFTGalleryModel::ThumbnailRole).value<QPixmap>().isNull());
+    QVERIFY(dataSpy.count() >= 1);
+
+    // Deliver a MISMATCH for row 1's hash ("bbbb").
+    model.onImageReady("bbbb", QPixmap(), /*mismatch*/2);
+    QCOMPARE(model.data(model.index(1, 0), NFTGalleryModel::VerifyStateRole).toInt(), 2);
+
+    // Row 2 was never delivered -> still PENDING.
+    QCOMPARE(model.data(model.index(2, 0), NFTGalleryModel::VerifyStateRole).toInt(), 0);
+
+    // A hash that matches no row is a harmless no-op (no crash, no state change).
+    model.onImageReady("zzzz", pm, 1);
+    QCOMPARE(model.data(model.index(2, 0), NFTGalleryModel::VerifyStateRole).toInt(), 0);
+}
+
+// sizeHint is the fixed 168x208 card scaled by the device pixel ratio, and is
+// STABLE across calls / indices (QListView::setUniformItemSizes relies on this).
+void TestLogic::nftDelegateSizeHintStable() {
+    NFTGalleryModel model;
+    model.setItems(makeNftFixtures());
+    NFTGalleryDelegate delegate;
+
+    QStyleOptionViewItem opt;
+    const QSize s0 = delegate.sizeHint(opt, model.index(0, 0));
+    const QSize s1 = delegate.sizeHint(opt, model.index(1, 0));
+    const QSize s2 = delegate.sizeHint(opt, model.index(2, 0));
+
+    // Stable across rows.
+    QCOMPARE(s0, s1);
+    QCOMPARE(s1, s2);
+
+    // Matches the declared base card * dpr.
+    const qreal dpr = qApp ? qApp->devicePixelRatio() : 1.0;
+    const QSize base = NFTGalleryDelegate::baseCardSize();
+    QCOMPARE(base, QSize(168, 208));
+    QCOMPARE(s0.width(),  qRound(base.width()  * dpr));
+    QCOMPARE(s0.height(), qRound(base.height() * dpr));
+    QVERIFY(s0.width() > 0 && s0.height() > 0);
+}
+
+// End-to-end pipeline: real PNGs on disk, a correct hash -> VERIFIED, a wrong
+// hash -> MISMATCH, and a missing-bytes item -> stays PENDING. Exercises the
+// off-GUI-thread read+SHA256+decode and the QPixmap-on-GUI-thread handoff.
+void TestLogic::nftCachePipelineVerifyMismatchPending() {
+    // Isolate AppDataLocation so cacheDir() writes into a throwaway dir.
+    QTemporaryDir appDir;
+    QVERIFY(appDir.isValid());
+    qputenv("XDG_DATA_HOME", appDir.path().toUtf8());
+    QStandardPaths::setTestModeEnabled(true);
+
+    QTemporaryDir tmp;
+    QVERIFY(tmp.isValid());
+
+    QString hashGood, hashOther;
+    const QString pGood = tmp.path() + "/good.png";
+    const QString pOther = tmp.path() + "/other.png";
+    QVERIFY(writeTestPng(pGood,  QColor(20, 160, 90),  hashGood));
+    QVERIFY(writeTestPng(pOther, QColor(200, 90, 40),  hashOther));
+    QVERIFY(hashGood != hashOther);
+
+    // A deliberately WRONG (but distinct) expected hash for the mismatch row, so
+    // each request maps to exactly one model row (onImageReady matches by hash).
+    const QString hashWrong = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    NFTGalleryModel model;
+    QVector<NFTItem> items;
+    // 0: docHash == real bytes hash -> VERIFIED (1)
+    { NFTItem it; it.name = "Good";     it.docHashHex = hashGood;  it.cachePath = pGood;  items.push_back(it); }
+    // 1: docHash does NOT match the bytes -> MISMATCH (2)
+    { NFTItem it; it.name = "Mismatch"; it.docHashHex = hashWrong; it.cachePath = pOther; items.push_back(it); }
+    // 2: missing file -> stays PENDING (0)
+    { NFTItem it; it.name = "Pending";  it.docHashHex = "deadbeef";it.cachePath = tmp.path() + "/nope.png"; items.push_back(it); }
+    model.setItems(items);
+
+    NFTImageCache cache(&model);
+    QSignalSpy dataSpy(&model, &QAbstractItemModel::dataChanged);
+
+    const int sizePx = 32;
+    // request(hash[=dedupe+match key], bytesPath, onChainExpectedHash, sizePx).
+    cache.request(items[0].docHashHex, items[0].cachePath, items[0].docHashHex, sizePx);
+    cache.request(items[1].docHashHex, items[1].cachePath, items[1].docHashHex, sizePx);
+    cache.request(items[2].docHashHex, items[2].cachePath, items[2].docHashHex, sizePx);
+
+    // Pump the event loop until the two real-file items have reported (or timeout).
+    QElapsedTimer timer; timer.start();
+    auto rowState = [&](int r){ return model.data(model.index(r,0),
+                                  NFTGalleryModel::VerifyStateRole).toInt(); };
+    while (timer.elapsed() < 5000) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 25);
+        if (rowState(0) != 0 && rowState(1) != 0)
+            break;
+    }
+
+    // good.png bytes hash == hashGood  -> VERIFIED
+    QCOMPARE(rowState(0), 1);
+    // other.png bytes hash != hashWrong -> MISMATCH
+    QCOMPARE(rowState(1), 2);
+    // missing-file item never decoded   -> still PENDING
+    QCOMPARE(rowState(2), 0);
+    // A dataChanged repaint was emitted for at least one delivery.
+    QVERIFY(dataSpy.count() >= 1);
+
+    // The on-disk thumbnail cache file was written atomically for the good asset.
+    const QString thumb = NFTImageCache::cacheDir() + "/" + hashGood + "_"
+                        + QString::number(sizePx) + ".png";
+    QVERIFY2(QFileInfo::exists(thumb), qPrintable("expected cached thumb: " + thumb));
+
+    QStandardPaths::setTestModeEnabled(false);
 }
 
 QTEST_MAIN(TestLogic)

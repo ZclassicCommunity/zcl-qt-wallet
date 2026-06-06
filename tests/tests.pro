@@ -45,6 +45,10 @@ INCLUDEPATH += $$PWD/../src/3rdparty
 # touching the source files.
 HEADERS += ../src/addresscombo.h
 HEADERS += ../src/privacybadgedelegate.h
+# Phase C0: NFT gallery model/delegate/cache carry Q_OBJECT -> MOC them.
+HEADERS += ../src/nftgallerymodel.h
+HEADERS += ../src/nftgallerydelegate.h
+HEADERS += ../src/nftimagecache.h
 
 # Product pure-logic sources (UNMODIFIED) + shims + the test.
 # privacybadgedelegate.cpp is pure classification + paint logic; the PRIV-13/14
@@ -55,6 +59,9 @@ SOURCES += \
     ../src/senttxstore.cpp \
     ../src/addresscombo.cpp \
     ../src/privacybadgedelegate.cpp \
+    ../src/nftgallerymodel.cpp \
+    ../src/nftgallerydelegate.cpp \
+    ../src/nftimagecache.cpp \
     shim/addressbook_stub.cpp \
     tst_logic.cpp
 
