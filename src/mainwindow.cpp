@@ -1929,6 +1929,16 @@ void MainWindow::setupSettingsModal() {
         // Auto shielding
         settings.chkAutoShield->setChecked(Settings::getInstance()->getAutoShield());
 
+        // COIN CONTROL (Advanced). Load current toggles. The manual-shielded sub-option
+        // is only meaningful when Coin Control itself is on, so keep it enabled-with-
+        // parent: it's disabled until Coin Control is checked (and re-enabled live).
+        settings.chkCoinControl->setChecked(Settings::getInstance()->getCoinControlEnabled());
+        settings.chkManualShielded->setChecked(Settings::getInstance()->getManualShieldedSelection());
+        settings.chkManualShielded->setEnabled(settings.chkCoinControl->isChecked());
+        QObject::connect(settings.chkCoinControl, &QCheckBox::toggled, [=](bool on) {
+            settings.chkManualShielded->setEnabled(on);
+        });
+
         // Use Tor
         bool isUsingTor = false;
         if (rpc->getConnection() != nullptr) {
@@ -2007,6 +2017,29 @@ void MainWindow::setupSettingsModal() {
 
             // Auto shield
             Settings::getInstance()->setAutoShield(settings.chkAutoShield->isChecked());
+
+            // COIN CONTROL (Advanced). Persist the toggles and refresh the Send-tab
+            // button visibility immediately (it's still ALSO gated on daemon support, so
+            // turning it on does nothing if the node can't honor a pinned input set).
+            Settings::getInstance()->setCoinControlEnabled(settings.chkCoinControl->isChecked());
+
+            // ONE-TIME privacy warning the first time manual shielded-note selection is
+            // turned ON: hand-picking notes can reduce privacy; auto-selection is
+            // privacy-optimized. Persisted so it never nags again.
+            bool wantManualShielded = settings.chkManualShielded->isChecked();
+            bool wasManualShielded  = Settings::getInstance()->getManualShieldedSelection();
+            if (wantManualShielded && !wasManualShielded
+                    && !QSettings().value("coincontrol/shieldedWarned", false).toBool()) {
+                QMessageBox::warning(this, tr("Manual shielded note selection"),
+                    tr("Manually selecting which shielded (z) notes to spend can REDUCE "
+                       "your privacy by revealing which notes you control together. "
+                       "Automatic selection is privacy-optimized.\n\nOnly turn this on if "
+                       "you understand the tradeoff."),
+                    QMessageBox::Ok);
+                QSettings().setValue("coincontrol/shieldedWarned", true);
+            }
+            Settings::getInstance()->setManualShieldedSelection(wantManualShielded);
+            refreshCoinControlVisibility();
 
             // Keep running in the background (tray-resident). Apply immediately
             // so the change takes effect this session, no restart needed.

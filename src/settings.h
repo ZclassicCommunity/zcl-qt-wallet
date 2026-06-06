@@ -91,7 +91,24 @@ public:
 
     bool    getAllowCustomFees();
     void    setAllowCustomFees(bool allow);
-            
+
+    // COIN CONTROL (Advanced, default OFF). When ON, the Send tab shows a "Coin
+    // Control…" button next to the from-address combo so the user can pin exactly which
+    // already-valid inputs a payment spends. The button is additionally gated on daemon
+    // support (RPC::coinControlSupported()), so turning this on never offers a feature
+    // the connected daemon can't honor.
+    bool    getCoinControlEnabled();
+    void    setCoinControlEnabled(bool on);
+
+    // COIN CONTROL — manual shielded-note selection (Advanced, default OFF). When OFF,
+    // the Coin Control dialog shows shielded (sapling/sprout) notes for visibility but
+    // leaves them UNcheckable; auto-selection stays privacy-optimized. When ON, the user
+    // may pick individual shielded notes (a one-time privacy warning is shown on first
+    // enable). Separate from getCoinControlEnabled so transparent coin control can be
+    // used without ever exposing per-note selection.
+    bool    getManualShieldedSelection();
+    void    setManualShieldedSelection(bool on);
+
     bool    isSaplingActive();
 
     void    setUsingZClassicConf(QString confLocation);

@@ -186,6 +186,21 @@ public:
     QString getDefaultSaplingAddress();
     QString getDefaultTAddress();
 
+    // COIN CONTROL daemon-capability gate. The Coin Control feature pins inputs via a
+    // 5TH positional z_sendmany argument (a typed `inputs` array). NOT every daemon
+    // supports it (the stock ZClassic z_sendmany rejects params.size() > 4), so we MUST
+    // probe before offering the UI: if the daemon lacks the param we HIDE Coin Control
+    // entirely rather than ever silently dropping the user's selection.
+    //
+    // probeCoinControlCapability() fires `help z_sendmany` ONCE per session and parses
+    // the returned synopsis for an `inputs` argument; the (default-FALSE, fail-safe)
+    // result latches into coinControlCapable and MainWindow::refreshCoinControlVisibility()
+    // is invoked so the Send-tab button appears/disappears accordingly. Probing again is a
+    // no-op once latched. Conservative: any parse ambiguity or RPC error leaves the
+    // capability OFF (Coin Control hidden), never on.
+    void probeCoinControlCapability();
+    bool coinControlSupported() const { return coinControlProbed && coinControlCapable; }
+
     void getAllPrivKeys(const std::function<void(QList<QPair<QString, QString>>)>);
 
     Turnstile*  getTurnstile()  { return turnstile; }
@@ -361,6 +376,13 @@ private:
     // of source. The per-address listunspent join remains the sole owner of the
     // per-address balances model / UTXO set and never touches the hero labels.
     bool                        summaryCapable              = true;
+
+    // COIN CONTROL capability latch (see probeCoinControlCapability()). coinControlProbed
+    // flips true once the one-shot `help z_sendmany` probe has answered; coinControlCapable
+    // is the (fail-safe default FALSE) verdict. coinControlSupported() requires BOTH, so an
+    // un-probed or unsupported daemon keeps the Coin Control UI hidden.
+    bool                        coinControlProbed           = false;
+    bool                        coinControlCapable          = false;
 
     Connection*                 conn                        = nullptr;
     QProcess*                   ezclassicd                     = nullptr;

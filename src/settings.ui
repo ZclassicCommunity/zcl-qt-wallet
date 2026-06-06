@@ -340,6 +340,47 @@
         </widget>
        </item>
        <item row="6" column="0">
+        <widget class="Line" name="line_5">
+         <property name="orientation">
+          <enum>Qt::Horizontal</enum>
+         </property>
+        </widget>
+       </item>
+       <item row="7" column="0">
+        <widget class="QCheckBox" name="chkCoinControl">
+         <property name="text">
+          <string>Enable Coin Control (choose which inputs a payment spends)</string>
+         </property>
+        </widget>
+       </item>
+       <item row="8" column="0">
+        <widget class="QLabel" name="label_coincontrol">
+         <property name="text">
+          <string>Advanced. Adds a &quot;Coin Control…&quot; button to the Send tab so you can pick exactly which already-confirmed inputs a payment spends. This only restricts which of your own valid inputs are used; it never changes fees, change, or how transactions are formed. Shown only when your node supports it. Default: off.</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item row="9" column="0">
+        <widget class="QCheckBox" name="chkManualShielded">
+         <property name="text">
+          <string>Allow manual shielded note selection in Coin Control</string>
+         </property>
+        </widget>
+       </item>
+       <item row="10" column="0">
+        <widget class="QLabel" name="label_manualshielded">
+         <property name="text">
+          <string>Advanced. Lets you hand-pick individual shielded (z) notes in Coin Control. Manually selecting shielded notes can REDUCE your privacy; automatic selection is privacy-optimized. Default: off.</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item row="11" column="0">
         <spacer name="verticalSpacer_3">
          <property name="orientation">
           <enum>Qt::Vertical</enum>

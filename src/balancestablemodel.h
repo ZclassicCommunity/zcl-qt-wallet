@@ -16,6 +16,25 @@ struct UnspentOutput {
     // basis must EXCLUDE these. C++14 default member init keeps this an aggregate,
     // so existing brace-initializers without the field still compile (coinbase=false).
     bool    coinbase = false;
+
+    // COIN CONTROL — the per-output coordinates the daemon needs to pin THIS exact
+    // input in a typed z_sendmany inputs array. ALL default-initialized so this stays a
+    // C++14 brace-init aggregate (every existing UnspentOutput{...} initializer that
+    // omits them still compiles). They carry NO money math and are written ONLY by
+    // RPC::processUnspent from the daemon's own listunspent / z_listunspent reply:
+    //   * transparent (listunspent):  vout       (the output index)
+    //   * Sapling     (z_listunspent): outindex  (the note's output index)
+    //   * Sprout      (z_listunspent): jsindex + jsoutindex (the JoinSplit coords)
+    // A field stays -1 when it does not apply to the row's pool, so the typed-inputs
+    // builder picks the right key set per type. `change` mirrors z_listunspent's
+    // "change" flag (true => this note is wallet change), surfaced read-only in the
+    // Coin Control table's Change? column. These never alter selection/affordability
+    // logic; they are pure pass-through coordinates + display metadata.
+    int     vout      = -1;     // transparent output index
+    int     outindex  = -1;     // Sapling note output index
+    int     jsindex   = -1;     // Sprout JoinSplit index
+    int     jsoutindex= -1;     // Sprout JoinSplit output index
+    bool    change    = false;  // z_listunspent "change": this note is wallet change
 };
 
 class BalancesTableModel : public QAbstractTableModel
