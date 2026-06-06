@@ -15,6 +15,8 @@
 #include "nftgallerymodel.h"
 #include "nftgallerydelegate.h"
 #include "nftimagecache.h"
+#include "nftdetaildialog.h"
+#include "nftmintdialog.h"
 #include "settings.h"
 #include "version.h"
 #include "turnstile.h"
@@ -37,6 +39,9 @@
 #include <QHBoxLayout>
 #include <QGridLayout>
 #include <QListView>      // Phase C0: the native Collections (NFT) gallery view
+#include <QLineEdit>      // Item B: copyable zslpindex=1 hint line
+#include <QClipboard>     // Item B: Copy-line button
+#include <QApplication>   // Item B: QApplication::clipboard()
 #include <QTabBar>
 #include <QSignalBlocker>
 #include <QFileInfo>     // showExternalNodeAuthFailed: open the conf's folder
@@ -3025,14 +3030,83 @@ void MainWindow::setupNFTTab() {
     outer->setContentsMargins(12, 12, 12, 12);
     outer->setSpacing(8);
 
+    // Heading row: title (left) + a green "Make a collectible" button (right) that
+    // opens the mint wizard.
+    auto* headingRow = new QHBoxLayout();
     auto* heading = new QLabel(tr("Collections"), nftTab);
     heading->setObjectName("nftGalleryHeading");
+    headingRow->addWidget(heading);
+    headingRow->addStretch(1);
+    auto* mintBtn = new QPushButton(tr("Make a collectible"), nftTab);
+    mintBtn->setObjectName("nftMakeButton");
+    headingRow->addWidget(mintBtn);
+    outer->addLayout(headingRow);
+
     auto* sub = new QLabel(
-        tr("Your NFTs. Each asset is checked against its on-chain hash."), nftTab);
+        tr("Your NFTs. The image on each card is checked against its on-chain fingerprint."),
+        nftTab);
     sub->setObjectName("nftGallerySubhead");
     sub->setWordWrap(true);
-    outer->addWidget(heading);
+    // Item B (honesty): the verify-badge disambiguation, available on the subhead so a
+    // user can learn what the green check does — and does NOT — mean.
+    sub->setWhatsThis(
+        tr("A green check (✓) on a card means the image matches the fingerprint "
+           "recorded on-chain. It does NOT mean the collectible is genuine, official, "
+           "or authorized — anyone can mint a copy that reuses the same picture."));
     outer->addWidget(sub);
+
+    // Item B: first-run Collections intro — what a collectible is + the calm
+    // non-consensus honesty, in one short panel. Shown only while the grid is empty
+    // (setNFTItems hides it once real rows arrive).
+    nftIntroLabel = new QLabel(nftTab);
+    nftIntroLabel->setObjectName("nftGalleryIntro");
+    nftIntroLabel->setWordWrap(true);
+    nftIntroLabel->setText(tr(
+        "A collectible is a one-of-a-kind item recorded on the ZClassic ledger. The "
+        "image stays on your computer — only its fingerprint goes on-chain, so the "
+        "wallet can confirm the picture you hold is the one that was recorded. "
+        "Collectibles are a new, optional feature layered on top of ZCL — please use "
+        "small amounts while we harden it."));
+    nftIntroLabel->setStyleSheet("color:#9aa0a6; font-size:11px;");
+    nftIntroLabel->hide();
+    outer->addWidget(nftIntroLabel);
+
+    // Honest state line: hidden when the grid has rows; shows the empty / index-off
+    // message otherwise (NATIVE_NFT_GUIDE §2.3). Wired by setNFTItems(items,indexOff).
+    nftStateLabel = new QLabel(nftTab);
+    nftStateLabel->setObjectName("nftGalleryStateLine");
+    nftStateLabel->setWordWrap(true);
+    nftStateLabel->setStyleSheet("color:#9aa0a6;");
+    nftStateLabel->hide();
+    outer->addWidget(nftStateLabel);
+
+    // Item B: the COPYABLE "zslpindex=1" hint for the index-off dead-end. A read-only
+    // selectable line + a Copy button, so a foreign/old daemon's owner can paste the
+    // exact config line. Shown ONLY in the index-off state (setNFTItems toggles it).
+    nftIndexHint = new QWidget(nftTab);
+    nftIndexHint->setObjectName("nftGalleryIndexHint");
+    auto* hintRow = new QHBoxLayout(nftIndexHint);
+    hintRow->setContentsMargins(0, 0, 0, 0);
+    hintRow->setSpacing(8);
+    auto* hintLabel = new QLabel(tr("Add this line to your zclassic.conf:"), nftIndexHint);
+    hintLabel->setStyleSheet("color:#9aa0a6;");
+    auto* hintEdit = new QLineEdit(QStringLiteral("zslpindex=1"), nftIndexHint);
+    hintEdit->setObjectName("nftGalleryIndexHintLine");
+    hintEdit->setReadOnly(true);
+    hintEdit->setMaximumWidth(160);
+    auto* hintCopy = new QPushButton(tr("Copy line"), nftIndexHint);
+    hintCopy->setObjectName("nftGalleryIndexHintCopy");
+    QObject::connect(hintCopy, &QPushButton::clicked, this, [hintEdit]() {
+        QApplication::clipboard()->setText(hintEdit->text());
+    });
+    hintRow->addWidget(hintLabel);
+    hintRow->addWidget(hintEdit);
+    hintRow->addWidget(hintCopy);
+    hintRow->addStretch(1);
+    nftIndexHint->hide();
+    outer->addWidget(nftIndexHint);
+
+    QObject::connect(mintBtn, &QPushButton::clicked, this, &MainWindow::openMintDialog);
 
     // --- the gallery view --------------------------------------------------
     auto* view = new QListView(nftTab);
@@ -3054,6 +3128,10 @@ void MainWindow::setupNFTTab() {
     view->setModel(nftModel);
     view->setItemDelegate(new NFTGalleryDelegate(view));
 
+    // ACTIVATED ONLY: fires on double-click AND Enter/Space. Do NOT also connect
+    // doubleClicked, or the detail dialog opens twice (NATIVE_NFT_GUIDE §2.2).
+    QObject::connect(view, &QListView::activated, this, &MainWindow::openNFTDetail);
+
     outer->addWidget(view, 1);
 
     // --- add as a NEW tab right AFTER Transactions (index 3 -> NFT at 4) ----
@@ -3061,7 +3139,13 @@ void MainWindow::setupNFTTab() {
     int insertAt    = (activityIdx >= 0) ? activityIdx + 1 : ui->tabWidget->count();
     ui->tabWidget->insertTab(insertAt, nftTab, tr("Collections"));
 
-    // --- feed fixtures lazily the FIRST time the Collections tab is shown ---
+    // Phase C1: the SHIPPED build feeds this gallery from the wallet's REAL on-chain
+    // ZSLP NFTs — RPC::refreshNFTs() polls zslp_listmytokens + zslp_gettoken on the
+    // normal refresh cycle and calls MainWindow::setNFTItems(). No fixtures are fed
+    // on the default path; the grid simply shows the empty/"index off" state until
+    // real data lands. The DEV fixture set (bundled sample PNGs) is reachable only
+    // under NFT_GALLERY_FIXTURES, for offline delegate/UX iteration.
+#ifdef NFT_GALLERY_FIXTURES
     QObject::connect(ui->tabWidget, &QTabWidget::currentChanged, this, [this](int idx) {
         if (nftFixturesLoaded || !nftTab)
             return;
@@ -3069,13 +3153,131 @@ void MainWindow::setupNFTTab() {
             return;
         loadNFTFixtures();
     });
+#endif
 }
 
-// Build the FIXTURE NFT set (bundled :/nft/ PNGs + fake metadata) and feed the
-// model, then kick off the threaded decode+verify for each. One item carries a
-// deliberately-WRONG docHashHex so the red MISMATCH badge is demonstrable, and
-// one is left UNVERIFIED (empty bytes path) so the amber PENDING badge shows.
+// ----------------------------------------------------------------------------
+// Open the native detail dialog for the activated gallery item. Connected to
+// QListView::activated ONLY (fires on double-click AND Enter/Space), so there is
+// no double-open. Snapshots the ordered POD list from the model (no model pointer
+// crosses into the dialog) and hands the dialog the EXISTING ContentEngine
+// (nftImgCache, upcast) — never a second engine. open() (not exec()) keeps the
+// poll loop flowing so the dialog's provenance/received-date back-fill lands.
+// ----------------------------------------------------------------------------
+void MainWindow::openNFTDetail(const QModelIndex& idx) {
+    if (!nftModel || !idx.isValid())
+        return;
+    QVector<NFTItem> ordered;
+    ordered.reserve(nftModel->rowCount());
+    for (int r = 0; r < nftModel->rowCount(); ++r)
+        ordered.push_back(nftModel->itemAt(r));
+    const int row = idx.row();
+    if (row < 0 || row >= ordered.size())
+        return;
+
+    auto* dlg = new NFTDetailDialog(ordered.at(row), ordered, row,
+                                    nftImgCache /*ContentEngine*/, rpc, this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->open();
+}
+
+// Open the "Make a collectible" mint wizard (modal). RPC::mintNFT already kicks an
+// NFT refresh on success; on accept we additionally trigger a full poll so balances
+// and the gallery re-pull promptly (the new token is 0-conf/pending until it
+// confirms — the gallery shows the calm pending state, never "not owned").
+void MainWindow::openMintDialog() {
+    if (!nftImgCache)
+        return;
+    NftMintDialog dlg(nftImgCache /*ContentEngine*/, rpc, this);
+    if (dlg.exec() == QDialog::Accepted && rpc)
+        rpc->refresh(true);
+}
+
+// ----------------------------------------------------------------------------
+// Phase C1: feed the Collections gallery with the wallet's REAL on-chain NFTs.
+//
+// Called by RPC::refreshNFTs() on the normal refresh cycle with the QVector<NFTItem>
+// it built from zslp_listmytokens + zslp_gettoken (public ZSLP, transparent-dust
+// carried). The model's setItems() is fingerprint-guarded, so re-feeding identical
+// data every poll emits zero model churn (no relayout, no thumbnail re-request).
+//
+// `indexOff` is true when the daemon lacks -zslpindex (the read RPC threw
+// RPC_MISC_ERROR): we just feed an empty set so the gallery shows its clean empty
+// state. Per the UX spec a richer "public collectibles are turned off, your private
+// NFTs are still shown" banner belongs to the toolbar/state-overlay work (Region D);
+// C1 keeps the contract minimal — no crash, no error spam.
+//
+// PRIVACY (hard rule): every NFTItem fed here has cachePath == "" — we never point
+// the image pipeline at a remote documenturl, so NFTImageCache NEVER fetches an
+// image over the network (no IP / interest leak). We queue a decode ONLY for items
+// that carry a LOCAL bytes path (none yet in C1 — public ZSLP assets live off-chain
+// and arrive later via the private data channel or an explicit, user-confirmed
+// fetch in the detail view). Items with an empty cachePath stay at verifyState 0
+// (shimmer + amber "?"), which is exactly the "image not downloaded" state.
+// ----------------------------------------------------------------------------
+void MainWindow::setNFTItems(const QVector<NFTItem>& items, bool indexOff) {
+    if (!nftModel)
+        return;   // gallery disabled (no tab created) -> nothing to do
+
+    // Honor indexOff with a distinct, honest state line (NATIVE_NFT_GUIDE §2.3):
+    //   index off            -> "Collectibles tracking is turned off…"
+    //   index on, no rows     -> "No collectibles yet…"
+    //   index on, has rows    -> hide the line (the grid speaks for itself)
+    if (nftStateLabel) {
+        if (indexOff) {
+            nftStateLabel->setText(tr(
+                "Collectibles tracking is turned off on your node. Turn on the "
+                "collectibles index and the wallet will start finding your "
+                "collectibles after a one-time catch-up scan."));
+            nftStateLabel->show();
+        } else if (items.isEmpty()) {
+            nftStateLabel->setText(tr(
+                "No collectibles yet. When someone sends you one, or you make one, "
+                "it shows up here."));
+            nftStateLabel->show();
+        } else {
+            nftStateLabel->hide();
+        }
+    }
+    // Item B: the COPYABLE zslpindex=1 hint is shown ONLY in the index-off state, so
+    // a foreign/old daemon's owner can paste the exact config line (not a prose
+    // dead-end). The first-run intro shows while the grid is empty (index on), and is
+    // hidden once real rows arrive.
+    if (nftIndexHint)
+        nftIndexHint->setVisible(indexOff);
+    if (nftIntroLabel)
+        nftIntroLabel->setVisible(!indexOff && items.isEmpty());
+
+    // Real data now owns the gallery; never let a (dev) fixture feed clobber it.
+    nftFixturesLoaded = true;
+
+    nftModel->setItems(items);
+
+    // Kick off the threaded decode + verify ONLY for items that carry a LOCAL bytes
+    // path. In C1 every public-ZSLP item has an empty cachePath (no local bytes yet),
+    // so this loop is a no-op for them and NOTHING is fetched over the network — the
+    // privacy contract. When the private data channel (or an explicit user fetch)
+    // later populates a local cachePath, those items decode + verify here.
+    if (nftImgCache) {
+        for (int row = 0; row < items.size(); ++row) {
+            const NFTItem& it = items.at(row);
+            if (it.cachePath.isEmpty())
+                continue;   // PRIVACY: no local bytes -> no fetch, stays pending
+            nftImgCache->request(it.docHashHex, it.cachePath, it.docHashHex, nftThumbPx);
+        }
+    }
+}
+
+// DEV-ONLY fixture set (bundled :/nft/ PNGs + fake metadata). Reachable only when
+// the app is built with NFT_GALLERY_FIXTURES — the shipped build feeds the gallery
+// exclusively from real on-chain data via setNFTItems()/RPC::refreshNFTs. Kept for
+// offline delegate/UX iteration: one item carries a deliberately-WRONG docHashHex
+// so the red MISMATCH badge is demonstrable, and one is left UNVERIFIED (missing
+// bytes path) so the amber PENDING badge shows.
 void MainWindow::loadNFTFixtures() {
+#ifndef NFT_GALLERY_FIXTURES
+    return;   // shipped build: never feed fixtures; real data only
+#else
     if (nftFixturesLoaded || !nftModel)
         return;
     nftFixturesLoaded = true;
@@ -3138,13 +3340,13 @@ void MainWindow::loadNFTFixtures() {
     // Kick off the threaded decode + verify for every item that has a real bytes
     // path. The cache delivers each result back on the GUI thread (onImageReady).
     // The thumbnail width matches the delegate card's inner thumbnail area.
-    const int thumbPx = 152;   // 168 card - 2*8 padding
     if (nftImgCache) {
         for (int row = 0; row < items.size(); ++row) {
             const NFTItem& it = items.at(row);
-            nftImgCache->request(it.docHashHex, it.cachePath, it.docHashHex, thumbPx);
+            nftImgCache->request(it.docHashHex, it.cachePath, it.docHashHex, nftThumbPx);
         }
     }
+#endif // NFT_GALLERY_FIXTURES
 }
 
 void MainWindow::setupTransactionsTab() {

@@ -53,6 +53,10 @@
 #include <QEvent>
 #include <QDir>
 #include <QFile>
+#include <QMimeData>
+#include <QDropEvent>
+#include <QCryptographicHash>
+#include <QImage>
 #include <QPixmap>
 #include <QPalette>
 #include <QColor>
@@ -82,6 +86,11 @@
 #include "settings.h"
 #include "connection.h"
 #include "notifyserver.h"
+#include "nft.h"
+#include "contentengine.h"
+#include "nftdetaildialog.h"
+#include "nftmintdialog.h"
+#include "nftsenddialog.h"
 
 // Kept alive for the whole process so QStandardPaths/QSettings stay isolated.
 static QTemporaryDir* g_homeDir = nullptr;
@@ -1854,6 +1863,506 @@ private slots:
     //   without a rebuild. To measure the REAL rebuild cost on every iteration we
     //   alternate between two distinct datasets (A/B) so each call sees changed
     //   data and actually does the work.
+    // ---- NFT detail dialog: no-local-bytes is a TERMINAL state, never a spinner -----
+    // Review fix #1/#2: an on-chain NFT whose image bytes are NOT on this computer
+    // (the DEFAULT for every freshly-listed token: cachePath="") must show a neutral,
+    // factual verify line — NOT a perpetual "Checking this image…" with no work in
+    // flight, and NOT an instruction the dialog cannot fulfil ("Open to fetch it
+    // yourself" with no fetch affordance). We construct the dialog with a real engine
+    // and a no-bytes item, then assert the verify line settled to the terminal copy.
+    void nftDetail_noBytesIsTerminalNotSpinner() {
+        ContentEngine engine(nullptr);   // a real engine; null model is fine (token path)
+
+        NFTItem it;
+        it.name       = "Orphan";
+        it.collection = "Strays";
+        it.txid       = "deadbeef";
+        it.docHashHex = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        it.cachePath  = "";              // NO local bytes -> the no-fetch terminal path
+        it.isPrivate  = false;
+        it.verifyState = 0;
+        QVector<NFTItem> ordered; ordered.push_back(it);
+
+        // rpc == nullptr: the dialog's backfill RPCs are guarded on m_rpc==nullptr, so
+        // this exercises the pure poster/verify path with no daemon.
+        NFTDetailDialog* dlg = new NFTDetailDialog(it, ordered, 0, &engine, nullptr);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+
+        auto* verifyLine = dlg->findChild<QLabel*>("nftDetailVerifyLine");
+        QVERIFY2(verifyLine, "detail dialog must expose its verify line by objectName");
+
+        // The no-bytes decision is synchronous (requestPoster early-returns), so the
+        // verify line is already terminal — but pump a few cycles to be safe.
+        QElapsedTimer t; t.start();
+        while (verifyLine->text().contains("Checking", Qt::CaseInsensitive)
+               && t.elapsed() < 2000)
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 25);
+
+        const QString line = verifyLine->text();
+        // (a) NOT a perpetual spinner.
+        QVERIFY2(!line.contains("Checking", Qt::CaseInsensitive),
+                 qPrintable("verify line stuck spinning: " + line));
+        // (b) NOT a dead-end instruction (no "fetch it yourself" call-to-action with
+        //     no affordance) — it states a FACT.
+        QVERIFY2(!line.contains("fetch it yourself", Qt::CaseInsensitive),
+                 qPrintable("verify line gives an impossible instruction: " + line));
+        // (c) It's the honest neutral "can't check — not on this computer" terminal.
+        QVERIFY2(line.contains("Can't check", Qt::CaseInsensitive)
+                     && line.contains("isn't on this computer", Qt::CaseInsensitive),
+                 qPrintable("verify line is not the terminal no-bytes copy: " + line));
+
+        // The Re-check button must be DISABLED in this state (no dead click).
+        QPushButton* recheck = nullptr;
+        for (QPushButton* b : dlg->findChildren<QPushButton*>())
+            if (b->text().contains("Re-check", Qt::CaseInsensitive)) { recheck = b; break; }
+        QVERIFY2(recheck, "detail dialog must have a Re-check button");
+        QVERIFY2(!recheck->isEnabled(), "Re-check must be disabled with no local bytes");
+
+        dlg->close();   // WA_DeleteOnClose -> deleted; closing the UAF surface too
+    }
+
+    // ======================================================================
+    // NFT dialog L1 tests (items A + E). Driven via the RPC test seams
+    // (testSetNextMintResult/SendResult/NftError) + the detail dialog's
+    // testAttachFile seam, all under ZCL_WIDGET_TEST + offscreen QPA. No daemon.
+    // ----------------------------------------------------------------------
+private:
+    // Pump the event loop until `pred()` is true or the bound elapses. Returns the
+    // final pred() value so a test can assert it (never an open-ended sleep).
+    template <typename Pred>
+    bool pumpUntil(Pred pred, int maxMs = 5000) {
+        QElapsedTimer t; t.start();
+        while (!pred() && t.elapsed() < maxMs)
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 25);
+        return pred();
+    }
+    // Write a real, decodable PNG of a given color; return its path + true SHA-256
+    // (the bare whole-file hash — small files anchor on the whole hash). The detail
+    // attach-gate + posterForToken both accept that as the on-chain anchor.
+    QString writePngWithHash(const QString& dir, const QString& name,
+                             const QColor& fill, QString& outHashHex) {
+        const QString p = QDir(dir).filePath(name);
+        QImage img(40, 40, QImage::Format_ARGB32);
+        img.fill(fill);
+        if (!img.save(p, "PNG")) return QString();
+        QFile f(p);
+        if (!f.open(QIODevice::ReadOnly)) return QString();
+        const QByteArray bytes = f.readAll(); f.close();
+        outHashHex = QString::fromLatin1(
+            QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
+        return p;
+    }
+
+private slots:
+
+    // -- MINT: Create stays disabled until name + fingerprint, hashing reaches ready
+    void nftMint_createGatedUntilNameAndFingerprint() {
+        QTemporaryDir appDir; QVERIFY(appDir.isValid());
+        qputenv("XDG_DATA_HOME", appDir.path().toUtf8());
+        QStandardPaths::setTestModeEnabled(true);
+        ContentEngine engine(nullptr);
+
+        MainWindow* w = makeWindow();
+        NftMintDialog* dlg = new NftMintDialog(&engine, w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* create = dlg->findChild<QPushButton*>("nftMintCreateButton");
+        auto* name   = dlg->findChild<QLineEdit*>("nftMintNameEdit");
+        auto* fp     = dlg->findChild<QLabel*>("nftMintFingerprintLabel");
+        QVERIFY(create && name && fp);
+
+        QVERIFY2(!create->isEnabled(), "Create must be disabled at open (no name, no file)");
+
+        // Type a name -> still disabled (no fingerprint yet).
+        name->setText("My collectible");
+        QVERIFY2(!create->isEnabled(), "Create must stay disabled with a name but no fingerprint");
+
+        // Drive a real file hash through the engine (the same descriptorReady the
+        // dialog listens for). The dialog computes the anchor + reaches "ready".
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        QString hashHex;
+        const QString png = writePngWithHash(tmp.path(), "a.png", Qt::blue, hashHex);
+        QVERIFY(!png.isEmpty());
+        // Drive the dialog's own pick path (same as a choose/drop) via the test seam.
+        dlg->testPickFile(png);
+
+        QVERIFY2(pumpUntil([&]{ return fp->text().contains("Fingerprint ready", Qt::CaseInsensitive); }),
+                 qPrintable("fingerprint never reached ready: " + fp->text()));
+        QVERIFY2(create->isEnabled(), "Create must be ENABLED once name + fingerprint are present");
+
+        dlg->close();
+        w->deleteLater();
+        QStandardPaths::setTestModeEnabled(false);
+    }
+
+    // -- MINT: a remote-URL drop is rejected + Create stays disabled
+    void nftMint_remoteUrlDropRejected() {
+        ContentEngine engine(nullptr);
+        MainWindow* w = makeWindow();
+        NftMintDialog* dlg = new NftMintDialog(&engine, w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* create = dlg->findChild<QPushButton*>("nftMintCreateButton");
+        auto* name   = dlg->findChild<QLineEdit*>("nftMintNameEdit");
+        auto* fp     = dlg->findChild<QLabel*>("nftMintFingerprintLabel");
+        QVERIFY(create && name && fp);
+        name->setText("Has a name");   // name present so the gate hinges on the rejected file
+
+        // A remote/URL "file" must be rejected by the privacy guard (same path a
+        // non-local drop takes): isRemoteUrl(path) -> red copy, no hashing, no anchor.
+        dlg->testPickFile("https://example.com/cat.png");
+
+        QVERIFY2(fp->text().contains("local file", Qt::CaseInsensitive)
+                 || fp->text().contains("web link", Qt::CaseInsensitive),
+                 qPrintable("remote drop not rejected with the privacy copy: " + fp->text()));
+        QVERIFY2(!create->isEnabled(), "Create must stay DISABLED after a rejected remote drop");
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- MINT: success -> Create becomes Done + honest "confirming" line + NOT accepted
+    void nftMint_successBecomesDoneNotAutoAccepted() {
+        QTemporaryDir appDir; QVERIFY(appDir.isValid());
+        qputenv("XDG_DATA_HOME", appDir.path().toUtf8());
+        QStandardPaths::setTestModeEnabled(true);
+        ContentEngine engine(nullptr);
+
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+        NftMintDialog* dlg = new NftMintDialog(&engine, rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* create = dlg->findChild<QPushButton*>("nftMintCreateButton");
+        auto* name   = dlg->findChild<QLineEdit*>("nftMintNameEdit");
+        auto* fp     = dlg->findChild<QLabel*>("nftMintFingerprintLabel");
+        auto* result = dlg->findChild<QLabel*>("nftMintResultLine");
+        QVERIFY(create && name && fp && result);
+
+        name->setText("Done test");
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        QString hashHex;
+        const QString png = writePngWithHash(tmp.path(), "b.png", Qt::red, hashHex);
+        dlg->testPickFile(png);
+        QVERIFY(pumpUntil([&]{ return create->isEnabled(); }));
+
+        // Install the success result the next mintNFT delivers, then click Create.
+        rpc->testSetNextMintResult("txdeadbeef", "tokdeadbeef");
+        create->click();
+
+        QVERIFY2(pumpUntil([&]{ return create->text() == QString("Done"); }),
+                 qPrintable("Create did not retire to Done: " + create->text()));
+        QVERIFY2(result->text().contains("confirm", Qt::CaseInsensitive),
+                 qPrintable("result line missing the honest confirming copy: " + result->text()));
+        QCOMPARE(dlg->lastTxid(), QString("txdeadbeef"));
+        QVERIFY2(dlg->result() != QDialog::Accepted,
+                 "dialog must NOT auto-accept on success (user reads the confirmation first)");
+
+        dlg->close();
+        w->deleteLater();
+        QStandardPaths::setTestModeEnabled(false);
+    }
+
+    // -- MINT: the window [X]/close is swallowed while the RPC is in flight
+    void nftMint_closeSwallowedWhileInFlight() {
+        QTemporaryDir appDir; QVERIFY(appDir.isValid());
+        qputenv("XDG_DATA_HOME", appDir.path().toUtf8());
+        QStandardPaths::setTestModeEnabled(true);
+        ContentEngine engine(nullptr);
+
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+        NftMintDialog* dlg = new NftMintDialog(&engine, rpc, w);
+        dlg->show();   // NOT WA_DeleteOnClose: we assert it survives the close
+
+        auto* create = dlg->findChild<QPushButton*>("nftMintCreateButton");
+        auto* name   = dlg->findChild<QLineEdit*>("nftMintNameEdit");
+        QVERIFY(create && name);
+        name->setText("Inflight");
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        QString hashHex;
+        const QString png = writePngWithHash(tmp.path(), "c.png", Qt::green, hashHex);
+        dlg->testPickFile(png);
+        QVERIFY(pumpUntil([&]{ return create->isEnabled(); }));
+
+        // Install NOTHING -> the seam returns without firing either callback, so the
+        // dialog stays in-flight (m_inFlight==true) indefinitely.
+        create->click();
+        QVERIFY2(pumpUntil([&]{ return create->text() == QString("Creating…"); }),
+                 "Create should read Creating… while in flight");
+
+        // Attempt to close: the closeEvent must be swallowed (dialog still visible).
+        dlg->close();
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 25);
+        QVERIFY2(dlg->isVisible(), "dialog must NOT close while the mint RPC is in flight");
+        QVERIFY2(dlg->result() != QDialog::Accepted, "must not have accepted while in flight");
+
+        delete dlg;   // test owns it (no WA_DeleteOnClose); explicit teardown
+        w->deleteLater();
+        QStandardPaths::setTestModeEnabled(false);
+    }
+
+    // -- SEND: 4-state recipient validation; zs rejected; Send only for a valid t-addr
+    void nftSend_fourStateRecipientValidation() {
+        const QString TADDR = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        const QString ZSADDR =
+            "zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u";
+
+        MainWindow* w = makeWindow();
+        NFTItem it; it.name = "Gift"; it.txid = "tok1"; it.verifyState = 1;
+        NFTSendDialog* dlg = new NFTSendDialog(it, w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* rcpt   = dlg->findChild<QLineEdit*>("nftSendRecipientEdit");
+        auto* status = dlg->findChild<QLabel*>("nftSendAddrStatus");
+        auto* send   = dlg->findChild<QPushButton*>("nftSendButton");
+        QVERIFY(rcpt && status && send);
+
+        // (1) empty -> status clear, Send disabled.
+        QVERIFY2(status->text().isEmpty(), "empty recipient should clear the status");
+        QVERIFY(!send->isEnabled());
+
+        // (2) garbage -> "doesn't look like a ZClassic address", Send disabled.
+        rcpt->setText("not-an-address");
+        QVERIFY2(status->text().contains("doesn't look like", Qt::CaseInsensitive)
+                 || status->text().contains("ZClassic address", Qt::CaseInsensitive),
+                 qPrintable("garbage addr status: " + status->text()));
+        QVERIFY(!send->isEnabled());
+
+        // (3) valid t-addr -> "public" status, Send ENABLED.
+        rcpt->setText(TADDR);
+        QVERIFY2(status->text().contains("public", Qt::CaseInsensitive),
+                 qPrintable("valid t-addr status should mention public: " + status->text()));
+        QVERIFY2(send->isEnabled(), "Send must be ENABLED for a valid t-addr (verifyState 1)");
+
+        // (4) valid zs-addr -> private gifts coming soon, Send DISABLED.
+        rcpt->setText(ZSADDR);
+        QVERIFY2(status->text().contains("Private gifts", Qt::CaseInsensitive)
+                 || status->text().contains("public (transparent) address", Qt::CaseInsensitive),
+                 qPrintable("zs-addr should be rejected with the private-soon copy: " + status->text()));
+        QVERIFY2(!send->isEnabled(), "a valid zs-addr must NOT enable Send (public path only)");
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- SEND: the LOAD-BEARING mismatch guard. verifyState==2 disables Send even with
+    //    a valid t-addr; verifyState==1 with the same addr allows it.
+    void nftSend_mismatchDisablesSendEvenWithValidTAddr() {
+        const QString TADDR = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        MainWindow* w = makeWindow();
+
+        // MISMATCH item (verifyState==2): the red warning is present AND Send stays
+        // disabled even after typing a valid t-addr.
+        NFTItem bad; bad.name = "Tampered"; bad.txid = "tokbad"; bad.verifyState = 2;
+        NFTSendDialog* dBad = new NFTSendDialog(bad, w->getRPC(), w);
+        dBad->setAttribute(Qt::WA_DeleteOnClose);
+        dBad->show();
+        auto* warn = dBad->findChild<QLabel*>("nftSendMismatchWarning");
+        auto* rcptBad = dBad->findChild<QLineEdit*>("nftSendRecipientEdit");
+        auto* sendBad = dBad->findChild<QPushButton*>("nftSendButton");
+        QVERIFY(rcptBad && sendBad);
+        QVERIFY2(warn, "a verifyState==2 item must surface the red mismatch warning");
+        QVERIFY2(warn->text().contains("doesn't match", Qt::CaseInsensitive),
+                 qPrintable("mismatch warning copy: " + warn->text()));
+        rcptBad->setText(TADDR);
+        QVERIFY2(!sendBad->isEnabled(),
+                 "MISMATCH: Send must stay DISABLED even with a valid t-addr (the guard)");
+        dBad->close();
+
+        // VERIFIED sibling (verifyState==1): the same valid t-addr enables Send.
+        NFTItem ok; ok.name = "Good"; ok.txid = "tokok"; ok.verifyState = 1;
+        NFTSendDialog* dOk = new NFTSendDialog(ok, w->getRPC(), w);
+        dOk->setAttribute(Qt::WA_DeleteOnClose);
+        dOk->show();
+        auto* warnOk = dOk->findChild<QLabel*>("nftSendMismatchWarning");
+        auto* rcptOk = dOk->findChild<QLineEdit*>("nftSendRecipientEdit");
+        auto* sendOk = dOk->findChild<QPushButton*>("nftSendButton");
+        QVERIFY(rcptOk && sendOk);
+        QVERIFY2(!warnOk, "a verified item must NOT show the mismatch warning");
+        rcptOk->setText(TADDR);
+        QVERIFY2(sendOk->isEnabled(),
+                 "VERIFIED: a valid t-addr must enable Send (proves the guard is mismatch-only)");
+        dOk->close();
+
+        w->deleteLater();
+    }
+
+    // -- SEND: success -> Send becomes Done + "on its way" copy + NOT auto-accepted
+    void nftSend_successBecomesDone() {
+        const QString TADDR = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+
+        NFTItem it; it.name = "Sendable"; it.txid = "toksend"; it.verifyState = 1;
+        NFTSendDialog* dlg = new NFTSendDialog(it, rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* rcpt = dlg->findChild<QLineEdit*>("nftSendRecipientEdit");
+        auto* send = dlg->findChild<QPushButton*>("nftSendButton");
+        auto* result = dlg->findChild<QLabel*>("nftSendAddrStatus");   // status reused
+        QVERIFY(rcpt && send);
+        rcpt->setText(TADDR);
+        QVERIFY(pumpUntil([&]{ return send->isEnabled(); }));
+
+        rpc->testSetNextSendResult("txsent");
+        send->click();
+
+        QVERIFY2(pumpUntil([&]{ return send->text() == QString("Done"); }),
+                 qPrintable("Send did not retire to Done: " + send->text()));
+        QVERIFY2(dlg->result() != QDialog::Accepted,
+                 "send dialog must NOT auto-accept on success");
+        (void)result;
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- DETAIL: VERIFIED says "matches its on-chain fingerprint"
+    void nftDetail_verifiedSaysMatches() {
+        QTemporaryDir appDir; QVERIFY(appDir.isValid());
+        qputenv("XDG_DATA_HOME", appDir.path().toUtf8());
+        QStandardPaths::setTestModeEnabled(true);
+        ContentEngine engine(nullptr);
+
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        QString hashHex;
+        const QString png = writePngWithHash(tmp.path(), "good.png", Qt::cyan, hashHex);
+        QVERIFY(!png.isEmpty());
+
+        NFTItem it; it.name = "Verified"; it.txid = "tokv";
+        it.docHashHex = hashHex; it.cachePath = png; it.isPrivate = false; it.verifyState = 1;
+        QVector<NFTItem> ordered; ordered.push_back(it);
+
+        NFTDetailDialog* dlg = new NFTDetailDialog(it, ordered, 0, &engine, nullptr);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        auto* line = dlg->findChild<QLabel*>("nftDetailVerifyLine");
+        QVERIFY(line);
+        QVERIFY2(pumpUntil([&]{ return line->text().contains("matches its on-chain fingerprint", Qt::CaseInsensitive); }),
+                 qPrintable("verified verify line: " + line->text()));
+
+        dlg->close();
+        QStandardPaths::setTestModeEnabled(false);
+    }
+
+    // -- DETAIL: MISMATCH says "does NOT match"
+    void nftDetail_mismatchSaysDoesNotMatch() {
+        QTemporaryDir appDir; QVERIFY(appDir.isValid());
+        qputenv("XDG_DATA_HOME", appDir.path().toUtf8());
+        QStandardPaths::setTestModeEnabled(true);
+        ContentEngine engine(nullptr);
+
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        QString realHash;
+        const QString png = writePngWithHash(tmp.path(), "real.png", Qt::magenta, realHash);
+        QVERIFY(!png.isEmpty());
+        // docHashHex is a WRONG anchor -> the engine recomputes from the real bytes and
+        // reports CE_Mismatch.
+        const QString wrong = QString(64, QChar('0'));
+
+        NFTItem it; it.name = "Tampered"; it.txid = "tokm";
+        it.docHashHex = wrong; it.cachePath = png; it.isPrivate = false; it.verifyState = 0;
+        QVector<NFTItem> ordered; ordered.push_back(it);
+
+        NFTDetailDialog* dlg = new NFTDetailDialog(it, ordered, 0, &engine, nullptr);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        auto* line = dlg->findChild<QLabel*>("nftDetailVerifyLine");
+        QVERIFY(line);
+        QVERIFY2(pumpUntil([&]{ return line->text().contains("does NOT match", Qt::CaseInsensitive); }),
+                 qPrintable("mismatch verify line: " + line->text()));
+
+        dlg->close();
+        QStandardPaths::setTestModeEnabled(false);
+    }
+
+    // -- DETAIL item-A: attach a MATCHING file -> badge resolves VERIFIED + cache filled
+    void nftDetail_attachFileVerifiesBadge() {
+        QTemporaryDir appDir; QVERIFY(appDir.isValid());
+        qputenv("XDG_DATA_HOME", appDir.path().toUtf8());
+        QStandardPaths::setTestModeEnabled(true);
+        ContentEngine engine(nullptr);
+
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        QString hashHex;
+        const QString png = writePngWithHash(tmp.path(), "attach.png", Qt::yellow, hashHex);
+        QVERIFY(!png.isEmpty());
+        // Clean any stale blob for this key so cacheGet starts empty.
+        QFile::remove(ContentEngine::blobCacheDir() + "/" + hashHex);
+        QVERIFY2(ContentEngine::cacheGet(hashHex).isEmpty(), "precondition: no cached blob");
+
+        // A RECEIVED NFT: cachePath="" (privacy), but docHashHex IS recorded.
+        NFTItem it; it.name = "Received"; it.txid = "tokr";
+        it.docHashHex = hashHex; it.cachePath = ""; it.isPrivate = false; it.verifyState = 0;
+        QVector<NFTItem> ordered; ordered.push_back(it);
+
+        NFTDetailDialog* dlg = new NFTDetailDialog(it, ordered, 0, &engine, nullptr);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        auto* line   = dlg->findChild<QLabel*>("nftDetailVerifyLine");
+        auto* attach = dlg->findChild<QLabel*>("nftAttachStatus");
+        QVERIFY(line && attach);
+        // Opens in the no-bytes terminal.
+        QVERIFY(pumpUntil([&]{ return line->text().contains("Can't check", Qt::CaseInsensitive); }));
+
+        // Drive the attach seam with the MATCHING file.
+        dlg->testAttachFile(png);
+        QVERIFY2(pumpUntil([&]{ return attach->text().contains("matches the on-chain fingerprint", Qt::CaseInsensitive); }),
+                 qPrintable("attach status (match) copy: " + attach->text()));
+        // The verify line resolves to VERIFIED, and the blob is now cached.
+        QVERIFY2(pumpUntil([&]{ return line->text().contains("matches its on-chain fingerprint", Qt::CaseInsensitive); }),
+                 qPrintable("verify line after attach: " + line->text()));
+        QVERIFY2(!ContentEngine::cacheGet(hashHex).isEmpty(),
+                 "a matching attach must cachePut the bytes (content-addressed)");
+
+        dlg->close();
+        QStandardPaths::setTestModeEnabled(false);
+    }
+
+    // -- DETAIL item-A: attach a NON-MATCHING file -> stays unverified, NOT cached
+    void nftDetail_attachNonMatchStaysUnverified() {
+        QTemporaryDir appDir; QVERIFY(appDir.isValid());
+        qputenv("XDG_DATA_HOME", appDir.path().toUtf8());
+        QStandardPaths::setTestModeEnabled(true);
+        ContentEngine engine(nullptr);
+
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        QString goodHash, otherHash;
+        const QString good  = writePngWithHash(tmp.path(), "good2.png",  Qt::darkGreen, goodHash);
+        const QString other = writePngWithHash(tmp.path(), "other.png",  Qt::darkRed,   otherHash);
+        QVERIFY(!good.isEmpty() && !other.isEmpty());
+        QVERIFY(goodHash != otherHash);
+        QFile::remove(ContentEngine::blobCacheDir() + "/" + goodHash);
+        QVERIFY(ContentEngine::cacheGet(goodHash).isEmpty());
+
+        // The NFT records goodHash, but the user attaches the WRONG file (other).
+        NFTItem it; it.name = "Received2"; it.txid = "tokr2";
+        it.docHashHex = goodHash; it.cachePath = ""; it.isPrivate = false; it.verifyState = 0;
+        QVector<NFTItem> ordered; ordered.push_back(it);
+
+        NFTDetailDialog* dlg = new NFTDetailDialog(it, ordered, 0, &engine, nullptr);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        auto* line   = dlg->findChild<QLabel*>("nftDetailVerifyLine");
+        auto* attach = dlg->findChild<QLabel*>("nftAttachStatus");
+        QVERIFY(line && attach);
+        QVERIFY(pumpUntil([&]{ return line->text().contains("Can't check", Qt::CaseInsensitive); }));
+
+        dlg->testAttachFile(other);   // wrong bytes
+        QVERIFY2(pumpUntil([&]{ return attach->text().contains("does NOT match", Qt::CaseInsensitive); }),
+                 qPrintable("attach status (non-match) copy: " + attach->text()));
+        // No cachePut happened for the NFT's real hash, and the verify line never went green.
+        QVERIFY2(ContentEngine::cacheGet(goodHash).isEmpty(),
+                 "a non-matching attach must NOT cache the bytes");
+        QVERIFY2(!line->text().contains("matches its on-chain fingerprint", Qt::CaseInsensitive),
+                 qPrintable("verify line must NOT go verified on a non-match: " + line->text()));
+
+        dlg->close();
+        QStandardPaths::setTestModeEnabled(false);
+    }
+
     void perf16_modelJank() {
         MainWindow* w = makeWindow();
         RPC* rpc = w->getRPC();

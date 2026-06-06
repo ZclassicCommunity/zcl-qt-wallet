@@ -53,7 +53,11 @@ SOURCES += \
     ../../src/privacybadgedelegate.cpp \
     ../../src/nftgallerymodel.cpp \
     ../../src/nftgallerydelegate.cpp \
+    ../../src/contentengine.cpp \
     ../../src/nftimagecache.cpp \
+    ../../src/nftdetaildialog.cpp \
+    ../../src/nftmintdialog.cpp \
+    ../../src/nftsenddialog.cpp \
     ../../src/3rdparty/qrcode/BitBuffer.cpp \
     ../../src/3rdparty/qrcode/QrCode.cpp \
     ../../src/3rdparty/qrcode/QrSegment.cpp \
@@ -79,7 +83,11 @@ HEADERS += \
     ../../src/privacybadgedelegate.h \
     ../../src/nftgallerymodel.h \
     ../../src/nftgallerydelegate.h \
+    ../../src/contentengine.h \
     ../../src/nftimagecache.h \
+    ../../src/nftdetaildialog.h \
+    ../../src/nftmintdialog.h \
+    ../../src/nftsenddialog.h \
     ../../src/qrcodelabel.h \
     ../../src/fillediconlabel.h \
     ../../src/addresscombo.h \

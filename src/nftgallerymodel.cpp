@@ -45,6 +45,7 @@ QVariant NFTGalleryModel::data(const QModelIndex& index, int role) const {
         return QVariant();
 
     const NFTItem& it = _items.at(index.row());
+    const bool haveThumb = !_thumbs.value(index.row()).isNull();
     switch (role) {
         case Qt::DisplayRole:      // a plain display fallback (name) for any default view
         case NameRole:             return it.name;
@@ -52,6 +53,23 @@ QVariant NFTGalleryModel::data(const QModelIndex& index, int role) const {
         case TxidRole:             return it.txid;
         case Qt::DecorationRole:   // a default view shows the thumbnail too
         case ThumbnailRole:        return _thumbs.value(index.row());   // QPixmap (may be null)
+        case Qt::ToolTipRole: {
+            // HONEST per-state hover (review fix #4): a confirmed NFT we hold whose
+            // image bytes aren't on this computer must NOT read as an endless spinner.
+            // The tooltip names the actual state so the card is a stable terminal one.
+            QString head = it.name.isEmpty() ? tr("Collectible") : it.name;
+            QString state;
+            if (haveThumb) {
+                if      (it.verifyState == 1) state = tr("Image matches its on-chain fingerprint.");
+                else if (it.verifyState == 2) state = tr("Image does NOT match its on-chain fingerprint.");
+                else                          state = tr("Checking this image…");
+            } else {
+                // No local bytes: it's yours, just not pictured here — a fact, not loading.
+                state = tr("You hold this collectible. Its image isn't on this computer "
+                           "(open it to check it yourself).");
+            }
+            return head + "\n" + state;
+        }
         case VerifyStateRole:      return it.verifyState;
         case IsPrivateRole:        return it.isPrivate;
         case DocHashRole:          return it.docHashHex;

@@ -148,20 +148,27 @@ void NFTGalleryDelegate::paint(QPainter* painter, const QStyleOptionViewItem& op
                             thumbRect.width(), thumbRect.height()));
         painter->restore();
     } else {
-        // Shimmer placeholder while the thumbnail is pending: a soft diagonal
-        // sweep over the inset. Static (no animation timer in the shell), but
-        // visually communicates "loading" vs an empty card.
+        // No thumbnail. For on-chain NFTs the bytes are NOT on this computer (we never
+        // auto-fetch), and no decode is in flight — so this is a TERMINAL state, not a
+        // spinner (review fix #4). Paint a calm, static "no image here" placeholder
+        // with a one-line caption, NOT a loading shimmer that reads as endless work.
         painter->save();
         painter->setClipPath(thumbClip);
-        QLinearGradient g(thumbRect.topLeft(), thumbRect.bottomRight());
-        g.setColorAt(0.0, kInset);
-        g.setColorAt(0.5, QColor("#262a33"));
-        g.setColorAt(1.0, kInset);
-        painter->fillRect(thumbRect, g);
+        painter->fillRect(thumbRect, kInset);
+        QFont capFont = option.font;
+        if (capFont.pointSizeF() > 0) capFont.setPointSizeF(capFont.pointSizeF() * 0.80);
+        painter->setFont(capFont);
+        painter->setPen(kDim);
+        painter->drawText(thumbRect.adjusted(8, 8, -8, -8),
+                          Qt::AlignCenter | Qt::TextWordWrap,
+                          tr("Image not on\nthis device"));
         painter->restore();
     }
 
     // ---- verify badge (top-right corner of the thumbnail) ------------------
+    // When there is NO local image, make NO verify claim — show a neutral dash badge
+    // (matches the detail dialog's "can't check" terminal state) rather than the amber
+    // "?" pending glyph, which falsely reads as "still verifying" forever (review fix #4).
     const QPixmap& vIcon = tintedIcon(verifyIconResource(verifyState),
                                       verifyColor(verifyState), kVerifyPx);
     const int badgePad = 6;
@@ -173,8 +180,16 @@ void NFTGalleryDelegate::paint(QPainter* painter, const QStyleOptionViewItem& op
     QColor disc("#0f1115"); disc.setAlpha(200);
     painter->setBrush(disc);
     painter->drawEllipse(badgeBg);
-    if (!vIcon.isNull())
+    if (thumb.isNull()) {
+        // Neutral terminal "no claim" badge.
+        QFont dashFont = option.font;
+        dashFont.setBold(true);
+        painter->setFont(dashFont);
+        painter->setPen(kDim);
+        painter->drawText(badgeBg, Qt::AlignCenter, QStringLiteral("–"));
+    } else if (!vIcon.isNull()) {
         painter->drawPixmap(badgeBg.left() + 4, badgeBg.top() + 4, vIcon);
+    }
 
     // ---- privacy pill (below the thumbnail) --------------------------------
     const bool isPrivate = index.data(NFTGalleryModel::IsPrivateRole).toBool();

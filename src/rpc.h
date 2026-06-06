@@ -116,6 +116,22 @@ public:
     // repeatedly re-run the balances-model rebuild over a seeded large dataset. The
     // anyUnconfirmed arg is forwarded straight through.
     void testUpdateUI(bool anyUnconfirmed) { updateUI(anyUnconfirmed); }
+
+    // NFT dialog seams (L1, E-PREREQ): one-shot install the result the NEXT
+    // mintNFT/sendNFT delivers, mirroring testSetNextZaddrResult. A non-empty txid
+    // => the success cb fires; a non-empty error (set via testSetNextNftError) takes
+    // priority and fires the error cb. With NOTHING installed the call returns
+    // WITHOUT firing either callback — it simulates an in-flight RPC that never
+    // resolves, which drives the closeEvent-swallowed-while-in-flight test. The
+    // production path below the guard is byte-identical (zero behavior change).
+    void testSetNextMintResult(const QString& txid, const QString& tokenid)
+        { testNextMintTxid = txid; testNextMintTokenId = tokenid; }
+    void testSetNextSendResult(const QString& txid) { testNextSendTxid = txid; }
+    void testSetNextNftError(const QString& err)    { testNextNftError = err; }
+    // txReceivedDate seam: the confs/blocktime the NEXT call delivers. confs<0 (or
+    // testReceivedSet left false) routes to the error cb instead.
+    void testSetNextReceived(qint64 confs, qint64 blocktime)
+        { testNextReceivedConfs = confs; testNextReceivedBlocktime = blocktime; testReceivedSet = true; }
 #endif
 
     // SAFE-RACE: synchronously-driven re-poll of ONLY the transparent UTXOs, spliced into
@@ -183,6 +199,47 @@ public:
     // once) into a single refresh shortly after the quiet point.
     static constexpr int   kNotifyDebounceMs      = 200;
 
+    // ---- Native NFT write path (dev/testnet; regtest-proven, not mainnet-hardened) ----
+    // Mint a NEW public ZSLP NFT from a file the user picked. docHashHex MUST be 64
+    // lowercase hex (the ContentEngine document_hash); name/ticker optional;
+    // documentUrl is NEVER auto-fetched (pass "" unless the user typed one). On
+    // success onDone(txid, tokenid) — the token is 0-conf/PENDING (invisible to the
+    // confirmed-only indexer until it confirms), so the caller shows a pending card;
+    // we also kick refreshNFTs(). On failure onErr(calm honest message). C++14:
+    // empty-QString sentinels, no std::optional.
+    void mintNFT(const QString& name, const QString& ticker,
+                 const QString& docHashHex, const QString& documentUrl,
+                 const std::function<void(QString txid, QString tokenid)>& onDone,
+                 const std::function<void(QString errStr)>& onErr);
+
+    // Gift/transfer an NFT (amount fixed at 1) to a recipient t-address. On success
+    // the token leaves this wallet immediately (0-conf), so refreshNFTs() will drop
+    // it once confirmed; onDone(txid) lets the caller show "sent — confirming". On
+    // failure onErr(calm honest message).
+    void sendNFT(const QString& tokenId, const QString& toAddress,
+                 const std::function<void(QString txid)>& onDone,
+                 const std::function<void(QString errStr)>& onErr);
+
+    // Detail-dialog provenance back-fill: zslp_gettoken "tokenId" -> the success cb
+    // receives the unwrapped token-metadata object (ticker/name/documenthash/...).
+    // Any error -> the err cb fires with a calm message; the dialog keeps honest
+    // defaults (Creator "Unknown", Set "Not part of a set"), never a dialog.
+    void nftProvenance(const QString& tokenId,
+                       const std::function<void(json tokenMeta)>& onDone,
+                       const std::function<void(QString errStr)>& onErr);
+
+    // Detail-dialog received-date back-fill: gettransaction "txid" -> the success cb
+    // receives (confirmations, blocktime). confs<10 => "Just arrived — confirming…";
+    // >=10 => ISO date + "block N" (the caller formats). Any error -> onErr.
+    void txReceivedDate(const QString& txid,
+                        const std::function<void(qint64 confirmations, qint64 blocktime)>& onDone,
+                        const std::function<void(QString errStr)>& onErr);
+
+    // Honest gating: the PRIVATE (ZDC1 shielded) mint/gift path is not built yet, so
+    // this is hard-false. The mint/send dialogs disable the Private tile as "Coming
+    // in this release" rather than ship a dead Create button (spec §2.5 polarity).
+    static bool isPrivateMintWired() { return false; }
+
     QString getDefaultSaplingAddress();
     QString getDefaultTAddress();
 
@@ -194,9 +251,26 @@ public:
 private:
     void refreshBalances();
 
-    void refreshTransactions();    
+    void refreshTransactions();
     void refreshSentZTrans();
     void refreshReceivedZTrans(QList<QString> zaddresses);
+
+    // Phase C1: fetch the wallet's REAL on-chain ZSLP NFTs and feed the native
+    // Collections gallery (MainWindow::setNFTItems). zslp_listmytokens lists the
+    // tokens this wallet holds (intersect of the indexed tokens with our t-addresses
+    // — ZSLP rides transparent dust); for each we zslp_gettoken for the on-chain
+    // document hash / url / decimals / genesis height, then map to NFTItem.
+    //
+    // GRACEFUL FALLBACK: zslp_listmytokens throws RPC_MISC_ERROR (code -1) when the
+    // daemon lacks -zslpindex; we catch that in the error callback and feed an empty
+    // "index off" set (no crash, no error dialog). An index-on wallet that owns no
+    // tokens simply yields an empty gallery.
+    //
+    // PRIVACY: we read metadata + the on-chain document hash ONLY and set
+    // cachePath="" on every item — the GUI never auto-fetches a remote documenturl
+    // image (no IP / interest leak). Bytes arrive later from the local cache or an
+    // explicit user action. Read-only: no key material, no node mutation.
+    void refreshNFTs();
 
     bool processUnspent     (const json& reply, QMap<QString, double>* newBalances, QList<UnspentOutput>* newUtxos);
     // SAFE-RACE: build a new owned list = the shielded-note rows kept from `oldUtxos`
@@ -429,6 +503,14 @@ private:
     // SAFE-RACE backing store: the transparent set the next repollTransparentUnspent()
     // splices in (one-shot). nullptr => the re-poll cannot fire (fail-closed).
     QList<UnspentOutput>*       testRepollUTXOs = nullptr;
+    // NFT dialog seam backing stores (one-shot; consumed inside mintNFT/sendNFT/
+    // txReceivedDate). Empty txid + empty error => the call returns without firing a
+    // callback (the perpetual-in-flight closeEvent test). Never in the shipped build.
+    QString                     testNextMintTxid, testNextMintTokenId, testNextSendTxid;
+    QString                     testNextNftError;
+    qint64                      testNextReceivedConfs     = 0;
+    qint64                      testNextReceivedBlocktime = 0;
+    bool                        testReceivedSet           = false;
 #endif
 };
 

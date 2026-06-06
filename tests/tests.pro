@@ -48,6 +48,7 @@ HEADERS += ../src/privacybadgedelegate.h
 # Phase C0: NFT gallery model/delegate/cache carry Q_OBJECT -> MOC them.
 HEADERS += ../src/nftgallerymodel.h
 HEADERS += ../src/nftgallerydelegate.h
+HEADERS += ../src/contentengine.h
 HEADERS += ../src/nftimagecache.h
 
 # Product pure-logic sources (UNMODIFIED) + shims + the test.
@@ -61,6 +62,7 @@ SOURCES += \
     ../src/privacybadgedelegate.cpp \
     ../src/nftgallerymodel.cpp \
     ../src/nftgallerydelegate.cpp \
+    ../src/contentengine.cpp \
     ../src/nftimagecache.cpp \
     shim/addressbook_stub.cpp \
     tst_logic.cpp

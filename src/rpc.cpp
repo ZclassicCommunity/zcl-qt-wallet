@@ -818,6 +818,383 @@ void RPC::refreshReceivedZTrans(QList<QString> zaddrs) {
     );
 } 
 
+// Phase C1: fetch the wallet's REAL on-chain ZSLP NFTs and feed the native
+// Collections gallery. See the rpc.h doc for the contract. Two-stage, fully async:
+//
+//   1. zslp_listmytokens  -> [{tokenid,ticker,name,decimals,balance,addresses[]}...]
+//      (the indexed tokens intersected with THIS wallet's t-addresses; ZSLP rides
+//       transparent dust so only t-addrs hold tokens). RPC_MISC_ERROR here means the
+//       daemon lacks -zslpindex -> feed an empty "index off" set (no crash/dialog).
+//   2. for each listed token, zslp_gettoken "tokenid" -> the on-chain metadata we
+//      need for the card (documenturl/documenthash/decimals/genesisheight). We batch
+//      these so they fire in parallel and the gallery is fed once they've all landed.
+//
+// An NFT (1-of-1) is decimals==0 && balance==1; we still list other tokens but they
+// read as the same card shape. The token id (genesis txid) is the stable identity.
+//
+// PRIVACY (hard rule): cachePath is left EMPTY on every item, so NFTImageCache never
+// fetches a remote documenturl image — no IP/interest leak. Bytes come later from
+// the local cache or an explicit user action; until then the card shows the pending
+// (shimmer + amber "?") state. Read-only throughout: no key material, no mutation.
+// Safe JSON field readers. nlohmann's CONST operator[] does assert(find != end)
+// on a missing key, and the shipped build keeps C asserts ACTIVE (the .pro sets
+// -DQT_NO_DEBUG but NOT -DNDEBUG), so reading a possibly-absent key via operator[]
+// can SIGABRT in the field — exactly what happens when doBatchRPC stores an EMPTY
+// object for an errored reply. These readers never assert and never throw: they
+// validate the container and key first (mirrors the .find()/.value() idiom already
+// used elsewhere in this file, e.g. refreshReceivedZTrans).
+static QString nftJsonStr(const json& o, const char* key) {
+    if (!o.is_object()) return QString();
+    auto it = o.find(key);
+    if (it == o.end() || !it->is_string()) return QString();
+    return QString::fromStdString(it->get<std::string>());
+}
+static qint64 nftJsonInt(const json& o, const char* key, qint64 dflt = 0) {
+    if (!o.is_object()) return dflt;
+    auto it = o.find(key);
+    if (it == o.end()) return dflt;
+    if (it->is_number_integer() || it->is_number_unsigned())
+        return (qint64) it->get<int64_t>();
+    if (it->is_number_float())
+        return (qint64) it->get<double>();
+    return dflt;
+}
+
+void RPC::refreshNFTs() {
+    // No connection, or the gallery isn't active (Settings off / tab not built) ->
+    // nothing to do. Skipping when inactive avoids a needless RPC every poll.
+    if (conn == nullptr || main == nullptr || !main->isNFTGalleryActive())
+        return;
+
+    json listPayload = {
+        {"jsonrpc", "1.0"},
+        {"id", "someid"},
+        {"method", "zslp_listmytokens"}
+    };
+
+    // Use the error-AWARE doRPC (not the default dialog handler) so a daemon WITHOUT
+    // -zslpindex (RPC_MISC_ERROR) degrades to a clean empty "index off" state instead
+    // of popping the generic "Transaction Error" dialog every poll.
+    conn->doRPC(listPayload,
+        [=] (const json& myTokens) {
+            // myTokens is a JSON array (possibly empty). Empty => wallet owns no
+            // tokens => empty gallery (the index is ON, just nothing to show).
+            if (!myTokens.is_array() || myTokens.empty()) {
+                main->setNFTItems(QVector<NFTItem>(), /*indexOff=*/false);
+                return;
+            }
+
+            // Stage 2: zslp_gettoken for every token id, in one parallel batch, then
+            // build the NFTItem set once all replies have landed. The token id
+            // (genesis txid) is the stable identity; all card metadata (name, ticker,
+            // documenthash, genesisheight) comes from zslp_gettoken below, so we only
+            // need the id list here.
+            QList<QString> tokenIds;
+            for (auto& t : myTokens) {
+                QString tid = nftJsonStr(t, "tokenid");
+                if (!tid.isEmpty())
+                    tokenIds.push_back(tid);
+            }
+
+            if (tokenIds.isEmpty()) {
+                main->setNFTItems(QVector<NFTItem>(), /*indexOff=*/false);
+                return;
+            }
+
+            conn->doBatchRPC<QString>(tokenIds,
+                [=] (QString tid) -> json {
+                    return json {
+                        {"jsonrpc", "1.0"},
+                        {"id", "someid"},
+                        {"method", "zslp_gettoken"},
+                        {"params", { tid.toStdString() }}
+                    };
+                },
+                [=] (QMap<QString, json>* replies) {
+                    QVector<NFTItem> items;
+                    items.reserve(replies->size());
+
+                    // Iterate the ORIGINAL list order (tokenIds) for a stable layout;
+                    // the batch map is keyed by tokenid so order is otherwise arbitrary.
+                    for (const QString& tid : tokenIds) {
+                        if (!replies->contains(tid))
+                            continue;
+                        // doBatchRPC stores parsed["result"] directly (an EMPTY object
+                        // on any error / discarded reply), so `tok` IS the token's
+                        // metadata object — not a {result:...} envelope. An empty object
+                        // is NOT discarded and IS an object, so we cannot probe it with
+                        // operator[] (that would assert-abort); nftJsonStr returns "" for
+                        // a missing key, so an errored/empty reply yields no tokenid -> skip.
+                        const json& tok = replies->value(tid);
+                        if (tok.is_discarded() || !tok.is_object())
+                            continue;
+                        if (nftJsonStr(tok, "tokenid").isEmpty())
+                            continue;
+
+                        NFTItem it;
+
+                        QString name   = nftJsonStr(tok, "name");
+                        QString ticker = nftJsonStr(tok, "ticker");
+
+                        // name || ticker || short tokenid — never show a bare hash if we
+                        // have a human label; never show nothing.
+                        if (!name.isEmpty())
+                            it.name = name;
+                        else if (!ticker.isEmpty())
+                            it.name = ticker;
+                        else
+                            it.name = tid.left(10) + QStringLiteral("…");
+
+                        // collection: the ticker groups a card-set; fall back to "ZSLP".
+                        it.collection = !ticker.isEmpty() ? ticker : QStringLiteral("ZSLP");
+
+                        // identity = the genesis txid (the token id).
+                        it.txid = tid;
+
+                        // on-chain fingerprint (may be "" if the mint set no doc hash —
+                        // then the card just can't be verified, stays pending).
+                        it.docHashHex = nftJsonStr(tok, "documenthash");
+
+                        // PRIVACY: NEVER point the image pipeline at documenturl. Local
+                        // bytes only; empty here keeps verifyState pending (no fetch).
+                        it.cachePath = QString();
+
+                        it.receivedHeight = nftJsonInt(tok, "genesisheight", 0);
+
+                        // Public ZSLP rides transparent dust -> not shielded.
+                        it.isPrivate   = false;
+                        it.verifyState = 0;   // pending until local bytes verify
+
+                        items.push_back(it);
+                    }
+
+                    main->setNFTItems(items, /*indexOff=*/false);
+
+                    // doBatchRPC hands us ownership of the map; free it.
+                    delete replies;
+                }
+            );
+        },
+        [=] (QNetworkReply*, const json& parsed) {
+            // GRACEFUL FALLBACK: the most common failure is the daemon running WITHOUT
+            // -zslpindex, which throws RPC_MISC_ERROR (code -1). Treat ANY error here
+            // as "no public ZSLP available right now" and show the clean empty/index-off
+            // state — never a dialog, never a crash. (A transient/foreign-daemon error
+            // also lands here and self-recovers on the next poll.)
+            // -1 == RPC_MISC_ERROR (the "index is not enabled" throw). We keep the empty
+            // state for every error code, but record the index-off intent. Probe with
+            // find() only — `parsed` may be a STRING here (doRPC calls the error handler
+            // with a json string on an HTTP-200-but-undecodable body), and operator[] on
+            // a non-object const json THROWS type_error.305 across the Qt slot boundary.
+            bool indexOff = true;
+            if (parsed.is_object()) {
+                auto e = parsed.find("error");
+                if (e != parsed.end() && e->is_object()) {
+                    auto c = e->find("code");
+                    if (c != e->end() && c->is_number())
+                        indexOff = (c->get<json::number_integer_t>() == -1);
+                }
+            }
+            if (main != nullptr && main->isNFTGalleryActive())
+                main->setNFTItems(QVector<NFTItem>(), indexOff);
+        }
+    );
+}
+
+// Map a ZSLP write-RPC error envelope to ONE calm, honest sentence. `parsed` may be
+// a JSON object (normal jsonrpc error) OR a bare string (HTTP-200 undecodable body) —
+// probe with find() only; operator[] on a non-object const json THROWS (see the
+// refreshNFTs error handler above). We never imply mainnet-readiness.
+static QString zslpCalmError(const QNetworkReply* reply, const json& parsed) {
+    qint64  code = 0;
+    QString msg;
+    if (parsed.is_object()) {
+        auto e = parsed.find("error");
+        if (e != parsed.end() && e->is_object()) {
+            auto c = e->find("code");
+            if (c != e->end() && c->is_number())
+                code = (qint64) c->get<json::number_integer_t>();
+            auto m = e->find("message");
+            if (m != e->end() && m->is_string())
+                msg = QString::fromStdString(m->get<std::string>());
+        }
+    }
+    // -13 RPC_WALLET_UNLOCK_NEEDED, -6 RPC_WALLET_INSUFFICIENT_FUNDS,
+    // -1  RPC_MISC_ERROR (the -zslpindex-off throw, GetZSLPStoreOrThrow).
+    switch (code) {
+        case -13: return QObject::tr("Your wallet is locked. Unlock it, then try again.");
+        case -6:  return QObject::tr("Not enough funds to cover the network fee for this collectible action.");
+        case -1:  return QObject::tr("Collectibles tracking is turned off on your node, so collectibles can't be created or sent right now.");
+        default:  break;
+    }
+    if (!msg.isEmpty())
+        return msg;   // daemon's own clear message (e.g. "Insufficient token balance: have 0, need 1")
+    if (reply != nullptr)
+        return reply->errorString();
+    return QObject::tr("The collectible action could not be completed.");
+}
+
+void RPC::mintNFT(const QString& name, const QString& ticker,
+                  const QString& docHashHex, const QString& documentUrl,
+                  const std::function<void(QString txid, QString tokenid)>& onDone,
+                  const std::function<void(QString errStr)>& onErr) {
+#ifdef ZCL_WIDGET_TEST
+    // TEST-ONLY SEAM (E-PREREQ): drive the dialog to a terminal state with no daemon,
+    // mirroring newZaddr's short-circuit. A non-empty error wins; else a non-empty
+    // txid is a success; else return WITHOUT firing either callback (simulates an
+    // in-flight RPC that never resolves -> the closeEvent-swallow test). One-shot.
+    {
+        if (!testNextNftError.isEmpty()) {
+            const QString e = testNextNftError; testNextNftError.clear(); onErr(e); return;
+        }
+        if (!testNextMintTxid.isEmpty()) {
+            const QString t = testNextMintTxid, k = testNextMintTokenId;
+            testNextMintTxid.clear(); testNextMintTokenId.clear();
+            onDone(t, k);   // NOTE: the dialog's onDone does the cachePut; no refreshNFTs (no conn)
+            return;
+        }
+        (void)name; (void)ticker; (void)docHashHex; (void)documentUrl;
+        return;   // nothing installed -> perpetual in-flight (drives the swallow test)
+    }
+#endif
+    if (conn == nullptr) { onErr(QObject::tr("Not connected to your node yet.")); return; }
+
+    // Build the SINGLE object param zslp_genesis requires (it enforces params.size()
+    // == 1). PUBLIC default: nft:true forces decimals 0 / quantity 1 / no baton on
+    // the daemon side. Only include optional fields when non-empty so we never send
+    // "" where the daemon expects a real value, and NEVER include document_url unless
+    // the user typed one (no auto-fetch).
+    json obj = { {"nft", true} };
+    if (!name.isEmpty())        obj["name"]          = name.toStdString();
+    if (!ticker.isEmpty())      obj["ticker"]        = ticker.toStdString();
+    if (!docHashHex.isEmpty())  obj["document_hash"] = docHashHex.toLower().toStdString(); // 64 hex
+    if (!documentUrl.isEmpty()) obj["document_url"]  = documentUrl.toStdString();
+    // 'to' omitted => daemon mints to a fresh OWN wallet address — we own it.
+
+    json payload = {
+        {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "zslp_genesis"},
+        {"params", json::array({ obj })}
+    };
+
+    conn->doRPC(payload,
+        [=] (const json& result) {
+            // result is the unwrapped { "txid": hex, "tokenid": hex } (tokenid==txid).
+            QString txid  = nftJsonStr(result, "txid");
+            QString tokid = nftJsonStr(result, "tokenid");
+            if (txid.isEmpty() || tokid.isEmpty()) {
+                onErr(QObject::tr("The collectible was submitted but the node returned an unexpected reply."));
+                return;
+            }
+            // 0-CONF: the confirmed-only indexer can't see this yet; the caller shows
+            // a pending card from (txid,tokenid). Still kick a refresh so the gallery
+            // re-pulls the moment it confirms.
+            onDone(txid, tokid);
+            refreshNFTs();
+        },
+        [=] (QNetworkReply* reply, const json& parsed) {
+            onErr(zslpCalmError(reply, parsed));
+        }
+    );
+}
+
+void RPC::sendNFT(const QString& tokenId, const QString& toAddress,
+                  const std::function<void(QString txid)>& onDone,
+                  const std::function<void(QString errStr)>& onErr) {
+#ifdef ZCL_WIDGET_TEST
+    // TEST-ONLY SEAM (E-PREREQ): same shape as mintNFT. error wins; else txid is a
+    // success; else perpetual in-flight (the closeEvent-swallow test). One-shot.
+    {
+        if (!testNextNftError.isEmpty()) {
+            const QString e = testNextNftError; testNextNftError.clear(); onErr(e); return;
+        }
+        if (!testNextSendTxid.isEmpty()) {
+            const QString t = testNextSendTxid; testNextSendTxid.clear(); onDone(t); return;
+        }
+        (void)tokenId; (void)toAddress;
+        return;   // nothing installed -> perpetual in-flight
+    }
+#endif
+    if (conn == nullptr) { onErr(QObject::tr("Not connected to your node yet.")); return; }
+    if (tokenId.isEmpty() || toAddress.isEmpty()) {
+        onErr(QObject::tr("A recipient address is required to gift this collectible."));
+        return;
+    }
+
+    // Positional args: tokenid, to_address, amount(=1 for an NFT, an INT not a string).
+    // change_address omitted => fresh own address. The daemon accepts 2..4 args.
+    json payload = {
+        {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "zslp_send"},
+        {"params", json::array({ tokenId.toStdString(), toAddress.toStdString(), 1 })}
+    };
+
+    conn->doRPC(payload,
+        [=] (const json& result) {
+            QString txid = nftJsonStr(result, "txid");
+            if (txid.isEmpty()) {
+                onErr(QObject::tr("The transfer was submitted but the node returned an unexpected reply."));
+                return;
+            }
+            // 0-CONF: the token leaves this wallet now; refreshNFTs will drop it once
+            // confirmed. onDone(txid) lets the detail dialog show "Sent — confirming".
+            onDone(txid);
+            refreshNFTs();
+        },
+        [=] (QNetworkReply* reply, const json& parsed) {
+            onErr(zslpCalmError(reply, parsed));
+        }
+    );
+}
+
+void RPC::nftProvenance(const QString& tokenId,
+                        const std::function<void(json tokenMeta)>& onDone,
+                        const std::function<void(QString errStr)>& onErr) {
+    if (conn == nullptr) { onErr(QObject::tr("Not connected to your node yet.")); return; }
+    if (tokenId.isEmpty()) { onErr(QObject::tr("Missing collectible id.")); return; }
+
+    json payload = {
+        {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "zslp_gettoken"},
+        {"params", json::array({ tokenId.toStdString() })}
+    };
+    conn->doRPC(payload,
+        [=] (const json& result) { onDone(result); },
+        [=] (QNetworkReply* reply, const json& parsed) { onErr(zslpCalmError(reply, parsed)); }
+    );
+}
+
+void RPC::txReceivedDate(const QString& txid,
+                         const std::function<void(qint64 confirmations, qint64 blocktime)>& onDone,
+                         const std::function<void(QString errStr)>& onErr) {
+#ifdef ZCL_WIDGET_TEST
+    // TEST-ONLY SEAM (E-PREREQ): deliver the installed confs/blocktime; an unset
+    // seam (or confs<0) routes to the error cb. One-shot (testReceivedSet cleared).
+    {
+        if (testReceivedSet && testNextReceivedConfs >= 0) {
+            const qint64 c = testNextReceivedConfs, b = testNextReceivedBlocktime;
+            testReceivedSet = false; onDone(c, b); return;
+        }
+        if (testReceivedSet) { testReceivedSet = false; }
+        (void)txid;
+        onErr(QObject::tr("Missing transaction id."));
+        return;
+    }
+#endif
+    if (conn == nullptr) { onErr(QObject::tr("Not connected to your node yet.")); return; }
+    if (txid.isEmpty()) { onErr(QObject::tr("Missing transaction id.")); return; }
+
+    json payload = {
+        {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "gettransaction"},
+        {"params", json::array({ txid.toStdString() })}
+    };
+    conn->doRPC(payload,
+        [=] (const json& result) {
+            const qint64 confs = nftJsonInt(result, "confirmations", 0);
+            const qint64 bt    = nftJsonInt(result, "blocktime", 0);
+            onDone(confs, bt);
+        },
+        [=] (QNetworkReply* reply, const json& parsed) { onErr(zslpCalmError(reply, parsed)); }
+    );
+}
+
 /// This will refresh all the balance data from zclassicd
 void RPC::refresh(bool force) {
     if  (conn == nullptr)
@@ -983,9 +1360,13 @@ void RPC::getInfoThenRefresh(bool force) {
             // See if the turnstile migration has any steps that need to be done.
             turnstile->executeMigrationStep();
 
-            refreshBalances();        
+            refreshBalances();
             refreshAddresses(); // This calls refreshZSentTransactions() and refreshReceivedZTrans()
             refreshTransactions();
+            // Phase C1: refresh the native Collections gallery from the wallet's REAL
+            // on-chain ZSLP NFTs. Self-gated (no-op if the gallery is disabled or the
+            // daemon lacks -zslpindex); read-only; never blocks paint.
+            refreshNFTs();
         }
 
         int connections = reply["connections"].get<json::number_integer_t>();
