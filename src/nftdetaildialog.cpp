@@ -3,6 +3,7 @@
 // ============================================================================
 #include "nftdetaildialog.h"
 #include "nftsenddialog.h"
+#include "nftselldialog.h"
 #include "contentengine.h"
 #include "rpc.h"
 #include "settings.h"
@@ -110,6 +111,7 @@ NFTDetailDialog::NFTDetailDialog(const NFTItem& item, const QVector<NFTItem>& or
     info->addLayout(verifyRow);
 
     m_privacyPill = new QLabel(this);
+    m_privacyPill->setObjectName("nftDetailPrivacyPill");
     m_privacyPill->setWordWrap(true);
     info->addWidget(m_privacyPill);
 
@@ -141,9 +143,12 @@ NFTDetailDialog::NFTDetailDialog(const NFTItem& item, const QVector<NFTItem>& or
     auto* actionRow = new QHBoxLayout();
     m_sendBtn = new QPushButton(tr("Send / Gift"), this);
     m_sendBtn->setObjectName("nftSendGiftButton");
+    m_sellBtn = new QPushButton(tr("Sell"), this);
+    m_sellBtn->setObjectName("nftDetailSellButton");
     m_saveBtn   = new QPushButton(tr("Save image…"), this);
     auto* copyIdBtn = new QPushButton(tr("Copy id"), this);
     actionRow->addWidget(m_sendBtn);
+    actionRow->addWidget(m_sellBtn);
     actionRow->addWidget(m_saveBtn);
     actionRow->addWidget(copyIdBtn);
     info->addLayout(actionRow);
@@ -185,6 +190,7 @@ NFTDetailDialog::NFTDetailDialog(const NFTItem& item, const QVector<NFTItem>& or
     connect(m_prevBtn,   &QPushButton::clicked, this, &NFTDetailDialog::goPrev);
     connect(m_nextBtn,   &QPushButton::clicked, this, &NFTDetailDialog::goNext);
     connect(m_sendBtn,   &QPushButton::clicked, this, &NFTDetailDialog::onSendGift);
+    connect(m_sellBtn,   &QPushButton::clicked, this, &NFTDetailDialog::onSell);
     connect(m_saveBtn,     &QPushButton::clicked, this, &NFTDetailDialog::onSaveImage);
     connect(copyIdBtn,   &QPushButton::clicked, this, &NFTDetailDialog::onCopyId);
     connect(copyFpBtn,   &QPushButton::clicked, this, &NFTDetailDialog::onCopyFingerprint);
@@ -213,13 +219,18 @@ void NFTDetailDialog::loadCurrent() {
     m_prevBtn->setEnabled(m_index > 0);
     m_nextBtn->setEnabled(m_index < m_ordered.size() - 1);
 
-    // Privacy pill one-liner.
-    if (it.isPrivate)
-        m_privacyPill->setText(
-            tr("● Private — only you can see this. Its ownership is shielded."));
-    else
-        m_privacyPill->setText(
-            tr("● Public — anyone can verify this on the public ledger."));
+    // Don't offer to SELL a tampered collectible (verifyState==2) — listing it would
+    // be dishonest. Mirrors the send dialog's mismatch hard-disable.
+    if (m_sellBtn)
+        m_sellBtn->setEnabled(it.verifyState != 2);
+
+    // Ownership pill (#119, HONEST): ZSLP NFT ownership is ALWAYS public — the token
+    // rides a public transparent dust UTXO. There is NO shielded-ownership state, so we
+    // make exactly ONE honest statement and never imply a private owner. (A future
+    // encrypted-FILE-CONTENT label, if added, must describe only the file bytes — never
+    // ownership.)
+    m_privacyPill->setText(
+        tr("● Public — anyone can verify this on the public ledger."));
 
     // Details card.
     m_mintId->setText(tr("Mint id: %1").arg(shortId(it.txid)));
@@ -245,9 +256,9 @@ void NFTDetailDialog::loadCurrent() {
     if (m_attachStatus)
         m_attachStatus->clear();
 
-    // Explorer link gating: configured (non-empty URL on mainnet) AND public.
-    const bool explorerOk =
-        !Settings::getExplorerTxURL(it.txid).isEmpty() && !it.isPrivate;
+    // Explorer link gating: configured (non-empty URL on mainnet). #119: NFT ownership
+    // is always public, so there is no "private => no explorer" case to encode.
+    const bool explorerOk = !Settings::getExplorerTxURL(it.txid).isEmpty();
     m_explorerBtn->setEnabled(explorerOk);
 
     // Reset the image stage, then request a fresh poster. requestPoster() owns the
@@ -436,19 +447,25 @@ void NFTDetailDialog::backfillReceived() {
 }
 
 void NFTDetailDialog::onSendGift() {
-    // On a MISMATCH item, confirm before opening the send dialog.
-    if (m_lastVerifyState == 2) {
-        const auto r = QMessageBox::warning(
-            this, tr("Send anyway?"),
-            tr("This image failed its on-chain check. Send anyway?"),
-            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
-        if (r != QMessageBox::Yes)
-            return;
-    }
+    // #119 HONESTY: do NOT offer a "Send anyway?" override on a mismatch. NFTSendDialog
+    // HARD-disables Send for verifyState==2 (and shows a red mismatch reason), so an
+    // override here would promise an action that does not exist. Open the send dialog
+    // directly; for a tampered item it opens with Send disabled and the honest reason.
     NFTSendDialog dlg(cur(), m_rpc, this);
     if (dlg.exec() == QDialog::Accepted) {
         // The token is on its way (0-conf). Close the detail view so the gallery
         // owns the pending/confirming state; never imply the user still holds it.
+        accept();
+    }
+}
+
+void NFTDetailDialog::onSell() {
+    // Open the Sell flow for THIS owned NFT. A mismatch item never reaches here (the
+    // button is disabled), but NFTSellDialog also hard-disables List for verifyState==2.
+    NFTSellDialog dlg(cur(), m_rpc, this);
+    if (dlg.exec() == QDialog::Accepted) {
+        // The NFT was listed (and possibly cancelled) — close the detail view so the
+        // gallery re-pulls its current state on the next poll.
         accept();
     }
 }
@@ -564,8 +581,8 @@ void NFTDetailDialog::onAttachDescriptor(quint64 token, ContentDescriptor d) {
 void NFTDetailDialog::onViewInExplorer() {
     const NFTItem& it = cur();
     const QString url = Settings::getExplorerTxURL(it.txid);
-    if (url.isEmpty() || it.isPrivate)
-        return;   // gated off (testnet / private) — should be disabled anyway
+    if (url.isEmpty())
+        return;   // gated off (no explorer configured) — should be disabled anyway
     const auto r = QMessageBox::question(
         this, tr("Open the block explorer?"),
         tr("This opens an outside website and may reveal your interest. Continue?"),

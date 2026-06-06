@@ -17,6 +17,7 @@
 #include "nftimagecache.h"
 #include "nftdetaildialog.h"
 #include "nftmintdialog.h"
+#include "nftbuydialog.h"
 #include "settings.h"
 #include "version.h"
 #include "turnstile.h"
@@ -3037,6 +3038,9 @@ void MainWindow::setupNFTTab() {
     heading->setObjectName("nftGalleryHeading");
     headingRow->addWidget(heading);
     headingRow->addStretch(1);
+    auto* buyBtn = new QPushButton(tr("Buy an NFT"), nftTab);
+    buyBtn->setObjectName("nftBuyAnNftButton");
+    headingRow->addWidget(buyBtn);
     auto* mintBtn = new QPushButton(tr("Make a collectible"), nftTab);
     mintBtn->setObjectName("nftMakeButton");
     headingRow->addWidget(mintBtn);
@@ -3107,6 +3111,7 @@ void MainWindow::setupNFTTab() {
     outer->addWidget(nftIndexHint);
 
     QObject::connect(mintBtn, &QPushButton::clicked, this, &MainWindow::openMintDialog);
+    QObject::connect(buyBtn,  &QPushButton::clicked, this, &MainWindow::openBuyDialog);
 
     // --- the gallery view --------------------------------------------------
     auto* view = new QListView(nftTab);
@@ -3189,6 +3194,18 @@ void MainWindow::openMintDialog() {
     if (!nftImgCache)
         return;
     NftMintDialog dlg(nftImgCache /*ContentEngine*/, rpc, this);
+    if (dlg.exec() == QDialog::Accepted && rpc)
+        rpc->refresh(true);
+}
+
+// Open the "Buy an NFT" dialog (modal). Paste/open a *.znftoffer blob -> auto-verify
+// (mandatory) -> renders the NFT image (via the EXISTING ContentEngine, nftImgCache) +
+// price + a green/amber verdict -> Buy. On accept (a successful purchase) we trigger a
+// full poll so the bought token lands in the gallery once it confirms.
+void MainWindow::openBuyDialog() {
+    if (!nftImgCache)
+        return;
+    NFTBuyDialog dlg(nftImgCache /*ContentEngine*/, rpc, this);
     if (dlg.exec() == QDialog::Accepted && rpc)
         rpc->refresh(true);
 }

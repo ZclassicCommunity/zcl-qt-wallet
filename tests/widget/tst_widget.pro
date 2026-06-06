@@ -58,6 +58,8 @@ SOURCES += \
     ../../src/nftdetaildialog.cpp \
     ../../src/nftmintdialog.cpp \
     ../../src/nftsenddialog.cpp \
+    ../../src/nftselldialog.cpp \
+    ../../src/nftbuydialog.cpp \
     ../../src/3rdparty/qrcode/BitBuffer.cpp \
     ../../src/3rdparty/qrcode/QrCode.cpp \
     ../../src/3rdparty/qrcode/QrSegment.cpp \
@@ -88,6 +90,8 @@ HEADERS += \
     ../../src/nftdetaildialog.h \
     ../../src/nftmintdialog.h \
     ../../src/nftsenddialog.h \
+    ../../src/nftselldialog.h \
+    ../../src/nftbuydialog.h \
     ../../src/qrcodelabel.h \
     ../../src/fillediconlabel.h \
     ../../src/addresscombo.h \

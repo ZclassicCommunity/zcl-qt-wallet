@@ -3,6 +3,9 @@
 
 #include "precompiled.h"
 
+#include <QStringList>   // NFTVerifyResult::reasons (header-signature type, #119/PART2)
+#include <QVector>       // nftListOffers callback carries QVector<NFTOfferRow>
+
 #include "balancestablemodel.h"
 #include "txtablemodel.h"
 #include "ui_mainwindow.h"
@@ -23,6 +26,30 @@ struct TransactionItem {
     unsigned long   confirmations;
     QString         fromAddr;
     QString         memo;
+};
+
+// NFT SELL pillar (PART 2). Plain PODs (C++14 in-class init, no methods) carried by
+// VALUE across the synchronous doRPC callback boundary (mirroring TransactionItem) —
+// the wrappers fire onDone directly from doRPC's direct-connected lambda, NOT via a
+// queued signal, so NO Q_DECLARE_METATYPE/qRegisterMetaType is needed. priceZat is the
+// daemon-authoritative price in zatoshi (the verify result echoes the on-chain truth).
+struct NFTVerifyResult {
+    bool        ok = false;          // verify passed -> a real green verdict, else amber
+    QString     tokenId;
+    QString     payoutAddr;
+    QString     buyerNftAddr;
+    qint64      priceZat = 0;
+    qint64      expiryHeight = 0;
+    QStringList reasons;             // one honest reason per failed check (amber detail)
+};
+
+struct NFTOfferRow {
+    QString offerId;
+    QString tokenId;
+    QString role;                    // "sell" (every local-store record)
+    QString status;                  // open / filled / expired / canceled
+    qint64  priceZat = 0;
+    qint64  expiryHeight = 0;
 };
 
 struct WatchedTx {
@@ -128,6 +155,21 @@ public:
         { testNextMintTxid = txid; testNextMintTokenId = tokenid; }
     void testSetNextSendResult(const QString& txid) { testNextSendTxid = txid; }
     void testSetNextNftError(const QString& err)    { testNextNftError = err; }
+    // NFT SELL seams (PART 2): mirror the mint/send seams — a non-empty testNextNftError
+    // wins on ALL of these (the calm-error path is L1-testable); else the installed
+    // result fires onDone; else the call returns WITHOUT firing either callback (the
+    // perpetual-in-flight closeEvent-swallow test). One-shot (consumed on use). The
+    // verify seam needs an explicit set flag because an ok==false result is still a valid
+    // delivery (we must distinguish "deliver a fail verdict" from "nothing installed").
+    void testSetNextOfferResult(const QString& blob, const QString& id, const QString& outpoint)
+        { testNextOfferBlob = blob; testNextOfferId = id; testNextOfferOutpoint = outpoint; }
+    void testSetNextVerifyResult(const NFTVerifyResult& vr)
+        { testNextVerify = vr; testVerifySet = true; }
+    void testSetNextTakeResult(const QString& txid, qint64 overshootZat)
+        { testNextTakeTxid = txid; testNextTakeOvershoot = overshootZat; }
+    void testSetNextOfferList(const QVector<NFTOfferRow>& rows)
+        { testNextOfferList = rows; testOfferListSet = true; }
+    void testSetNextCancelResult(const QString& txid) { testNextCancelTxid = txid; }
     // txReceivedDate seam: the confs/blocktime the NEXT call delivers. confs<0 (or
     // testReceivedSet left false) routes to the error cb instead.
     void testSetNextReceived(qint64 confs, qint64 blocktime)
@@ -234,6 +276,49 @@ public:
     void txReceivedDate(const QString& txid,
                         const std::function<void(qint64 confirmations, qint64 blocktime)>& onDone,
                         const std::function<void(QString errStr)>& onErr);
+
+    // ---- NFT SELL pillar (PART 2; non-consensus ZSLP atomic swap RPC wrappers) ----
+    // Each wraps one daemon nft_* RPC (src/rpc/nftoffer.cpp). All take a SINGLE JSON
+    // OBJECT param (we send real JSON over HTTP — the client.cpp CLI arg-conversion
+    // table is irrelevant). Calm honest error mapping reuses zslpCalmError. DRY on
+    // doRPC / nftJsonStr / nftJsonInt, exactly like mintNFT/sendNFT.
+
+    // SELL: build a buyer-sealed atomic offer. priceZcl is the human ZCL amount (the
+    // wrapper converts to zat). buyerNftAddr is REQUIRED (the daemon throws without it).
+    // payoutAddr "" => the daemon uses a fresh own address. expiryHeight 0 => the daemon
+    // default (~7 days). onDone(offerBlob "znftoffer:...", offerId, nftOutpoint "txid:n");
+    // onErr(calm).
+    void nftMakeOffer(const QString& tokenId, double priceZcl, const QString& buyerNftAddr,
+                      const QString& payoutAddr, int expiryHeight,
+                      const std::function<void(QString offerBlob, QString offerId, QString nftOutpoint)>& onDone,
+                      const std::function<void(QString errStr)>& onErr);
+
+    // BUY (MANDATORY pre-pay safety check): decode + live-verify the offer. onDone fires
+    // with a filled NFTVerifyResult for BOTH ok and not-ok (ok==false is a valid delivery
+    // carrying the reasons). onErr only on transport/parse failure.
+    void nftVerifyOffer(const QString& offerBlob,
+                        const std::function<void(NFTVerifyResult)>& onDone,
+                        const std::function<void(QString errStr)>& onErr);
+
+    // BUY settle. acknowledge=true sends the overshoot-to-fee consent. onDone(txid,
+    // overshootZat) — overshootZat is the total network fee donated (shown, never silent).
+    void nftTakeOffer(const QString& offerBlob, bool acknowledge,
+                      const std::function<void(QString txid, qint64 overshootZat)>& onDone,
+                      const std::function<void(QString errStr)>& onErr);
+
+    // List local offers (the store is all "mine"). onDone(rows); onErr(calm).
+    void nftListOffers(bool mineOnly,
+                       const std::function<void(QVector<NFTOfferRow>)>& onDone,
+                       const std::function<void(QString errStr)>& onErr);
+
+    // Cancel an outstanding sell offer by self-spending its NFT UTXO. onDone(txid).
+    void nftCancelOffer(const QString& offerId,
+                        const std::function<void(QString txid)>& onDone,
+                        const std::function<void(QString errStr)>& onErr);
+
+    // Pure conversion helper (L0-testable): human ZCL (double) -> zatoshi (qint64),
+    // rounded to the nearest zat. Clamped at 0. The ONE place price strings become zat.
+    static qint64 zclToZat(double zcl);
 
     // Honest gating: the PRIVATE (ZDC1 shielded) mint/gift path is not built yet, so
     // this is hard-false. The mint/send dialogs disable the Private tile as "Coming
@@ -511,6 +596,15 @@ private:
     qint64                      testNextReceivedConfs     = 0;
     qint64                      testNextReceivedBlocktime = 0;
     bool                        testReceivedSet           = false;
+    // NFT SELL seam backing stores (one-shot; consumed inside the nft offer wrappers).
+    QString                     testNextOfferBlob, testNextOfferId, testNextOfferOutpoint;
+    NFTVerifyResult             testNextVerify;
+    bool                        testVerifySet             = false;
+    QString                     testNextTakeTxid;
+    qint64                      testNextTakeOvershoot     = 0;
+    QVector<NFTOfferRow>        testNextOfferList;
+    bool                        testOfferListSet          = false;
+    QString                     testNextCancelTxid;
 #endif
 };
 

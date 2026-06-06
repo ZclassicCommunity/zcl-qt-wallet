@@ -25,7 +25,12 @@ struct NFTItem {
     QString docHashHex;      // expected SHA-256 of the asset bytes, lowercase hex
     QString cachePath;       // path/resource of the asset bytes to decode + verify
     qint64  receivedHeight = 0;   // block height the item was received at (0 = unknown)
-    bool    isPrivate      = true; // shielded provenance -> green privacy pill
+    // ZSLP NFT ownership is ALWAYS transparent/public — the token rides a public dust
+    // UTXO, so there is NO shielded ownership to surface. Default FALSE (matches the
+    // Public-default mint + the real data path at rpc.cpp). #119: never imply a private
+    // owner. A future flag may describe ENCRYPTED FILE CONTENT delivered via the data
+    // channel — never "private/shielded ownership".
+    bool    isPrivate      = false;
     int     verifyState    = 0;    // 0=pending 1=verified 2=mismatch (see header doc)
 };
 

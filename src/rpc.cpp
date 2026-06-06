@@ -859,6 +859,14 @@ static qint64 nftJsonInt(const json& o, const char* key, qint64 dflt = 0) {
         return (qint64) it->get<double>();
     return dflt;
 }
+// .find()-based bool reader (this nlohmann version lacks json::contains()). Never
+// asserts/throws — validates the container + key + type first (same idiom as above).
+static bool nftJsonBool(const json& o, const char* key, bool dflt = false) {
+    if (!o.is_object()) return dflt;
+    auto it = o.find(key);
+    if (it == o.end() || !it->is_boolean()) return dflt;
+    return it->get<bool>();
+}
 
 void RPC::refreshNFTs() {
     // No connection, or the gallery isn't active (Settings off / tab not built) ->
@@ -1190,6 +1198,256 @@ void RPC::txReceivedDate(const QString& txid,
             const qint64 confs = nftJsonInt(result, "confirmations", 0);
             const qint64 bt    = nftJsonInt(result, "blocktime", 0);
             onDone(confs, bt);
+        },
+        [=] (QNetworkReply* reply, const json& parsed) { onErr(zslpCalmError(reply, parsed)); }
+    );
+}
+
+// ===========================================================================
+// NFT SELL pillar (PART 2). Each wrapper mirrors mintNFT/sendNFT exactly: a test
+// seam (under ZCL_WIDGET_TEST) drives the dialog to a terminal state with no
+// daemon, then the real path sends a SINGLE JSON OBJECT param via doRPC and maps
+// errors through zslpCalmError. priceZat is daemon-authoritative; the GUI never
+// shows vout indices / sighash internals.
+// ===========================================================================
+
+// The ONE place a human ZCL price string becomes zatoshi. Round-half-up to the
+// nearest zat; clamp at 0. Pure -> L0-testable (the conversion can never drift).
+qint64 RPC::zclToZat(double zcl) {
+    if (zcl <= 0.0)
+        return 0;
+    // 1 ZCL = 1e8 zat. std::llround avoids the float truncation that would silently
+    // shave a zat off a price like 1.23456789.
+    return (qint64) std::llround(zcl * 100000000.0);
+}
+
+void RPC::nftMakeOffer(const QString& tokenId, double priceZcl, const QString& buyerNftAddr,
+                       const QString& payoutAddr, int expiryHeight,
+                       const std::function<void(QString offerBlob, QString offerId, QString nftOutpoint)>& onDone,
+                       const std::function<void(QString errStr)>& onErr) {
+#ifdef ZCL_WIDGET_TEST
+    {
+        if (!testNextNftError.isEmpty()) {
+            const QString e = testNextNftError; testNextNftError.clear(); onErr(e); return;
+        }
+        if (!testNextOfferBlob.isEmpty()) {
+            const QString b = testNextOfferBlob, i = testNextOfferId, op = testNextOfferOutpoint;
+            testNextOfferBlob.clear(); testNextOfferId.clear(); testNextOfferOutpoint.clear();
+            onDone(b, i, op); return;
+        }
+        (void)tokenId; (void)priceZcl; (void)buyerNftAddr; (void)payoutAddr; (void)expiryHeight;
+        return;   // nothing installed -> perpetual in-flight (the swallow test)
+    }
+#endif
+    if (conn == nullptr) { onErr(QObject::tr("Not connected to your node yet.")); return; }
+    const qint64 priceZat = zclToZat(priceZcl);
+    if (priceZat <= 0) { onErr(QObject::tr("Enter a price greater than zero.")); return; }
+    if (buyerNftAddr.isEmpty()) {
+        onErr(QObject::tr("A buyer's public address is required to list this collectible."));
+        return;
+    }
+
+    // SINGLE object param. priceZat as a STRING (the daemon's NftParseZat accepts a
+    // string|integer and avoids any 53-bit JSON-number rounding on large prices).
+    json obj = {
+        {"tokenId",      tokenId.toStdString()},
+        {"priceZat",     std::to_string((long long)priceZat)},
+        {"buyerNftAddr", buyerNftAddr.toStdString()}
+    };
+    if (!payoutAddr.isEmpty())  obj["payoutAddr"]   = payoutAddr.toStdString();
+    if (expiryHeight > 0)       obj["expiryHeight"] = expiryHeight;   // else daemon default ~7d
+
+    json payload = {
+        {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "nft_makeoffer"},
+        {"params", json::array({ obj })}
+    };
+
+    conn->doRPC(payload,
+        [=] (const json& result) {
+            const QString blob = nftJsonStr(result, "offerBlob");
+            const QString id   = nftJsonStr(result, "offerId");
+            const QString op   = nftJsonStr(result, "nftOutpoint");
+            if (blob.isEmpty()) {
+                onErr(QObject::tr("The listing was submitted but the node returned an unexpected reply."));
+                return;
+            }
+            onDone(blob, id, op);
+        },
+        [=] (QNetworkReply* reply, const json& parsed) { onErr(zslpCalmError(reply, parsed)); }
+    );
+}
+
+void RPC::nftVerifyOffer(const QString& offerBlob,
+                         const std::function<void(NFTVerifyResult)>& onDone,
+                         const std::function<void(QString errStr)>& onErr) {
+#ifdef ZCL_WIDGET_TEST
+    {
+        if (!testNextNftError.isEmpty()) {
+            const QString e = testNextNftError; testNextNftError.clear(); onErr(e); return;
+        }
+        if (testVerifySet) {
+            const NFTVerifyResult vr = testNextVerify;
+            testVerifySet = false; testNextVerify = NFTVerifyResult();
+            onDone(vr); return;
+        }
+        (void)offerBlob;
+        return;   // nothing installed -> perpetual in-flight
+    }
+#endif
+    if (conn == nullptr) { onErr(QObject::tr("Not connected to your node yet.")); return; }
+    if (offerBlob.isEmpty()) { onErr(QObject::tr("Paste or open an offer first.")); return; }
+
+    json obj = { {"offerBlob", offerBlob.toStdString()} };
+    json payload = {
+        {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "nft_verifyoffer"},
+        {"params", json::array({ obj })}
+    };
+
+    conn->doRPC(payload,
+        [=] (const json& result) {
+            NFTVerifyResult vr;
+            // The daemon returns ok + every re-derived (truth) field + reasons[].
+            vr.ok           = nftJsonBool(result, "ok", false);
+            vr.tokenId      = nftJsonStr(result, "tokenId");
+            vr.payoutAddr   = nftJsonStr(result, "payoutAddr");
+            vr.buyerNftAddr = nftJsonStr(result, "buyerNftAddr");
+            vr.priceZat     = nftJsonInt(result, "priceZat", 0);
+            vr.expiryHeight = nftJsonInt(result, "expiryHeight", 0);
+            if (result.is_object()) {
+                auto it = result.find("reasons");
+                if (it != result.end() && it->is_array())
+                    for (auto& r : *it)
+                        if (r.is_string())
+                            vr.reasons.push_back(QString::fromStdString(r.get<std::string>()));
+            }
+            onDone(vr);
+        },
+        [=] (QNetworkReply* reply, const json& parsed) { onErr(zslpCalmError(reply, parsed)); }
+    );
+}
+
+void RPC::nftTakeOffer(const QString& offerBlob, bool acknowledge,
+                       const std::function<void(QString txid, qint64 overshootZat)>& onDone,
+                       const std::function<void(QString errStr)>& onErr) {
+#ifdef ZCL_WIDGET_TEST
+    {
+        if (!testNextNftError.isEmpty()) {
+            const QString e = testNextNftError; testNextNftError.clear(); onErr(e); return;
+        }
+        if (!testNextTakeTxid.isEmpty()) {
+            const QString t = testNextTakeTxid; const qint64 ov = testNextTakeOvershoot;
+            testNextTakeTxid.clear(); testNextTakeOvershoot = 0;
+            onDone(t, ov); return;
+        }
+        (void)offerBlob; (void)acknowledge;
+        return;   // nothing installed -> perpetual in-flight
+    }
+#endif
+    if (conn == nullptr) { onErr(QObject::tr("Not connected to your node yet.")); return; }
+    if (offerBlob.isEmpty()) { onErr(QObject::tr("Paste or open an offer first.")); return; }
+
+    json obj = { {"offerBlob", offerBlob.toStdString()} };
+    if (acknowledge) obj["acknowledge"] = true;
+    json payload = {
+        {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "nft_takeoffer"},
+        {"params", json::array({ obj })}
+    };
+
+    conn->doRPC(payload,
+        [=] (const json& result) {
+            const QString txid    = nftJsonStr(result, "txid");
+            const qint64  overshoot = nftJsonInt(result, "overshootZat", 0);
+            if (txid.isEmpty()) {
+                onErr(QObject::tr("The purchase was submitted but the node returned an unexpected reply."));
+                return;
+            }
+            onDone(txid, overshoot);
+            refreshNFTs();   // the NFT should land in our gallery once it confirms
+        },
+        [=] (QNetworkReply* reply, const json& parsed) { onErr(zslpCalmError(reply, parsed)); }
+    );
+}
+
+void RPC::nftListOffers(bool mineOnly,
+                        const std::function<void(QVector<NFTOfferRow>)>& onDone,
+                        const std::function<void(QString errStr)>& onErr) {
+#ifdef ZCL_WIDGET_TEST
+    {
+        if (!testNextNftError.isEmpty()) {
+            const QString e = testNextNftError; testNextNftError.clear(); onErr(e); return;
+        }
+        if (testOfferListSet) {
+            const QVector<NFTOfferRow> rows = testNextOfferList;
+            testOfferListSet = false; testNextOfferList.clear();
+            onDone(rows); return;
+        }
+        (void)mineOnly;
+        return;   // nothing installed -> perpetual in-flight
+    }
+#endif
+    if (conn == nullptr) { onErr(QObject::tr("Not connected to your node yet.")); return; }
+
+    json obj = { {"mine", mineOnly} };
+    json payload = {
+        {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "nft_listoffers"},
+        {"params", json::array({ obj })}
+    };
+
+    conn->doRPC(payload,
+        [=] (const json& result) {
+            QVector<NFTOfferRow> rows;
+            if (result.is_array()) {
+                for (auto& r : result) {
+                    if (!r.is_object()) continue;
+                    NFTOfferRow row;
+                    row.offerId      = nftJsonStr(r, "offerId");
+                    row.tokenId      = nftJsonStr(r, "tokenId");
+                    row.role         = nftJsonStr(r, "role");
+                    row.status       = nftJsonStr(r, "status");
+                    row.priceZat     = nftJsonInt(r, "priceZat", 0);
+                    row.expiryHeight = nftJsonInt(r, "expiryHeight", 0);
+                    rows.push_back(row);
+                }
+            }
+            onDone(rows);
+        },
+        [=] (QNetworkReply* reply, const json& parsed) { onErr(zslpCalmError(reply, parsed)); }
+    );
+}
+
+void RPC::nftCancelOffer(const QString& offerId,
+                         const std::function<void(QString txid)>& onDone,
+                         const std::function<void(QString errStr)>& onErr) {
+#ifdef ZCL_WIDGET_TEST
+    {
+        if (!testNextNftError.isEmpty()) {
+            const QString e = testNextNftError; testNextNftError.clear(); onErr(e); return;
+        }
+        if (!testNextCancelTxid.isEmpty()) {
+            const QString t = testNextCancelTxid; testNextCancelTxid.clear(); onDone(t); return;
+        }
+        (void)offerId;
+        return;   // nothing installed -> perpetual in-flight
+    }
+#endif
+    if (conn == nullptr) { onErr(QObject::tr("Not connected to your node yet.")); return; }
+    if (offerId.isEmpty()) { onErr(QObject::tr("Missing offer id.")); return; }
+
+    json obj = { {"offerId", offerId.toStdString()} };
+    json payload = {
+        {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "nft_canceloffer"},
+        {"params", json::array({ obj })}
+    };
+
+    conn->doRPC(payload,
+        [=] (const json& result) {
+            const QString txid = nftJsonStr(result, "txid");
+            if (txid.isEmpty()) {
+                onErr(QObject::tr("The cancel was submitted but the node returned an unexpected reply."));
+                return;
+            }
+            onDone(txid);
+            refreshNFTs();   // the NFT returns to our gallery once the cancel confirms
         },
         [=] (QNetworkReply* reply, const json& parsed) { onErr(zslpCalmError(reply, parsed)); }
     );

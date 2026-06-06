@@ -191,10 +191,13 @@ void NFTGalleryDelegate::paint(QPainter* painter, const QStyleOptionViewItem& op
         painter->drawPixmap(badgeBg.left() + 4, badgeBg.top() + 4, vIcon);
     }
 
-    // ---- privacy pill (below the thumbnail) --------------------------------
-    const bool isPrivate = index.data(NFTGalleryModel::IsPrivateRole).toBool();
-    const QString pLabel = privacyLabel(isPrivate);
-    const QColor  pCol   = privacyColor(isPrivate);
+    // ---- ownership pill (below the thumbnail) ------------------------------
+    // #119 HONESTY: ZSLP NFT ownership is ALWAYS public (the token rides a public
+    // transparent dust UTXO). NEVER render a green "Private" pill that would imply
+    // shielded ownership — always the neutral/amber "Public" pill, regardless of the
+    // (now-defunct) IsPrivateRole. The pill states the true settlement, nothing more.
+    const QString pLabel = QStringLiteral("Public");
+    const QColor  pCol   = kAmber;
 
     QFont pillFont = option.font;
     if (pillFont.pointSizeF() > 0) pillFont.setPointSizeF(pillFont.pointSizeF() * 0.78);

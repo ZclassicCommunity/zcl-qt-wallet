@@ -46,6 +46,7 @@ public:
 private slots:
     void onPosterReady(quint64 token, QImage img, int verifyState);
     void onSendGift();
+    void onSell();   // open NFTSellDialog for this owned NFT (#119/PART2)
     void onSaveImage();
     void onCopyId();
     void onCopyFingerprint();
@@ -120,6 +121,7 @@ private:
     QLabel*      m_attachStatus= nullptr;   // item A: green/red attach-the-file result
     QPushButton* m_explorerBtn = nullptr;
     QPushButton* m_sendBtn     = nullptr;
+    QPushButton* m_sellBtn     = nullptr;   // "Sell" (opens NFTSellDialog)
     QPushButton* m_recheckBtn  = nullptr;   // disabled when there are no local bytes
     QPushButton* m_attachBtn   = nullptr;   // item A: "Attach the file you have…"
     QPushButton* m_saveBtn     = nullptr;   // disabled until a real image is loaded

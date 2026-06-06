@@ -353,6 +353,7 @@ private:
     // opens the "Make a collectible" wizard from the gallery heading button.
     void openNFTDetail(const QModelIndex& idx);
     void openMintDialog();
+    void openBuyDialog();   // "Buy an NFT" — opens NFTBuyDialog (#119/PART2)
     NFTGalleryModel* nftModel    = nullptr;
     NFTImageCache*   nftImgCache = nullptr;
     QWidget*         nftTab      = nullptr;   // the gallery page (added to tabWidget)

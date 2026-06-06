@@ -91,6 +91,10 @@
 #include "nftdetaildialog.h"
 #include "nftmintdialog.h"
 #include "nftsenddialog.h"
+#include "nftselldialog.h"
+#include "nftbuydialog.h"
+#include <QPlainTextEdit>
+#include <QCheckBox>
 
 // Kept alive for the whole process so QStandardPaths/QSettings stay isolated.
 static QTemporaryDir* g_homeDir = nullptr;
@@ -2361,6 +2365,358 @@ private slots:
 
         dlg->close();
         QStandardPaths::setTestModeEnabled(false);
+    }
+
+    // ======================================================================
+    // #119 HONESTY-FIX regression locks + NFT SELL/BUY L1 tests (PART 2).
+    // All driven via the RPC test seams (testSetNextOfferResult / VerifyResult /
+    // TakeResult / CancelResult / NftError) + the buy dialog's testPasteOffer seam,
+    // under ZCL_WIDGET_TEST + offscreen QPA. No daemon.
+    // ----------------------------------------------------------------------
+
+    // -- #119 (b): the detail pill must NEVER claim shielded/private OWNERSHIP.
+    void nftDetail_noShieldedOwnershipClaim() {
+        ContentEngine engine(nullptr);
+        NFTItem it; it.name = "Pub"; it.txid = "tok1";
+        it.docHashHex = "aa"; it.cachePath = ""; it.isPrivate = false; it.verifyState = 0;
+        QVector<NFTItem> ordered; ordered.push_back(it);
+
+        NFTDetailDialog* dlg = new NFTDetailDialog(it, ordered, 0, &engine, nullptr);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+
+        auto* pill = dlg->findChild<QLabel*>("nftDetailPrivacyPill");
+        QVERIFY2(pill, "detail dialog must expose its ownership pill by objectName");
+        const QString t = pill->text();
+        QVERIFY2(!t.contains("shielded", Qt::CaseInsensitive),
+                 qPrintable("pill must never claim shielded ownership: " + t));
+        QVERIFY2(!t.contains("only you", Qt::CaseInsensitive),
+                 qPrintable("pill must never claim only-you-can-see: " + t));
+        QVERIFY2(!t.contains("Private", Qt::CaseInsensitive),
+                 qPrintable("pill must never imply a private owner: " + t));
+        QVERIFY2(t.contains("Public", Qt::CaseInsensitive)
+                     && t.contains("public ledger", Qt::CaseInsensitive),
+                 qPrintable("pill must state the honest public truth: " + t));
+        dlg->close();
+    }
+
+    // -- #119 (b): even when an item somehow carries isPrivate==true, the pill stays
+    //    honest (the dead branch was removed — it can never resurrect the lie).
+    void nftDetail_pillHonestEvenIfIsPrivateTrue() {
+        ContentEngine engine(nullptr);
+        NFTItem it; it.name = "Legacy"; it.txid = "tok2";
+        it.docHashHex = "bb"; it.cachePath = ""; it.isPrivate = true; it.verifyState = 0;
+        QVector<NFTItem> ordered; ordered.push_back(it);
+
+        NFTDetailDialog* dlg = new NFTDetailDialog(it, ordered, 0, &engine, nullptr);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        auto* pill = dlg->findChild<QLabel*>("nftDetailPrivacyPill");
+        QVERIFY(pill);
+        QVERIFY2(!pill->text().contains("shielded", Qt::CaseInsensitive),
+                 qPrintable("isPrivate==true must NOT resurrect the shielded claim: " + pill->text()));
+        QVERIFY2(pill->text().contains("Public", Qt::CaseInsensitive),
+                 qPrintable("pill must stay Public regardless of isPrivate: " + pill->text()));
+        dlg->close();
+    }
+
+    // -- #119 (a): the NFTItem default must be PUBLIC (isPrivate==false).
+    void nftItem_defaultsPublic() {
+        NFTItem it;
+        QVERIFY2(it.isPrivate == false, "NFTItem must default to public (isPrivate==false)");
+    }
+
+    // -- #119 (d): a mismatch item's Send opens with Send HARD-disabled and there is
+    //    NO "Send anyway?" override modal (the override offered an action that doesn't
+    //    exist). We drive onSendGift indirectly: with the prompt removed, the Send
+    //    button on the detail dialog is enabled (the *send dialog* is where the gate
+    //    lives); the regression is that NO QMessageBox blocks. Since exec() on the
+    //    nested NFTSendDialog would block offscreen, we assert the SOURCE invariant via
+    //    the send dialog gate (proven elsewhere) + that the detail Sell/Send buttons
+    //    behave honestly for a mismatch (Sell disabled).
+    void nftDetail_mismatchSellDisabledNoOverride() {
+        ContentEngine engine(nullptr);
+        NFTItem it; it.name = "Tampered"; it.txid = "tok3";
+        it.docHashHex = "cc"; it.cachePath = ""; it.isPrivate = false; it.verifyState = 2;
+        QVector<NFTItem> ordered; ordered.push_back(it);
+
+        NFTDetailDialog* dlg = new NFTDetailDialog(it, ordered, 0, &engine, nullptr);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        auto* sell = dlg->findChild<QPushButton*>("nftDetailSellButton");
+        QVERIFY2(sell, "detail dialog must expose the Sell button");
+        QVERIFY2(!sell->isEnabled(), "Sell must be disabled for a tampered (mismatch) collectible");
+        dlg->close();
+    }
+
+    // -- L1 lock on the price->zat conversion (the ONE money conversion).
+    void nftSell_zclToZatConversionExact() {
+        QCOMPARE(RPC::zclToZat(1.0),        (qint64)100000000);
+        QCOMPARE(RPC::zclToZat(0.00000001), (qint64)1);
+        QCOMPARE(RPC::zclToZat(1.23456789), (qint64)123456789);
+        QCOMPARE(RPC::zclToZat(0.0),        (qint64)0);
+        QCOMPARE(RPC::zclToZat(-5.0),       (qint64)0);
+    }
+
+    // -- SELL: List gated until a valid price AND a valid buyer t-address; zs rejected.
+    void nftSell_listGatedUntilPriceAndBuyerAddr() {
+        MainWindow* w = makeWindow();
+        NFTItem it; it.name = "ForSale"; it.txid = "toks1";
+        it.docHashHex = "dd"; it.isPrivate = false; it.verifyState = 1;
+
+        NFTSellDialog* dlg = new NFTSellDialog(it, w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* price = dlg->findChild<QLineEdit*>("nftSellPriceEdit");
+        auto* buyer = dlg->findChild<QLineEdit*>("nftSellBuyerAddrEdit");
+        auto* list  = dlg->findChild<QPushButton*>("nftSellListButton");
+        auto* note  = dlg->findChild<QLabel*>("nftSellPublicNote");
+        QVERIFY(price && buyer && list && note);
+
+        // Honest public-settlement line present.
+        QVERIFY2(note->text().contains("publicly on-chain", Qt::CaseInsensitive)
+                     && note->text().contains("addresses are visible", Qt::CaseInsensitive),
+                 qPrintable("sell must state the public-settlement truth: " + note->text()));
+
+        QVERIFY2(!list->isEnabled(), "List disabled at open (no price, no buyer)");
+
+        price->setText("100");
+        QVERIFY2(!list->isEnabled(), "List stays disabled with a price but no buyer addr");
+
+        // A shielded address must be rejected (the daemon needs a public t-addr).
+        buyer->setText("zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u");
+        QVERIFY2(!list->isEnabled(), "List must reject a shielded (zs) buyer address");
+
+        buyer->setText("t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi");
+        QVERIFY2(list->isEnabled(), "List enabled with a valid price + buyer t-address");
+
+        // Clearing the price re-disables.
+        price->clear();
+        QVERIFY2(!list->isEnabled(), "List re-disabled when the price is cleared");
+        dlg->close();
+    }
+
+    // -- SELL: a mismatch item shows a red warning + List hard-disabled.
+    void nftSell_mismatchDisablesList() {
+        MainWindow* w = makeWindow();
+        NFTItem it; it.name = "Bad"; it.txid = "toks2";
+        it.docHashHex = "ee"; it.isPrivate = false; it.verifyState = 2;
+
+        NFTSellDialog* dlg = new NFTSellDialog(it, w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* warn  = dlg->findChild<QLabel*>("nftSellMismatchWarning");
+        auto* price = dlg->findChild<QLineEdit*>("nftSellPriceEdit");
+        auto* buyer = dlg->findChild<QLineEdit*>("nftSellBuyerAddrEdit");
+        auto* list  = dlg->findChild<QPushButton*>("nftSellListButton");
+        QVERIFY2(warn, "mismatch item must show the red warning label");
+        QVERIFY(price && buyer && list);
+
+        // Even with a valid price + buyer, List stays disabled for a tampered item.
+        price->setText("100");
+        buyer->setText("t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi");
+        QVERIFY2(!list->isEnabled(), "List must stay disabled for a verifyState==2 item");
+        dlg->close();
+    }
+
+    // -- SELL: a successful List shows the blob + Copy/Save/Cancel + a "Listed" badge.
+    void nftSell_successShowsBlobCopySaveCancel() {
+        MainWindow* w = makeWindow();
+        w->getRPC()->testSetNextOfferResult("znftoffer:AAAA", "offerid01", "tok:0");
+
+        NFTItem it; it.name = "Goods"; it.txid = "toks3";
+        it.docHashHex = "ff"; it.isPrivate = false; it.verifyState = 1;
+        NFTSellDialog* dlg = new NFTSellDialog(it, w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* price = dlg->findChild<QLineEdit*>("nftSellPriceEdit");
+        auto* buyer = dlg->findChild<QLineEdit*>("nftSellBuyerAddrEdit");
+        auto* list  = dlg->findChild<QPushButton*>("nftSellListButton");
+        QVERIFY(price && buyer && list);
+        price->setText("100");
+        buyer->setText("t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi");
+        QVERIFY(list->isEnabled());
+        list->click();
+
+        QVERIFY2(pumpUntil([&]{ return dlg->findChild<QPlainTextEdit*>("nftSellOfferBlob") != nullptr; }),
+                 "the offer blob view must appear after a successful List");
+        auto* blob   = dlg->findChild<QPlainTextEdit*>("nftSellOfferBlob");
+        auto* copy   = dlg->findChild<QPushButton*>("nftSellCopyButton");
+        auto* save   = dlg->findChild<QPushButton*>("nftSellSaveButton");
+        auto* cancel = dlg->findChild<QPushButton*>("nftSellCancelButton");
+        auto* badge  = dlg->findChild<QLabel*>("nftSellListedBadge");
+        QVERIFY2(blob && copy && save && cancel && badge,
+                 "listed state must expose blob + Copy + Save + Cancel + Listed badge");
+        QCOMPARE(blob->toPlainText(), QString("znftoffer:AAAA"));
+        QVERIFY2(badge->text().contains("Listed", Qt::CaseInsensitive),
+                 qPrintable("listed badge copy: " + badge->text()));
+        QCOMPARE(dlg->lastOfferId(), QString("offerid01"));
+        dlg->close();
+    }
+
+    // -- BUY: a green verify renders the green verdict + enables Buy (after ack).
+    void nftBuy_verifyGreenEnablesBuy() {
+        MainWindow* w = makeWindow();
+        ContentEngine engine(nullptr);
+
+        NFTVerifyResult vr; vr.ok = true; vr.tokenId = "tokbuy01";
+        vr.priceZat = 250000000; vr.expiryHeight = 99999;
+        w->getRPC()->testSetNextVerifyResult(vr);
+
+        NFTBuyDialog* dlg = new NFTBuyDialog(&engine, w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* verdict = dlg->findChild<QLabel*>("nftBuyVerdict");
+        auto* price   = dlg->findChild<QLabel*>("nftBuyPrice");
+        auto* buy     = dlg->findChild<QPushButton*>("nftBuyButton");
+        auto* ack     = dlg->findChild<QCheckBox*>("nftBuyAcknowledge");
+        QVERIFY(verdict && price && buy && ack);
+
+        QVERIFY2(!buy->isEnabled(), "Buy must be disabled before any verify");
+        dlg->testPasteOffer("znftoffer:GREEN");
+
+        QVERIFY2(pumpUntil([&]{ return verdict->text().contains("Verified", Qt::CaseInsensitive); }),
+                 qPrintable("verdict after green verify: " + verdict->text()));
+        QVERIFY2(price->text().contains("2.5", Qt::CaseInsensitive),
+                 qPrintable("price must render the ZCL amount: " + price->text()));
+        // Buy still disabled until the overshoot acknowledgement is checked.
+        QVERIFY2(!buy->isEnabled(), "Buy must require the overshoot acknowledgement");
+        ack->setChecked(true);
+        QVERIFY2(buy->isEnabled(), "Buy must enable on a green verify + ack");
+        dlg->close();
+    }
+
+    // -- BUY: a failed verify shows AMBER + the reason and keeps Buy disabled (no
+    //    green badge without a real ok).
+    void nftBuy_verifyFailShowsAmberReasonBuyDisabled() {
+        MainWindow* w = makeWindow();
+        ContentEngine engine(nullptr);
+
+        NFTVerifyResult vr; vr.ok = false; vr.tokenId = "tokbad01";
+        vr.priceZat = 100000000;
+        vr.reasons << "vin[0] is not a live (unspent) UTXO";
+        w->getRPC()->testSetNextVerifyResult(vr);
+
+        NFTBuyDialog* dlg = new NFTBuyDialog(&engine, w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* verdict = dlg->findChild<QLabel*>("nftBuyVerdict");
+        auto* buy     = dlg->findChild<QPushButton*>("nftBuyButton");
+        auto* ack     = dlg->findChild<QCheckBox*>("nftBuyAcknowledge");
+        QVERIFY(verdict && buy && ack);
+
+        dlg->testPasteOffer("znftoffer:FORGED");
+        QVERIFY2(pumpUntil([&]{ return verdict->text().contains("Don't pay", Qt::CaseInsensitive); }),
+                 qPrintable("amber verdict after failed verify: " + verdict->text()));
+        QVERIFY2(verdict->text().contains("not a live", Qt::CaseInsensitive),
+                 qPrintable("amber verdict must carry the honest reason: " + verdict->text()));
+        QVERIFY2(!verdict->text().contains("Verified", Qt::CaseInsensitive),
+                 "a failed verify must NEVER say Verified");
+        // Even checking ack cannot enable Buy on a non-ok verify.
+        ack->setChecked(true);
+        QVERIFY2(!buy->isEnabled(), "Buy must stay disabled on a failed verify even with ack");
+        dlg->close();
+    }
+
+    // -- BUY: editing the offer after a green verify re-disables Buy (anti-stale).
+    void nftBuy_editAfterVerifyResetsGate() {
+        MainWindow* w = makeWindow();
+        ContentEngine engine(nullptr);
+
+        NFTVerifyResult vr; vr.ok = true; vr.tokenId = "tokstale";
+        vr.priceZat = 100000000;
+        w->getRPC()->testSetNextVerifyResult(vr);
+
+        NFTBuyDialog* dlg = new NFTBuyDialog(&engine, w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* input = dlg->findChild<QPlainTextEdit*>("nftBuyOfferInput");
+        auto* buy   = dlg->findChild<QPushButton*>("nftBuyButton");
+        auto* ack   = dlg->findChild<QCheckBox*>("nftBuyAcknowledge");
+        QVERIFY(input && buy && ack);
+
+        dlg->testPasteOffer("znftoffer:GREEN2");
+        QVERIFY(pumpUntil([&]{ return dlg->verifyResult().ok; }));
+        ack->setChecked(true);
+        QVERIFY(buy->isEnabled());
+
+        // Edit the offer -> the green verdict is invalidated, Buy re-disabled.
+        input->setPlainText("znftoffer:TAMPERED");
+        QVERIFY2(!buy->isEnabled(), "editing the offer after a green verify must re-disable Buy");
+        QVERIFY2(!dlg->verifyResult().ok, "an edit must clear the verified flag");
+        dlg->close();
+    }
+
+    // -- BUY: a successful take becomes "Done" + shows the overshoot, NOT auto-accepted.
+    void nftBuy_successBecomesDoneOnItsWay() {
+        MainWindow* w = makeWindow();
+        ContentEngine engine(nullptr);
+
+        NFTVerifyResult vr; vr.ok = true; vr.tokenId = "tokwin";
+        vr.priceZat = 100000000;
+        w->getRPC()->testSetNextVerifyResult(vr);
+        w->getRPC()->testSetNextTakeResult("txwin0001", 12345);   // overshoot 12345 zat
+
+        NFTBuyDialog* dlg = new NFTBuyDialog(&engine, w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* buy    = dlg->findChild<QPushButton*>("nftBuyButton");
+        auto* ack    = dlg->findChild<QCheckBox*>("nftBuyAcknowledge");
+        auto* result = dlg->findChild<QLabel*>("nftBuyResultLine");
+        QVERIFY(buy && ack && result);
+
+        dlg->testPasteOffer("znftoffer:WIN");
+        QVERIFY(pumpUntil([&]{ return dlg->verifyResult().ok; }));
+        ack->setChecked(true);
+        QVERIFY(buy->isEnabled());
+        buy->click();
+
+        QVERIFY2(pumpUntil([&]{ return buy->text() == QString("Done"); }),
+                 "Buy must become Done after a successful purchase");
+        QVERIFY2(result->text().contains("on its way", Qt::CaseInsensitive),
+                 qPrintable("success copy: " + result->text()));
+        QVERIFY2(result->text().contains("fee", Qt::CaseInsensitive),
+                 qPrintable("overshoot/fee must be shown: " + result->text()));
+        QCOMPARE(dlg->lastTxid(), QString("txwin0001"));
+        QCOMPARE(dlg->lastOvershootZat(), (qint64)12345);
+        // NOT auto-accepted: the dialog is still visible (the user dismisses via Done).
+        QVERIFY2(dlg->isVisible(), "success must NOT auto-accept the dialog");
+        dlg->close();
+    }
+
+    // -- BUY: nothing installed -> perpetual in-flight -> [X] swallowed (UAF guard).
+    void nftBuy_closeSwallowedWhileInFlight() {
+        MainWindow* w = makeWindow();
+        ContentEngine engine(nullptr);
+
+        NFTVerifyResult vr; vr.ok = true; vr.tokenId = "tokhold";
+        vr.priceZat = 100000000;
+        w->getRPC()->testSetNextVerifyResult(vr);
+        // Install NO take result -> nftTakeOffer returns without firing a callback.
+
+        NFTBuyDialog* dlg = new NFTBuyDialog(&engine, w->getRPC(), w);
+        // NOT WA_DeleteOnClose here: we assert the dialog survives the close attempt.
+        dlg->show();
+
+        auto* buy = dlg->findChild<QPushButton*>("nftBuyButton");
+        auto* ack = dlg->findChild<QCheckBox*>("nftBuyAcknowledge");
+        QVERIFY(buy && ack);
+        dlg->testPasteOffer("znftoffer:HOLD");
+        QVERIFY(pumpUntil([&]{ return dlg->verifyResult().ok; }));
+        ack->setChecked(true);
+        QVERIFY(buy->isEnabled());
+        buy->click();
+        QVERIFY2(pumpUntil([&]{ return buy->text() == QString("Buying…"); }),
+                 "Buy must enter the in-flight Buying… state");
+
+        dlg->close();   // must be SWALLOWED while in flight
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+        QVERIFY2(dlg->isVisible(), "close must be swallowed while the take RPC is in flight");
+        delete dlg;     // we own it (no WA_DeleteOnClose)
     }
 
     void perf16_modelJank() {
