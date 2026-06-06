@@ -37,6 +37,7 @@
 #include "nftgallerydelegate.h"      // Phase C0: delegate sizeHint under test
 #include "nftimagecache.h"           // Phase C0: threaded decode/verify pipeline
 #include "contentengine.h"           // Phase C1: streaming hash / chunked Merkle engine
+#include "nftdatachannel.h"          // SHIELD: pure data-channel helpers (magic sniff / error map / cap)
 #include <QSet>
 #include <QVector>
 #include <QRegularExpression>
@@ -197,6 +198,8 @@ private slots:
     // --- formatters ---
     void getDecimalString_data();   // C5
     void getDecimalString();
+    void zatToDecimalString_data(); // C-2: NFT money formatter routed through getDecimalString
+    void zatToDecimalString();
     void zclDisplayFormat_data();
     void zclDisplayFormat();
     void usdFormat_data();          // C3
@@ -237,6 +240,12 @@ private slots:
     void ceVerifyMismatchOnFlippedByte();     // engine verify() red badge on 1-byte tamper
     void cePosterForTokenDelivers();          // posterForToken -> posterReady(token, img, vs)
     void cePosterForTokenRejects();           // token==0 / empty path / remote URL -> CE_Pending
+
+    // --- SHIELD (data-channel) pure helpers (nftdatachannel.h) ------------------
+    void shieldZdc1MagicSniffBinarySafe();    // raw-bytes magic sniff (NUL/high-byte safe)
+    void shieldFileCapConstant();             // ZDC_MAX_FILE_BYTES == 40000
+    void shieldErrorStateMapping_data();      // status strings -> the 4 distinct states
+    void shieldErrorStateMapping();
 
     // --- SentTxStore at-rest ---  G1 / G4
     void sentTxStore_perms_and_testnetName();   // G4
@@ -401,6 +410,29 @@ void TestLogic::getDecimalString() {
     QFETCH(double, amt);
     QFETCH(QString, expected);
     QCOMPARE(Settings::getDecimalString(amt), expected);
+}
+
+// =====================================================================
+// C-2 — zatToDecimalString: the NFT dialogs' zat->ZCL money string now routes
+// through the tested getDecimalString path (replaces the deleted humanZcl). The
+// values below MUST match what humanZcl produced so the buy dialog reads the same.
+// =====================================================================
+void TestLogic::zatToDecimalString_data() {
+    QTest::addColumn<qlonglong>("zat");
+    QTest::addColumn<QString>("expected");
+
+    QTest::newRow("one zcl")     << (qlonglong)100000000 << QString("1");
+    QTest::newRow("2.5 zcl")     << (qlonglong)250000000 << QString("2.5");   // buy-test value
+    QTest::newRow("one zat")     << (qlonglong)1         << QString("0.00000001");
+    QTest::newRow("overshoot")   << (qlonglong)12345     << QString("0.00012345"); // fee value
+    QTest::newRow("zero")        << (qlonglong)0         << QString("0");
+    QTest::newRow("trailing 0s") << (qlonglong)150000000 << QString("1.5");
+}
+
+void TestLogic::zatToDecimalString() {
+    QFETCH(qlonglong, zat);
+    QFETCH(QString, expected);
+    QCOMPARE(Settings::zatToDecimalString((qint64)zat), expected);
 }
 
 // =====================================================================
@@ -2004,6 +2036,74 @@ void TestLogic::cePosterForTokenRejects() {
     for (const QList<QVariant>& sig : spy) {
         QVERIFY(sig.at(1).value<QImage>().isNull());        // null image
         QCOMPARE(sig.at(2).toInt(), int(CE_Pending));       // pending state
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SHIELD — pure data-channel helpers (nftdatachannel.h). These back the binary-
+// safe memo sniff, the up-front 40000-byte cap, and the four-distinct-state
+// receive UI, so they are L0-gated with no daemon.
+// ---------------------------------------------------------------------------
+
+// The ZDC1 magic MUST be sniffed on the RAW bytes BEFORE any QString is built
+// (a binary frame carries NULs / high bytes a QString decode would mangle).
+void TestLogic::shieldZdc1MagicSniffBinarySafe() {
+    // A real frame: "ZDC1" magic followed by binary payload (NUL + 0xFF high byte).
+    QByteArray frame;
+    frame.append('\x5A').append('\x44').append('\x43').append('\x31');   // ZDC1
+    frame.append('\x00').append('\xFF').append('\x10').append('\x80');   // binary tail
+    QVERIFY2(nftdc::looksLikeZdc1Memo(frame), "a ZDC1 frame must be recognized");
+
+    // An ordinary text memo is NOT a frame.
+    QVERIFY2(!nftdc::looksLikeZdc1Memo(QByteArray("hello world")),
+             "a plain text memo must NOT be mistaken for a frame");
+    // Too short to carry the 4-byte magic.
+    QVERIFY(!nftdc::looksLikeZdc1Memo(QByteArray("ZD")));
+    QVERIFY(!nftdc::looksLikeZdc1Memo(QByteArray()));
+    // A leading NUL (the kind of byte that breaks a naive QString sniff) must not
+    // false-positive, and a near-miss magic must be rejected.
+    QByteArray nul; nul.append('\x00').append('\x5A').append('\x44').append('\x43');
+    QVERIFY(!nftdc::looksLikeZdc1Memo(nul));
+    QByteArray nearMiss("ZDC2");
+    QVERIFY(!nftdc::looksLikeZdc1Memo(nearMiss));
+}
+
+// The GUI's up-front cap must match the daemon's principled 40000-byte limit.
+void TestLogic::shieldFileCapConstant() {
+    QCOMPARE(nftdc::ZDC_MAX_FILE_BYTES, 40000);
+}
+
+void TestLogic::shieldErrorStateMapping_data() {
+    QTest::addColumn<QString>("errStr");
+    QTest::addColumn<int>("expected");
+    // The daemon emits zdc::status_str text; each distinct failure must map to its
+    // own state (never collapsed to a generic "failed").
+    QTest::newRow("hash-mismatch")
+        << QString("content hash mismatch after reassembly") << int(nftdc::DTS_HashMismatch);
+    QTest::newRow("aead-fail")
+        << QString("AEAD verification failed (tamper or wrong key)") << int(nftdc::DTS_AeadFail);
+    QTest::newRow("no-key")
+        << QString("key not yet available (sealed)") << int(nftdc::DTS_NoKey);
+    QTest::newRow("incomplete")
+        << QString("transfer incomplete (missing frames)") << int(nftdc::DTS_Incomplete);
+    QTest::newRow("frames-still-missing")
+        << QString("ERR_INCOMPLETE (frames still missing)") << int(nftdc::DTS_Incomplete);
+    QTest::newRow("empty")     << QString()              << int(nftdc::DTS_None);
+    QTest::newRow("unknown")   << QString("some other daemon error") << int(nftdc::DTS_OtherError);
+}
+
+void TestLogic::shieldErrorStateMapping() {
+    QFETCH(QString, errStr);
+    QFETCH(int, expected);
+    QCOMPARE(int(nftdc::mapDataTransferError(errStr)), expected);
+    // The four hard states must each carry distinct, non-empty honest copy; the
+    // mismatch/aead refusals must NOT say "try again".
+    const nftdc::DataTransferState st = nftdc::mapDataTransferError(errStr);
+    if (st == nftdc::DTS_HashMismatch || st == nftdc::DTS_AeadFail) {
+        const QString copy = nftdc::dataTransferStateCopy(st);
+        QVERIFY2(!copy.isEmpty(), "a refusal must carry honest copy");
+        QVERIFY2(!copy.contains("try again", Qt::CaseInsensitive),
+                 "a hard refusal must NOT invite a retry");
     }
 }
 

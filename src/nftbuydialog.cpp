@@ -2,6 +2,7 @@
 // NFTBuyDialog implementation — see nftbuydialog.h. NFT_SELL_DESIGN.md §5.
 // ============================================================================
 #include "nftbuydialog.h"
+#include "nftcommon.h"
 #include "contentengine.h"
 #include "settings.h"
 
@@ -16,7 +17,6 @@
 #include <QFile>
 #include <QTextStream>
 #include <QPointer>
-#include <QCloseEvent>
 
 namespace {
     const int kStagePx = 240;   // square image stage min edge
@@ -30,7 +30,7 @@ namespace {
 }
 
 NFTBuyDialog::NFTBuyDialog(ContentEngine* engine, RPC* rpc, QWidget* parent)
-    : QDialog(parent), m_engine(engine), m_rpc(rpc) {
+    : NftAsyncDialog(parent), m_engine(engine), m_rpc(rpc) {
     setWindowTitle(tr("Buy a collectible"));
     setMinimumWidth(480);
 
@@ -110,9 +110,7 @@ NFTBuyDialog::NFTBuyDialog(ContentEngine* engine, RPC* rpc, QWidget* parent)
     m_confirmLine->setWordWrap(true);
     outer->addWidget(m_confirmLine);
 
-    m_publicNote = new QLabel(
-        tr("This trade settles publicly on-chain — the price and both addresses are "
-           "visible. Only the negotiation can be private."), this);
+    m_publicNote = new QLabel(nftPublicTradeNote(), this);
     m_publicNote->setObjectName("nftBuyPublicNote");
     m_publicNote->setWordWrap(true);
     m_publicNote->setStyleSheet("color:#9aa0a6;");
@@ -155,7 +153,7 @@ NFTBuyDialog::NFTBuyDialog(ContentEngine* engine, RPC* rpc, QWidget* parent)
 }
 
 void NFTBuyDialog::onOfferTextChanged() {
-    if (m_succeeded || m_inFlight)
+    if (m_succeeded || isInFlight())
         return;
     // ANY edit invalidates a prior green verdict so a tampered blob can never be bought
     // on a stale verify (the load-bearing anti-stale rule).
@@ -199,7 +197,7 @@ void NFTBuyDialog::testPasteOffer(const QString& blob) {
 #endif
 
 void NFTBuyDialog::runVerify() {
-    if (m_inFlight || m_succeeded || m_rpc == nullptr)
+    if (isInFlight() || m_succeeded || m_rpc == nullptr)
         return;
     m_offerBlob = m_offerInput->toPlainText().trimmed();
     if (m_offerBlob.isEmpty())
@@ -255,7 +253,7 @@ void NFTBuyDialog::renderVerified() {
         shortTok = shortTok.left(8) + QStringLiteral("…") + shortTok.right(8);
     m_nameLbl->setText(shortTok.isEmpty() ? tr("Collectible") : shortTok);
 
-    m_priceLbl->setText(tr("Price: %1 ZCL").arg(humanZcl(vr.priceZat)));
+    m_priceLbl->setText(tr("Price: %1 ZCL").arg(Settings::zatToDecimalString(vr.priceZat)));
     m_expiryLbl->setText(vr.expiryHeight > 0
                              ? tr("Expires at block %1").arg(vr.expiryHeight)
                              : QString());
@@ -265,7 +263,7 @@ void NFTBuyDialog::renderVerified() {
         m_verdictLbl->setText(tr("✓ Verified — you will own this if you pay."));
         m_verdictLbl->setStyleSheet("color:#2a9d2a; font-weight:600;");
         m_confirmLine->setText(tr("You pay %1 ZCL (+ a small network fee). You receive "
-                                  "this collectible.").arg(humanZcl(vr.priceZat)));
+                                  "this collectible.").arg(Settings::zatToDecimalString(vr.priceZat)));
     } else {
         // AMBER — the honest reason(s); Buy stays disabled.
         QString why = vr.reasons.isEmpty()
@@ -349,20 +347,17 @@ void NFTBuyDialog::refreshBuyEnabled() {
         return;   // post-success: Buy is now "Done" — never re-enable the buy path
     }
     // HARD gate: a real green verify + the overshoot acknowledgement + not in flight.
-    m_buyBtn->setEnabled(m_verified.ok && m_acknowledged && !m_inFlight);
+    m_buyBtn->setEnabled(m_verified.ok && m_acknowledged && !isInFlight());
 }
 
 void NFTBuyDialog::onBuyClicked() {
-    if (m_inFlight || m_succeeded || m_rpc == nullptr)
+    if (isInFlight() || m_succeeded || m_rpc == nullptr)
         return;
     if (!m_verified.ok || !m_acknowledged)
         return;
 
-    m_inFlight = true;
-    refreshBuyEnabled();
-    m_buyBtn->setText(tr("Buying…"));
-    if (m_closeBtn)
-        m_closeBtn->setEnabled(false);
+    // Shared scaffold: latch in-flight, relabel Buy -> "Buying…", disable it + Close.
+    beginPrimary(m_buyBtn, tr("Buying…"), m_closeBtn);
     m_resultLine->clear();
 
     QPointer<NFTBuyDialog> self(this);
@@ -370,56 +365,23 @@ void NFTBuyDialog::onBuyClicked() {
         [self](QString txid, qint64 overshootZat) {
             if (self.isNull())
                 return;
-            self->m_inFlight     = false;
             self->m_succeeded    = true;
             self->m_lastTxid     = txid;
             self->m_lastOvershoot = overshootZat;
             QString msg = tr("Collectible bought — it's on its way, confirming on-chain.");
             if (overshootZat > 0)
-                msg += tr(" Network fee: %1 ZCL.").arg(humanZcl(overshootZat));
+                msg += tr(" Network fee: %1 ZCL.").arg(Settings::zatToDecimalString(overshootZat));
             self->m_resultLine->setText(msg);
             self->m_resultLine->setStyleSheet("color:#2a9d2a;");
-            self->m_buyBtn->setText(tr("Done"));
-            self->m_buyBtn->setEnabled(true);
-            self->m_buyBtn->disconnect(SIGNAL(clicked()));
-            connect(self->m_buyBtn, &QPushButton::clicked,
-                    self.data(), &NFTBuyDialog::onDoneClicked);
-            if (self->m_closeBtn)
-                self->m_closeBtn->setEnabled(false);   // only Done dismisses now
+            self->finishPrimaryAsDone(self->m_buyBtn, self->m_closeBtn);
         },
         [self](QString errStr) {
             if (self.isNull())
                 return;
-            self->m_inFlight = false;
-            self->m_buyBtn->setText(tr("Try again"));
+            self->finishPrimaryAsRetry(self->m_buyBtn, self->m_closeBtn);
             self->m_resultLine->setText(errStr);
             self->m_resultLine->setStyleSheet("color:#c0392b;");
-            if (self->m_closeBtn)
-                self->m_closeBtn->setEnabled(true);
             self->refreshBuyEnabled();
         }
     );
-}
-
-void NFTBuyDialog::onDoneClicked() {
-    accept();
-}
-
-QString NFTBuyDialog::humanZcl(qint64 zat) {
-    // zat -> human ZCL string (up to 8 dp, trailing zeros trimmed). Read-only display.
-    const double zcl = (double)zat / 100000000.0;
-    QString s = QString::number(zcl, 'f', 8);
-    while (s.contains('.') && (s.endsWith('0')))
-        s.chop(1);
-    if (s.endsWith('.'))
-        s.chop(1);
-    return s;
-}
-
-void NFTBuyDialog::closeEvent(QCloseEvent* e) {
-    if (m_inFlight) {
-        e->ignore();   // swallow [X] while the take RPC is in flight (UAF guard)
-        return;
-    }
-    QDialog::closeEvent(e);
 }

@@ -327,6 +327,18 @@ void Settings::setShowNFTGallery(bool show) {
     QSettings().setValue("options/shownftgallery", show);
 }
 
+bool Settings::getEnableDataChannel() {
+    // Default OFF (opt-in): private FILE transfers via the ZDC1 data-channel. This
+    // is the persisted GUI INTENT; the daemon -datachannel flag is what actually
+    // turns the RPCs on. HONEST: only file content is private — ownership is always
+    // public and the encrypted bytes live on-chain permanently.
+    return QSettings().value("options/enabledatachannel", false).toBool();
+}
+
+void Settings::setEnableDataChannel(bool on) {
+    QSettings().setValue("options/enabledatachannel", on);
+}
+
 bool Settings::getNonModalStartup() {
     // W1-1 default ON: the MainWindow appears at once (already painting cached
     // balances pre-RPC) and the warmup splash is a non-blocking, dismissible
@@ -384,6 +396,12 @@ QString Settings::getDecimalString(double amt) {
         f = "0";
 
     return f;
+}
+
+QString Settings::zatToDecimalString(qint64 zat) {
+    // 1 ZCL = 1e8 zat. Route through the tested getDecimalString so the NFT money
+    // strings can never drift from the rest of the wallet's display formatting.
+    return getDecimalString((double) zat / 100000000.0);
 }
 
 QString Settings::getHeightString(qint64 height) {

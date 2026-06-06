@@ -2,6 +2,7 @@
 // NFTSendDialog implementation — see nftsenddialog.h. NATIVE_NFT_GUIDE.md §2.6.
 // ============================================================================
 #include "nftsenddialog.h"
+#include "nftcommon.h"
 #include "rpc.h"
 #include "settings.h"
 
@@ -12,10 +13,9 @@
 #include <QPushButton>
 #include <QFrame>
 #include <QPointer>
-#include <QCloseEvent>
 
 NFTSendDialog::NFTSendDialog(const NFTItem& item, RPC* rpc, QWidget* parent)
-    : QDialog(parent), m_item(item), m_rpc(rpc) {
+    : NftAsyncDialog(parent), m_item(item), m_rpc(rpc) {
     setWindowTitle(tr("Send a gift"));
     setMinimumWidth(440);
 
@@ -107,21 +107,10 @@ NFTSendDialog::NFTSendDialog(const NFTItem& item, RPC* rpc, QWidget* parent)
 }
 
 void NFTSendDialog::onRecipientChanged(const QString& text) {
-    const QString addr = text.trimmed();
-    if (addr.isEmpty()) {
-        m_addrStatus->clear();
-    } else if (!Settings::isValidAddress(addr)) {
-        m_addrStatus->setText(tr("That doesn't look like a ZClassic address."));
-        m_addrStatus->setStyleSheet("color:#c0392b;");
-    } else if (Settings::isTAddress(addr)) {
-        m_addrStatus->setText(tr("Looks good — a public (transparent) address."));
-        m_addrStatus->setStyleSheet("color:#d9822b;");
-    } else {
-        // A valid shielded address: the public ZSLP path can't deliver to a z-addr.
-        m_addrStatus->setText(
-            tr("A gift needs a public (transparent) address. Private gifts are coming soon."));
-        m_addrStatus->setStyleSheet("color:#c0392b;");
-    }
+    // Shared 4-state t-address validator (mirrors the sell dialog).
+    nftValidateTAddrInto(
+        m_addrStatus, text,
+        tr("A gift needs a public (transparent) address. Private gifts are coming soon."));
     refreshSendEnabled();
 }
 
@@ -131,21 +120,19 @@ void NFTSendDialog::refreshSendEnabled() {
     const QString addr = m_recipient->text().trimmed();
     const bool recipientOk = Settings::isTAddress(addr);   // public address only
     const bool notMismatch = (m_item.verifyState != 2);
-    m_sendBtn->setEnabled(recipientOk && notMismatch && !m_inFlight);
+    m_sendBtn->setEnabled(recipientOk && notMismatch && !isInFlight());
 }
 
 void NFTSendDialog::onSendClicked() {
-    if (m_inFlight || m_succeeded || m_rpc == nullptr)
+    if (isInFlight() || m_succeeded || m_rpc == nullptr)
         return;
     const QString addr = m_recipient->text().trimmed();
     if (!Settings::isTAddress(addr))
         return;
 
-    m_inFlight = true;
-    refreshSendEnabled();
-    m_sendBtn->setText(tr("Sending…"));
-    if (m_cancelBtn)
-        m_cancelBtn->setEnabled(false);   // can't bail mid-flight (also closes the UAF window)
+    // Shared scaffold: latch in-flight, relabel Send -> "Sending…", disable it +
+    // Cancel (can't bail mid-flight — also closes the UAF window).
+    beginPrimary(m_sendBtn, tr("Sending…"), m_cancelBtn);
     m_resultLine->clear();
 
     // LIFETIME (review fix #5): guard the reply with a QPointer and bail before touching
@@ -160,45 +147,20 @@ void NFTSendDialog::onSendClicked() {
             // state and let the user explicitly dismiss the acknowledged result.
             // 0-CONF honesty: the token is on its way; the gallery will drop it once it
             // confirms — never imply the user lost it.
-            self->m_inFlight  = false;
             self->m_succeeded = true;
             self->m_resultLine->setText(
                 tr("Gift sent. It's on its way — confirming on-chain."));
             self->m_resultLine->setStyleSheet("color:#2a9d2a;");
             self->m_recipient->setEnabled(false);
-            self->m_sendBtn->setText(tr("Done"));
-            self->m_sendBtn->setEnabled(true);
-            self->m_sendBtn->disconnect(SIGNAL(clicked()));
-            connect(self->m_sendBtn, &QPushButton::clicked,
-                    self.data(), &NFTSendDialog::onDoneClicked);
-            if (self->m_cancelBtn)
-                self->m_cancelBtn->setEnabled(false);   // only Done dismisses now
+            self->finishPrimaryAsDone(self->m_sendBtn, self->m_cancelBtn);
         },
         [self](QString errStr) {
             if (self.isNull())
                 return;   // dialog gone — safe no-op
-            self->m_inFlight = false;
-            self->m_sendBtn->setText(tr("Try again"));
+            self->finishPrimaryAsRetry(self->m_sendBtn, self->m_cancelBtn);
             self->m_resultLine->setText(errStr);
             self->m_resultLine->setStyleSheet("color:#c0392b;");
-            if (self->m_cancelBtn)
-                self->m_cancelBtn->setEnabled(true);
             self->refreshSendEnabled();
         }
     );
-}
-
-void NFTSendDialog::onDoneClicked() {
-    accept();   // the user has read the confirmation; the parent now refreshes the gallery
-}
-
-void NFTSendDialog::closeEvent(QCloseEvent* e) {
-    // Swallow the window [X] while the send RPC is in flight so the dialog can't be
-    // destroyed under the in-flight reply (review fix #5). The QPointer guard is the
-    // true safety net; this is the honest UX (the button reads "Sending…").
-    if (m_inFlight) {
-        e->ignore();
-        return;
-    }
-    QDialog::closeEvent(e);
 }

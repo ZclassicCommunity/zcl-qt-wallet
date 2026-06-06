@@ -19,36 +19,33 @@
 
 #include "precompiled.h"
 #include "nft.h"
-
-#include <QDialog>
+#include "nftasyncdialog.h"   // shared in-flight latch + [X]-swallow + Done/Try-again
 
 class QLabel;
 class QLineEdit;
 class QPushButton;
 class RPC;
 
-class NFTSendDialog : public QDialog {
+class NFTSendDialog : public NftAsyncDialog {
     Q_OBJECT
 public:
     // `item` is the NFT being gifted (by value). `rpc` issues the zslp_send.
     explicit NFTSendDialog(const NFTItem& item, RPC* rpc, QWidget* parent = nullptr);
 
-protected:
-    // While the send RPC is in flight, swallow the window [X] so the dialog can't be
-    // destroyed out from under the in-flight reply (review fix #5 / UAF).
-    void closeEvent(QCloseEvent* e) override;
+    // The [X]-swallow while the send RPC is in flight is inherited from
+    // NftAsyncDialog::closeEvent (review fix #5 / UAF).
 
 private slots:
     void onRecipientChanged(const QString& text);
     void onSendClicked();
-    void onDoneClicked();   // after success: explicit dismiss (accept) of the confirmation
+    // After success the primary button is re-wired to QDialog::accept() by
+    // NftAsyncDialog::finishPrimaryAsDone — no per-dialog onDoneClicked needed.
 
 private:
     void refreshSendEnabled();
 
     NFTItem      m_item;
     RPC*         m_rpc       = nullptr;
-    bool         m_inFlight  = false;
     bool         m_succeeded = false;   // send returned; dialog now shows the confirmation
 
     QLineEdit*   m_recipient = nullptr;

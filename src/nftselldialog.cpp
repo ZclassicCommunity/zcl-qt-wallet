@@ -2,6 +2,7 @@
 // NFTSellDialog implementation — see nftselldialog.h. NFT_SELL_DESIGN.md §5.
 // ============================================================================
 #include "nftselldialog.h"
+#include "nftcommon.h"
 #include "rpc.h"
 #include "settings.h"
 
@@ -19,12 +20,11 @@
 #include <QDoubleValidator>
 #include <QMessageBox>
 #include <QPointer>
-#include <QCloseEvent>
 #include <QFile>
 #include <QTextStream>
 
 NFTSellDialog::NFTSellDialog(const NFTItem& item, RPC* rpc, QWidget* parent)
-    : QDialog(parent), m_item(item), m_rpc(rpc) {
+    : NftAsyncDialog(parent), m_item(item), m_rpc(rpc) {
     setWindowTitle(tr("Sell this collectible"));
     setMinimumWidth(460);
 
@@ -111,9 +111,7 @@ NFTSellDialog::NFTSellDialog(const NFTItem& item, RPC* rpc, QWidget* parent)
     m_resultLine->setWordWrap(true);
     m_resultLine->setMinimumHeight(18);
 
-    auto* publicNote = new QLabel(
-        tr("This trade settles publicly on-chain — the price and both addresses are "
-           "visible. Only the negotiation can be private."), this);
+    auto* publicNote = new QLabel(nftPublicTradeNote(), this);
     publicNote->setObjectName("nftSellPublicNote");
     publicNote->setWordWrap(true);
     publicNote->setStyleSheet("color:#9aa0a6;");
@@ -158,21 +156,10 @@ void NFTSellDialog::onComposeChanged() {
             m_priceStatus->clear();
         }
     }
-    // Buyer-address hint.
-    const QString addr = m_buyerEdit->text().trimmed();
-    if (addr.isEmpty()) {
-        m_buyerStatus->clear();
-    } else if (!Settings::isValidAddress(addr)) {
-        m_buyerStatus->setText(tr("That doesn't look like a ZClassic address."));
-        m_buyerStatus->setStyleSheet("color:#c0392b;");
-    } else if (Settings::isTAddress(addr)) {
-        m_buyerStatus->setText(tr("Looks good — a public (transparent) address."));
-        m_buyerStatus->setStyleSheet("color:#d9822b;");
-    } else {
-        m_buyerStatus->setText(
-            tr("A sale needs the buyer's public (transparent) address."));
-        m_buyerStatus->setStyleSheet("color:#c0392b;");
-    }
+    // Buyer-address hint — shared 4-state t-address validator (mirrors the send dialog).
+    nftValidateTAddrInto(
+        m_buyerStatus, m_buyerEdit->text(),
+        tr("A sale needs the buyer's public (transparent) address."));
     refreshListEnabled();
 }
 
@@ -184,11 +171,11 @@ void NFTSellDialog::refreshListEnabled() {
     priceOk = priceOk && price > 0.0;
     const bool buyerOk    = Settings::isTAddress(m_buyerEdit->text().trimmed());
     const bool notMismatch = (m_item.verifyState != 2);
-    m_listBtn->setEnabled(priceOk && buyerOk && notMismatch && !m_inFlight);
+    m_listBtn->setEnabled(priceOk && buyerOk && notMismatch && !isInFlight());
 }
 
 void NFTSellDialog::onListClicked() {
-    if (m_inFlight || m_listed || m_rpc == nullptr)
+    if (isInFlight() || m_listed || m_rpc == nullptr)
         return;
     bool ok = false;
     const double price = m_priceEdit->text().trimmed().toDouble(&ok);
@@ -198,9 +185,10 @@ void NFTSellDialog::onListClicked() {
     if (!Settings::isTAddress(buyer))
         return;
 
-    m_inFlight = true;
-    refreshListEnabled();
-    m_listBtn->setText(tr("Listing…"));
+    // Shared scaffold: latch in-flight + relabel List -> "Listing…" (this flow has
+    // no secondary button to disable; Close is a plain reject and the [X] is
+    // swallowed by NftAsyncDialog while in flight).
+    beginPrimary(m_listBtn, tr("Listing…"));
     m_resultLine->clear();
 
     // v1: payoutAddr "" (daemon picks a fresh own address); expiryHeight 0 (daemon
@@ -211,7 +199,9 @@ void NFTSellDialog::onListClicked() {
         [self](QString offerBlob, QString offerId, QString /*nftOutpoint*/) {
             if (self.isNull())
                 return;
-            self->m_inFlight  = false;
+            // Success transitions into the LISTED phase (blob + Copy/Save/Cancel),
+            // NOT a terminal Done — just clear the in-flight latch.
+            self->setInFlight(false);
             self->m_offerBlob = offerBlob;
             self->m_offerId   = offerId;
             self->enterListedState();
@@ -219,8 +209,7 @@ void NFTSellDialog::onListClicked() {
         [self](QString errStr) {
             if (self.isNull())
                 return;
-            self->m_inFlight = false;
-            self->m_listBtn->setText(tr("Try again"));
+            self->finishPrimaryAsRetry(self->m_listBtn);
             self->m_resultLine->setText(errStr);
             self->m_resultLine->setStyleSheet("color:#c0392b;");
             self->refreshListEnabled();
@@ -317,7 +306,7 @@ void NFTSellDialog::onSaveClicked() {
 }
 
 void NFTSellDialog::onCancelListingClicked() {
-    if (m_inFlight || m_rpc == nullptr || m_offerId.isEmpty())
+    if (isInFlight() || m_rpc == nullptr || m_offerId.isEmpty())
         return;
     const auto r = QMessageBox::question(
         this, tr("Cancel this listing?"),
@@ -326,29 +315,20 @@ void NFTSellDialog::onCancelListingClicked() {
     if (r != QMessageBox::Yes)
         return;
 
-    m_inFlight = true;
-    if (m_cancelListBtn) {
-        m_cancelListBtn->setEnabled(false);
-        m_cancelListBtn->setText(tr("Cancelling…"));
-    }
+    // Shared scaffold: latch in-flight + relabel the Cancel-listing button to
+    // "Cancelling…" (it is this flow's primary action).
+    beginPrimary(m_cancelListBtn, tr("Cancelling…"));
     QPointer<NFTSellDialog> self(this);
     m_rpc->nftCancelOffer(m_offerId,
         [self](QString /*txid*/) {
             if (self.isNull())
                 return;
-            self->m_inFlight = false;
             if (self->m_listedBadge) {
                 self->m_listedBadge->setText(tr("● Listing cancelled — your collectible is free."));
                 self->m_listedBadge->setStyleSheet("color:#9aa0a6; font-weight:600;");
             }
-            if (self->m_cancelListBtn) {
-                // Repurpose Cancel into a terminal "Done" dismiss.
-                self->m_cancelListBtn->setText(tr("Done"));
-                self->m_cancelListBtn->setEnabled(true);
-                self->m_cancelListBtn->disconnect(SIGNAL(clicked()));
-                connect(self->m_cancelListBtn, &QPushButton::clicked,
-                        self.data(), &NFTSellDialog::onDoneClicked);
-            }
+            // Repurpose the Cancel button into a terminal "Done" dismiss (shared scaffold).
+            self->finishPrimaryAsDone(self->m_cancelListBtn);
             if (self->m_copyBtn) self->m_copyBtn->setEnabled(false);
             if (self->m_saveBtn) self->m_saveBtn->setEnabled(false);
             if (self->m_resultLine) {
@@ -359,7 +339,9 @@ void NFTSellDialog::onCancelListingClicked() {
         [self](QString errStr) {
             if (self.isNull())
                 return;
-            self->m_inFlight = false;
+            // Restore the Cancel-listing affordance (not the generic "Try again":
+            // the listing still stands, so the original label is the honest one).
+            self->setInFlight(false);
             if (self->m_cancelListBtn) {
                 self->m_cancelListBtn->setEnabled(true);
                 self->m_cancelListBtn->setText(tr("Cancel listing"));
@@ -374,16 +356,4 @@ void NFTSellDialog::onCancelListingClicked() {
 
 void NFTSellDialog::onDoneClicked() {
     accept();
-}
-
-QString NFTSellDialog::trimmedExpiryLabel(int days) {
-    return tr("~%1 days").arg(days);
-}
-
-void NFTSellDialog::closeEvent(QCloseEvent* e) {
-    if (m_inFlight) {
-        e->ignore();   // swallow [X] while a make/cancel RPC is in flight (UAF guard)
-        return;
-    }
-    QDialog::closeEvent(e);
 }

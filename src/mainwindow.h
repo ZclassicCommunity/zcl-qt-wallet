@@ -354,6 +354,8 @@ private:
     void openNFTDetail(const QModelIndex& idx);
     void openMintDialog();
     void openBuyDialog();   // "Buy an NFT" — opens NFTBuyDialog (#119/PART2)
+    void openShieldSendDialog();      // SHIELD: "Send a private file" (file content only)
+    void openShieldReceiveDialog();   // SHIELD: "Receive a private file" (verify-before-decrypt)
     NFTGalleryModel* nftModel    = nullptr;
     NFTImageCache*   nftImgCache = nullptr;
     QWidget*         nftTab      = nullptr;   // the gallery page (added to tabWidget)

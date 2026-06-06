@@ -52,6 +52,55 @@ struct NFTOfferRow {
     qint64  expiryHeight = 0;
 };
 
+// SHIELD (private file send/receive) PODs over the ZDC1 shielded data-channel
+// (doc/nft/PRIVACY_TECH.md). Carried by VALUE across the synchronous doRPC
+// callback boundary (same pattern as NFTOfferRow) so no metatype registration is
+// needed. HONESTY: the data-channel makes only FILE CONTENT private — ownership
+// is ALWAYS public, and the ciphertext is stored publicly on-chain forever.
+
+// One row of z_listdatatransfers — session/in-memory only ("sent" this session),
+// NOT a durable history (the wrapper's caller must label it as such).
+struct DataTransferRow {
+    QString transferId;              // 16-hex
+    QString fingerprint;             // 64-hex ciphertext anchor (== NFT document_hash)
+    QString direction;               // always "sent" in this build (no received list)
+    QString status;                  // always "recorded" in this build
+    QString fromAddress;
+    QString toAddress;
+    QString filename;
+    int     frames = 0;
+};
+
+// The result of z_getdatatransfer (reassemble + verify-before-decrypt). hexData is
+// the plaintext and is non-empty ONLY when verified && complete (the daemon never
+// returns plaintext on a verify/decrypt failure). `error` carries the daemon's
+// honest zdc::status_str text for the four distinct failure states.
+struct DataTransferResult {
+    QString transferId;
+    QString fingerprint;
+    bool    verified = false;
+    bool    complete = false;
+    int     framesReceived = 0;
+    QString hexData;                 // plaintext, hex — only if verified+decrypted
+    int     size = 0;                // plaintext byte length
+    QString filename;
+    QString contentType;
+    QString onchainFingerprint;      // present for mismatch diagnosis
+    QString expectedFingerprint;     // present for mismatch diagnosis
+    QString error;                   // daemon's honest status text (empty on success)
+};
+
+// The result of z_senddatafile (the immediate, pre-async-result object). After
+// this returns the operation runs async; the load-bearing facts (fingerprint =
+// NFT document_hash, the per-transfer disclosure key) are already known here.
+struct SendDataFileResult {
+    QString operationId;
+    QString transferId;              // 16-hex
+    QString fingerprint;             // 64-hex == NFT document_hash
+    QString key;                     // hex per-transfer L3 disclosure key (the secret to safeguard)
+    int     frames = 0;
+};
+
 struct WatchedTx {
     QString opid;
     Tx tx;
@@ -170,6 +219,18 @@ public:
     void testSetNextOfferList(const QVector<NFTOfferRow>& rows)
         { testNextOfferList = rows; testOfferListSet = true; }
     void testSetNextCancelResult(const QString& txid) { testNextCancelTxid = txid; }
+    // SHIELD seams (mirror the SELL seams): a non-empty testNextNftError wins on all of
+    // these (the calm-error path is L1-testable, incl. the channel-off -32601 message);
+    // else the installed result fires onDone; else the call returns WITHOUT firing either
+    // callback (the perpetual-in-flight closeEvent-swallow test). One-shot. The get/list
+    // results need explicit "set" flags because an unverified/empty result is still a
+    // valid delivery (we must distinguish "deliver a fail verdict" from "nothing installed").
+    void testSetNextSendDataFileResult(const SendDataFileResult& r)
+        { testNextSendDataFile = r; testSendDataFileSet = true; }
+    void testSetNextDataTransferList(const QVector<DataTransferRow>& rows)
+        { testNextDataXferList = rows; testDataXferListSet = true; }
+    void testSetNextDataTransferResult(const DataTransferResult& r)
+        { testNextDataXfer = r; testDataXferSet = true; }
     // txReceivedDate seam: the confs/blocktime the NEXT call delivers. confs<0 (or
     // testReceivedSet left false) routes to the error cb instead.
     void testSetNextReceived(qint64 confs, qint64 blocktime)
@@ -315,6 +376,56 @@ public:
     void nftCancelOffer(const QString& offerId,
                         const std::function<void(QString txid)>& onDone,
                         const std::function<void(QString errStr)>& onErr);
+
+    // ---- SHIELD pillar (private file send/receive over the ZDC1 data-channel) ----
+    // Each wraps one daemon z_*datafile / z_*datatransfer RPC (src/rpc/datachannel.cpp),
+    // a SINGLE JSON OBJECT param. HONEST error mapping: the data-channel RPCs are only
+    // registered under -datachannel (default OFF); when off the dispatcher returns
+    // RPC_METHOD_NOT_FOUND (-32601) — we map that to a CALM "enable private transfers in
+    // Settings first" message (datachannelOff()) instead of a scary raw error.
+    //
+    // The plaintext NEVER leaves the user's machine for a SEND: the GUI hex-encodes the
+    // local file bytes and sends `hexdata` (not a server filepath). The 40000-byte cap
+    // is enforced UP FRONT in the dialog (nftdc::ZDC_MAX_FILE_BYTES). acknowledge_permanent
+    // is ALWAYS true here (the dialog earns that consent via a mandatory checkbox; the
+    // daemon also refuses without it). content_type/filename are optional metadata.
+
+    // SEND a private file. `hexData` is the lowercase-hex of the local file bytes (the
+    // caller reads them binary-safe and hex-encodes). fromAddr/toAddr are Sapling
+    // z-addresses (zs..). z_senddatafile is ASYNC and returns an operationid; the
+    // immediate object carries the fingerprint (= NFT document_hash) + per-transfer key,
+    // which is what the success screen needs — so we surface that immediate result via
+    // onDone (no operation poll needed for the load-bearing facts). onErr(calm honest).
+    void sendDataFile(const QString& fromAddr, const QString& toAddr,
+                      const QString& hexData, const QString& filename,
+                      const QString& contentType,
+                      const std::function<void(SendDataFileResult)>& onDone,
+                      const std::function<void(QString errStr)>& onErr);
+
+    // LIST the data transfers this node sent THIS SESSION (z_listdatatransfers; in-memory,
+    // 72h TTL — NOT a durable or received history; the caller labels it honestly).
+    // onDone(rows); onErr(calm). -32601 (channel off) routes to onErr(datachannelOff()).
+    void listDataTransfers(const std::function<void(QVector<DataTransferRow>)>& onDone,
+                           const std::function<void(QString errStr)>& onErr);
+
+    // GET (reassemble + VERIFY-BEFORE-DECRYPT) a private file. Identify by transfer_id
+    // (16-hex) OR fingerprint (64-hex) — pass the one you have, "" for the other. `address`
+    // optional (defaults to the recorded toaddress, else scans viewable addrs) supports
+    // CROSS-WALLET receive. `verifyFingerprint` optional out-of-band 64-hex anchor. The
+    // daemon verifies BEFORE any decrypt and returns plaintext ONLY when verified+complete;
+    // onDone always fires with a filled DataTransferResult (even on a verify/decrypt
+    // FAILURE — the .error field carries the honest state). onErr only on transport/off.
+    void getDataTransfer(const QString& transferId, const QString& fingerprint,
+                         const QString& address, const QString& verifyFingerprint,
+                         const std::function<void(DataTransferResult)>& onDone,
+                         const std::function<void(QString errStr)>& onErr);
+
+    // PROVENANCE: the PUBLIC transfer history of an NFT (zslp_listtransfers, newest-first,
+    // reorg-safe). HONEST: ZSLP ownership is always public — this is the on-chain
+    // chain-of-custody, not a private log. onDone(array of JSON transfer rows); onErr(calm).
+    void nftListTransfers(const QString& tokenId,
+                          const std::function<void(json transfers)>& onDone,
+                          const std::function<void(QString errStr)>& onErr);
 
     // Pure conversion helper (L0-testable): human ZCL (double) -> zatoshi (qint64),
     // rounded to the nearest zat. Clamped at 0. The ONE place price strings become zat.
@@ -605,6 +716,13 @@ private:
     QVector<NFTOfferRow>        testNextOfferList;
     bool                        testOfferListSet          = false;
     QString                     testNextCancelTxid;
+    // SHIELD seam backing stores (one-shot; consumed inside the data-channel wrappers).
+    SendDataFileResult          testNextSendDataFile;
+    bool                        testSendDataFileSet       = false;
+    QVector<DataTransferRow>    testNextDataXferList;
+    bool                        testDataXferListSet       = false;
+    DataTransferResult          testNextDataXfer;
+    bool                        testDataXferSet           = false;
 #endif
 };
 

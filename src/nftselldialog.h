@@ -24,8 +24,8 @@
 
 #include "precompiled.h"
 #include "nft.h"
+#include "nftasyncdialog.h"   // shared in-flight latch + [X]-swallow + Done/Try-again
 
-#include <QDialog>
 #include <QString>
 
 class QLabel;
@@ -35,7 +35,7 @@ class QComboBox;
 class QPushButton;
 class RPC;
 
-class NFTSellDialog : public QDialog {
+class NFTSellDialog : public NftAsyncDialog {
     Q_OBJECT
 public:
     explicit NFTSellDialog(const NFTItem& item, RPC* rpc, QWidget* parent = nullptr);
@@ -44,9 +44,8 @@ public:
     QString lastOfferId()   const { return m_offerId; }
     QString lastOfferBlob() const { return m_offerBlob; }
 
-protected:
-    // Swallow [X] while the make/cancel RPC is in flight (UAF guard, like the send dialog).
-    void closeEvent(QCloseEvent* e) override;
+    // The [X]-swallow while a make/cancel RPC is in flight is inherited from
+    // NftAsyncDialog::closeEvent (UAF guard, like the send dialog).
 
 private slots:
     void onComposeChanged();   // re-gate List on a valid price + buyer t-address
@@ -59,11 +58,10 @@ private slots:
 private:
     void refreshListEnabled();
     void enterListedState();   // swap the compose controls for the blob + actions
-    static QString trimmedExpiryLabel(int days);
 
     NFTItem  m_item;
     RPC*     m_rpc      = nullptr;
-    bool     m_inFlight = false;   // make/cancel RPC in flight (Cancel + [X] disabled)
+    // m_inFlight now lives in NftAsyncDialog (isInFlight()/setInFlight()).
     bool     m_listed   = false;   // an offer has been produced (LISTED phase)
 
     QString  m_offerId;            // from nft_makeoffer (for Cancel)

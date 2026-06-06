@@ -4,6 +4,8 @@
 #include "nftdetaildialog.h"
 #include "nftsenddialog.h"
 #include "nftselldialog.h"
+#include "shieldsenddialog.h"
+#include "shieldreceivedialog.h"
 #include "contentengine.h"
 #include "rpc.h"
 #include "settings.h"
@@ -124,11 +126,18 @@ NFTDetailDialog::NFTDetailDialog(const NFTItem& item, const QVector<NFTItem>& or
     m_received    = new QLabel(this);
     m_setLine     = new QLabel(this);
     m_fingerprint = new QLabel(this);
-    for (QLabel* l : { m_mintId, m_received, m_setLine, m_fingerprint }) {
+    m_provenance  = new QLabel(this);
+    m_provenance->setObjectName("nftDetailProvenance");
+    for (QLabel* l : { m_mintId, m_received, m_setLine, m_fingerprint, m_provenance }) {
         l->setWordWrap(true);
         l->setTextInteractionFlags(Qt::TextSelectableByMouse);
         info->addWidget(l);
     }
+    // PROVENANCE is the PUBLIC chain-of-custody (honest: ownership is always public).
+    m_provenance->setWhatsThis(
+        tr("Every transfer of this collectible is recorded publicly on the ZClassic "
+           "ledger. This is the public history of who has held it — ownership is never "
+           "private."));
 
     auto* footnote = new QLabel(
         tr("This name and image aren't unique — anyone can mint another collectible "
@@ -161,6 +170,26 @@ NFTDetailDialog::NFTDetailDialog(const NFTItem& item, const QVector<NFTItem>& or
     moreRow->addWidget(m_recheckBtn);
     moreRow->addWidget(m_explorerBtn);
     info->addLayout(moreRow);
+
+    // SHIELD row (private FILE content — never private ownership). "Send file
+    // privately…" opens the encrypted-send dialog; "Open private file" looks up the
+    // file linked to THIS token's fingerprint (verify-before-decrypt).
+    auto* shieldRow = new QHBoxLayout();
+    m_sendFileBtn = new QPushButton(tr("Send file privately…"), this);
+    m_sendFileBtn->setObjectName("nftDetailSendPrivateButton");
+    m_sendFileBtn->setWhatsThis(
+        tr("Encrypt a file so only the person you send it to can read it. This makes "
+           "only the file's CONTENTS private — who owns this collectible is always "
+           "public, and the encrypted file is stored on-chain permanently."));
+    m_openFileBtn = new QPushButton(tr("Open private file"), this);
+    m_openFileBtn->setObjectName("nftDetailOpenPrivateButton");
+    m_openFileBtn->setWhatsThis(
+        tr("Look up the private file linked to this collectible's fingerprint and, if "
+           "it verifies against the on-chain fingerprint, decrypt and open it."));
+    shieldRow->addWidget(m_sendFileBtn);
+    shieldRow->addWidget(m_openFileBtn);
+    shieldRow->addStretch(1);
+    info->addLayout(shieldRow);
 
     // Item A: attach-the-file affordance. A RECEIVED NFT has cachePath="" by privacy
     // design (never auto-fetched), so this is the ONLY way its image can reach the
@@ -197,6 +226,8 @@ NFTDetailDialog::NFTDetailDialog(const NFTItem& item, const QVector<NFTItem>& or
     connect(m_recheckBtn,  &QPushButton::clicked, this, &NFTDetailDialog::onRecheck);
     connect(m_explorerBtn, &QPushButton::clicked, this, &NFTDetailDialog::onViewInExplorer);
     connect(m_attachBtn,   &QPushButton::clicked, this, &NFTDetailDialog::onAttachFile);
+    connect(m_sendFileBtn, &QPushButton::clicked, this, &NFTDetailDialog::onSendPrivateFile);
+    connect(m_openFileBtn, &QPushButton::clicked, this, &NFTDetailDialog::onOpenPrivateFile);
 
     if (m_engine) {
         connect(m_engine, &ContentEngine::posterReady,
@@ -270,9 +301,14 @@ void NFTDetailDialog::loadCurrent() {
         m_saveBtn->setEnabled(false);   // re-enabled by onPosterReady when bytes load
     requestPoster();
 
-    // Back-fill richer provenance + received date (best-effort; honest defaults).
+    // Provenance line: an honest default until the public transfer history lands.
+    m_provenance->setText(tr("Transfer history: public — loading…"));
+
+    // Back-fill richer provenance + received date + the PUBLIC transfer history
+    // (best-effort; honest defaults stand if a call fails).
     backfillProvenance();
     backfillReceived();
+    backfillTransfers();
 }
 
 void NFTDetailDialog::requestPoster() {
@@ -444,6 +480,58 @@ void NFTDetailDialog::backfillReceived() {
         },
         [](QString /*errStr*/) { /* keep the height-only line */ }
     );
+}
+
+void NFTDetailDialog::backfillTransfers() {
+    if (m_rpc == nullptr)
+        return;
+    const QString tokenId = cur().txid;
+    // LIFETIME (UAF guard): open()-modeless + WA_DeleteOnClose, so the dialog can be
+    // destroyed while this RPC is in flight. QPointer the reply and bail if gone.
+    QPointer<NFTDetailDialog> self(this);
+    m_rpc->nftListTransfers(tokenId,
+        [self, tokenId](json transfers) {
+            if (self.isNull())
+                return;   // dialog gone — safe no-op
+            if (self->cur().txid != tokenId)
+                return;   // raced past this item
+            // HONEST: this is the PUBLIC chain-of-custody. Count the transfers; the
+            // detail line states the public count without fabricating creator/owner
+            // identities the chain does not record.
+            int count = 0;
+            if (transfers.is_array())
+                count = (int) transfers.size();
+            if (count <= 0) {
+                self->m_provenance->setText(
+                    tr("Transfer history: public — none recorded yet (just minted)."));
+            } else {
+                self->m_provenance->setText(
+                    tr("Transfer history: public — %n transfer(s) on the ledger.", "", count));
+            }
+        },
+        [self](QString /*errStr*/) {
+            if (self.isNull())
+                return;
+            // Index off / old daemon: keep the honest public framing, drop the count.
+            self->m_provenance->setText(tr("Transfer history: public on the ledger."));
+        }
+    );
+}
+
+void NFTDetailDialog::onSendPrivateFile() {
+    // SHIELD: open the private-file SEND dialog. HONEST: this encrypts FILE CONTENT
+    // only — it does NOT make ownership private (the dialog repeats that). Modal.
+    ShieldSendDialog dlg(m_rpc, this);
+    dlg.exec();
+}
+
+void NFTDetailDialog::onOpenPrivateFile() {
+    // SHIELD Mode A: open the private file linked to THIS token's fingerprint, with the
+    // token's docHashHex as the expected anchor (verify-before-decrypt). Modal.
+    ShieldReceiveDialog dlg(m_rpc, this);
+    if (!cur().docHashHex.isEmpty())
+        dlg.prefillFingerprint(cur().docHashHex);
+    dlg.exec();
 }
 
 void NFTDetailDialog::onSendGift() {

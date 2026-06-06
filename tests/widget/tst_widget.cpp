@@ -93,8 +93,13 @@
 #include "nftsenddialog.h"
 #include "nftselldialog.h"
 #include "nftbuydialog.h"
+#include "shieldsenddialog.h"
+#include "shieldreceivedialog.h"
 #include <QPlainTextEdit>
 #include <QCheckBox>
+#include <QListWidget>
+#include <QComboBox>
+#include <QTemporaryFile>
 
 // Kept alive for the whole process so QStandardPaths/QSettings stay isolated.
 static QTemporaryDir* g_homeDir = nullptr;
@@ -2717,6 +2722,516 @@ private slots:
         QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
         QVERIFY2(dlg->isVisible(), "close must be swallowed while the take RPC is in flight");
         delete dlg;     // we own it (no WA_DeleteOnClose)
+    }
+
+    // -- C-4 (DRY): the public-trade honesty sentence must be IDENTICAL in the sell
+    //    and buy dialogs (both now read it from nftPublicTradeNote()). A drift here
+    //    would split the translation entry and risk one dialog saying something the
+    //    other doesn't. Also assert it carries the load-bearing honesty words.
+    void nftCommon_publicTradeNoteIdenticalSellAndBuy() {
+        MainWindow* w = makeWindow();
+        ContentEngine engine(nullptr);
+
+        NFTItem it; it.txid = "tokcommon01"; it.name = "Common"; it.verifyState = 1;
+        NFTSellDialog* sell = new NFTSellDialog(it, w->getRPC(), w);
+        sell->setAttribute(Qt::WA_DeleteOnClose);
+        NFTBuyDialog* buy = new NFTBuyDialog(&engine, w->getRPC(), w);
+        buy->setAttribute(Qt::WA_DeleteOnClose);
+
+        auto* sellNote = sell->findChild<QLabel*>("nftSellPublicNote");
+        auto* buyNote  = buy->findChild<QLabel*>("nftBuyPublicNote");
+        QVERIFY(sellNote && buyNote);
+        QCOMPARE(sellNote->text(), buyNote->text());   // single source -> identical
+        QVERIFY2(sellNote->text().contains("publicly", Qt::CaseInsensitive),
+                 qPrintable("public-trade note must stay honest: " + sellNote->text()));
+        sell->close();
+        buy->close();
+    }
+
+    // -- C-4 (DRY): the shared 4-state t-address validator must paint the SAME copy
+    //    in the send and sell dialogs for the same input (both call
+    //    nftValidateTAddrInto). We drive the green (valid t-address) state and the
+    //    not-an-address red state; the shielded-specific hint legitimately differs.
+    void nftCommon_tAddrValidatorSharedCopy() {
+        MainWindow* w = makeWindow();
+
+        NFTItem it; it.txid = "tokcommon02"; it.name = "Common2"; it.verifyState = 1;
+        NFTSendDialog* send = new NFTSendDialog(it, w->getRPC(), w);
+        send->setAttribute(Qt::WA_DeleteOnClose);
+        NFTSellDialog* sell = new NFTSellDialog(it, w->getRPC(), w);
+        sell->setAttribute(Qt::WA_DeleteOnClose);
+
+        auto* sendRcpt   = send->findChild<QLineEdit*>("nftSendRecipientEdit");
+        auto* sendStatus = send->findChild<QLabel*>("nftSendAddrStatus");
+        auto* sellBuyer  = sell->findChild<QLineEdit*>("nftSellBuyerAddrEdit");
+        auto* sellStatus = sell->findChild<QLabel*>("nftSellBuyerStatus");
+        QVERIFY(sendRcpt && sendStatus && sellBuyer && sellStatus);
+
+        // Valid t-address -> identical green/amber "Looks good" copy in both dialogs.
+        const QString tAddr = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        sendRcpt->setText(tAddr);
+        sellBuyer->setText(tAddr);
+        QCOMPARE(sendStatus->text(), sellStatus->text());
+        QVERIFY2(sendStatus->text().contains("Looks good", Qt::CaseInsensitive),
+                 qPrintable("valid-taddr copy: " + sendStatus->text()));
+
+        // Garbage -> identical "doesn't look like a ZClassic address" copy.
+        sendRcpt->setText("not-an-address");
+        sellBuyer->setText("not-an-address");
+        QCOMPARE(sendStatus->text(), sellStatus->text());
+        QVERIFY2(sendStatus->text().contains("doesn't look like", Qt::CaseInsensitive),
+                 qPrintable("invalid-addr copy: " + sendStatus->text()));
+        send->close();
+        sell->close();
+    }
+
+    // =======================================================================
+    // SHIELD — private file send/receive (ZDC1 data-channel). Driven via the RPC
+    // test seams (testSetNextSendDataFileResult / DataTransferResult / List) +
+    // the ShieldSendDialog::testPickFile seam, under ZCL_WIDGET_TEST + offscreen.
+    // The coin is ZCL; the feature makes only FILE CONTENT private.
+    // =======================================================================
+
+    static const char* SAPLING_ZS_A() {
+        return "zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u";
+    }
+    static const char* SAPLING_ZS_B() {
+        return "zs10m00rvkhfm4f7n23e4sxsx275r7ptnggx39ygl0vy46j9mdll5c97gl6dxgpk0njuptg2mn9w5s";
+    }
+
+    // Write a small binary file (with a NUL + high byte) and return its path.
+    QString writeSmallBinary(const QString& dir, const QString& name, int bytes) {
+        const QString p = QDir(dir).filePath(name);
+        QFile f(p);
+        if (!f.open(QIODevice::WriteOnly)) return QString();
+        QByteArray data;
+        for (int i = 0; i < bytes; ++i)
+            data.append(char(i % 256));   // includes 0x00 and high bytes -> binary-safe path
+        f.write(data); f.close();
+        return p;
+    }
+
+    // -- SHIELD SEND: Send gated until file + recipient + consent; consent is mandatory.
+    void shieldSend_consentMandatoryAndGating() {
+        MainWindow* w = makeWindow();
+        // Install a wallet Sapling z-addr so the From combo has a valid spending addr.
+        auto* zs = new QList<QString>(); zs->append(SAPLING_ZS_A());
+        w->getRPC()->testSetZAddresses(zs);
+
+        ShieldSendDialog* dlg = new ShieldSendDialog(w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* to      = dlg->findChild<QLineEdit*>("shieldSendToEdit");
+        auto* consent = dlg->findChild<QCheckBox*>("shieldSendConsentCheck");
+        auto* send    = dlg->findChild<QPushButton*>("shieldSendButton");
+        QVERIFY(to && consent && send);
+        QVERIFY2(!send->isEnabled(), "Send must be disabled at open (no file/recipient/consent)");
+
+        // Pick a valid small binary file (the From combo is already a valid Sapling addr).
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        const QString file = writeSmallBinary(tmp.path(), "payload.bin", 256);
+        QVERIFY(!file.isEmpty());
+        dlg->testPickFile(file);
+
+        // A valid Sapling recipient -> still disabled until consent is ticked.
+        to->setText(SAPLING_ZS_B());
+        QVERIFY2(!send->isEnabled(), "Send must stay DISABLED until permanence consent is ticked");
+
+        // Tick consent -> Send enabled.
+        consent->setChecked(true);
+        QVERIFY2(send->isEnabled(), "Send must enable once file + recipient + consent are all present");
+
+        // Untick consent -> disabled again (consent is not a one-way latch).
+        consent->setChecked(false);
+        QVERIFY2(!send->isEnabled(), "unticking consent must disable Send again");
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- SHIELD SEND: a too-large file is rejected UP FRONT (no RPC), Send stays disabled.
+    void shieldSend_oversizeRejectedUpFront() {
+        MainWindow* w = makeWindow();
+        auto* zs = new QList<QString>(); zs->append(SAPLING_ZS_A());
+        w->getRPC()->testSetZAddresses(zs);
+
+        ShieldSendDialog* dlg = new ShieldSendDialog(w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* to      = dlg->findChild<QLineEdit*>("shieldSendToEdit");
+        auto* consent = dlg->findChild<QCheckBox*>("shieldSendConsentCheck");
+        auto* send    = dlg->findChild<QPushButton*>("shieldSendButton");
+        auto* fileLine= dlg->findChild<QLabel*>("shieldSendFileLine");
+        QVERIFY(to && consent && send && fileLine);
+
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        const QString big = writeSmallBinary(tmp.path(), "big.bin", 41000);   // > 40000 cap
+        QVERIFY(!big.isEmpty());
+        dlg->testPickFile(big);
+
+        QVERIFY2(fileLine->text().contains("too large", Qt::CaseInsensitive),
+                 qPrintable("oversize message: " + fileLine->text()));
+        // Even with a valid recipient + consent, Send stays disabled (no hex payload set).
+        to->setText(SAPLING_ZS_B());
+        consent->setChecked(true);
+        QVERIFY2(!send->isEnabled(), "an oversize file must keep Send disabled (rejected up front)");
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- SHIELD SEND: success -> Done + fingerprint + disclosure key surfaced + NOT auto-accepted.
+    void shieldSend_successShowsFingerprintAndKey() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+        auto* zs = new QList<QString>(); zs->append(SAPLING_ZS_A());
+        rpc->testSetZAddresses(zs);
+
+        ShieldSendDialog* dlg = new ShieldSendDialog(rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* to      = dlg->findChild<QLineEdit*>("shieldSendToEdit");
+        auto* consent = dlg->findChild<QCheckBox*>("shieldSendConsentCheck");
+        auto* send    = dlg->findChild<QPushButton*>("shieldSendButton");
+        QVERIFY(to && consent && send);
+
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        const QString file = writeSmallBinary(tmp.path(), "p.bin", 100);
+        dlg->testPickFile(file);
+        to->setText(SAPLING_ZS_B());
+        consent->setChecked(true);
+        QVERIFY(pumpUntil([&]{ return send->isEnabled(); }));
+
+        SendDataFileResult r;
+        r.operationId = "opid-1";
+        r.transferId  = "00112233aabbccdd";
+        r.fingerprint = QString(64, QChar('a'));
+        r.key         = QString(64, QChar('b'));
+        r.frames      = 2;
+        rpc->testSetNextSendDataFileResult(r);
+        send->click();
+
+        QVERIFY2(pumpUntil([&]{ return send->text() == QString("Done"); }),
+                 qPrintable("Send did not retire to Done: " + send->text()));
+        QVERIFY2(dlg->result() != QDialog::Accepted,
+                 "shield send must NOT auto-accept on success");
+
+        // The fingerprint + disclosure key fields are now present + carry the values.
+        auto* fpField  = dlg->findChild<QLineEdit*>("shieldSendFingerprintField");
+        auto* keyField = dlg->findChild<QLineEdit*>("shieldSendKeyField");
+        QVERIFY2(fpField,  "the content fingerprint field must appear on success");
+        QVERIFY2(keyField, "the disclosure key field must appear on success");
+        QCOMPARE(fpField->text(), r.fingerprint);
+        QCOMPARE(keyField->text(), r.key);
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- SHIELD SEND: the [X]/close is swallowed while the send RPC is in flight (UAF guard).
+    void shieldSend_closeSwallowedWhileInFlight() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+        auto* zs = new QList<QString>(); zs->append(SAPLING_ZS_A());
+        rpc->testSetZAddresses(zs);
+
+        ShieldSendDialog* dlg = new ShieldSendDialog(rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* to      = dlg->findChild<QLineEdit*>("shieldSendToEdit");
+        auto* consent = dlg->findChild<QCheckBox*>("shieldSendConsentCheck");
+        auto* send    = dlg->findChild<QPushButton*>("shieldSendButton");
+        QVERIFY(to && consent && send);
+
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        dlg->testPickFile(writeSmallBinary(tmp.path(), "p.bin", 80));
+        to->setText(SAPLING_ZS_B());
+        consent->setChecked(true);
+        QVERIFY(pumpUntil([&]{ return send->isEnabled(); }));
+
+        // Nothing installed -> the send RPC never resolves -> perpetual in-flight.
+        send->click();
+        QVERIFY2(pumpUntil([&]{ return send->text() == QString("Encrypting and sending…"); }),
+                 qPrintable("Send did not enter in-flight state: " + send->text()));
+        dlg->close();   // must be SWALLOWED while in flight
+        QCoreApplication::processEvents();
+        QVERIFY2(dlg->isVisible(), "close must be swallowed while the send RPC is in flight");
+        QVERIFY2(dlg->result() != QDialog::Accepted, "must not accept while in flight");
+
+        w->deleteLater();
+    }
+
+    // -- SHIELD SEND: channel-off (-32601) maps to the calm "enable in Settings" line.
+    void shieldSend_channelOffCalmError() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+        auto* zs = new QList<QString>(); zs->append(SAPLING_ZS_A());
+        rpc->testSetZAddresses(zs);
+
+        ShieldSendDialog* dlg = new ShieldSendDialog(rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* to      = dlg->findChild<QLineEdit*>("shieldSendToEdit");
+        auto* consent = dlg->findChild<QCheckBox*>("shieldSendConsentCheck");
+        auto* send    = dlg->findChild<QPushButton*>("shieldSendButton");
+        auto* result  = dlg->findChild<QLabel*>("shieldSendResultLine");
+        QVERIFY(to && consent && send && result);
+
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        dlg->testPickFile(writeSmallBinary(tmp.path(), "p.bin", 60));
+        to->setText(SAPLING_ZS_B());
+        consent->setChecked(true);
+        QVERIFY(pumpUntil([&]{ return send->isEnabled(); }));
+
+        // The seam fires the error cb with the calm channel-off message (as the real
+        // datachannelCalmError would for -32601).
+        rpc->testSetNextNftError(QStringLiteral(
+            "Private file transfers are turned off on your node. Turn on “Enable private "
+            "file transfers” in Settings → Privacy, then restart, to use this."));
+        send->click();
+
+        QVERIFY2(pumpUntil([&]{ return result->text().contains("turned off", Qt::CaseInsensitive)
+                                       && result->text().contains("Settings", Qt::CaseInsensitive); }),
+                 qPrintable("channel-off calm error: " + result->text()));
+        // After an error the primary returns to a retryable state (Try again), not Done.
+        QVERIFY2(send->text() == QString("Try again"),
+                 qPrintable("after error Send should read Try again: " + send->text()));
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- SHIELD RECEIVE: verified+complete -> success line + Save enabled.
+    void shieldReceive_verifiedEnablesSave() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+
+        ShieldReceiveDialog* dlg = new ShieldReceiveDialog(rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* id    = dlg->findChild<QLineEdit*>("shieldReceiveIdEdit");
+        auto* look  = dlg->findChild<QPushButton*>("shieldReceiveLookupButton");
+        auto* state = dlg->findChild<QLabel*>("shieldReceiveStateLine");
+        auto* save  = dlg->findChild<QPushButton*>("shieldReceiveSaveButton");
+        QVERIFY(id && look && state && save);
+        QVERIFY2(!save->isEnabled(), "Save must be disabled until a file verifies");
+
+        DataTransferResult r;
+        r.verified = true; r.complete = true;
+        r.hexData  = QString::fromLatin1(QByteArray("hello").toHex());
+        r.size     = 5; r.filename = "hello.txt"; r.contentType = "text/plain";
+        rpc->testSetNextDataTransferResult(r);
+
+        id->setText(QString(64, QChar('a')));
+        look->click();
+
+        QVERIFY2(pumpUntil([&]{ return state->text().contains("verified", Qt::CaseInsensitive); }),
+                 qPrintable("verified state line: " + state->text()));
+        QVERIFY2(save->isEnabled(), "Save must enable ONLY after verify+decrypt");
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- SHIELD RECEIVE: the four honest failure states stay DISTINCT (no generic "failed",
+    //    no fake "try again" on a hard refusal), and Save NEVER enables on failure.
+    void shieldReceive_distinctFailureStates() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+
+        struct Case { QString error; bool complete; QString expect; bool refusal; };
+        const QList<Case> cases = {
+            { "content hash mismatch after reassembly",          true,  "doesn't match", true  },
+            { "AEAD verification failed (tamper or wrong key)",  true,  "tampered",      true  },
+            { "key not yet available (sealed)",                  true,  "addressed to you", false },
+            { "transfer incomplete (missing frames)",            false, "haven't confirmed", false },
+        };
+        for (const Case& c : cases) {
+            ShieldReceiveDialog* dlg = new ShieldReceiveDialog(rpc, w);
+            dlg->setAttribute(Qt::WA_DeleteOnClose);
+            dlg->show();
+            auto* id    = dlg->findChild<QLineEdit*>("shieldReceiveIdEdit");
+            auto* look  = dlg->findChild<QPushButton*>("shieldReceiveLookupButton");
+            auto* state = dlg->findChild<QLabel*>("shieldReceiveStateLine");
+            auto* save  = dlg->findChild<QPushButton*>("shieldReceiveSaveButton");
+            QVERIFY(id && look && state && save);
+
+            DataTransferResult r;
+            r.verified = false; r.complete = c.complete; r.error = c.error;
+            rpc->testSetNextDataTransferResult(r);
+            id->setText(QString(64, QChar('c')));
+            look->click();
+
+            QVERIFY2(pumpUntil([&]{ return state->text().contains(c.expect, Qt::CaseInsensitive); }),
+                     qPrintable("state for [" + c.error + "] -> " + state->text()));
+            QVERIFY2(!save->isEnabled(), "Save must NEVER enable on a failure");
+            if (c.refusal)
+                QVERIFY2(!state->text().contains("try again", Qt::CaseInsensitive),
+                         qPrintable("a hard refusal must NOT say try again: " + state->text()));
+            dlg->close();
+        }
+        w->deleteLater();
+    }
+
+    // -- SHIELD SEND: the recipient field is a FULL 4-state validator, and (unlike the
+    //    NFT-send t-addr validator) the data-channel needs a SAPLING (zs…) recipient.
+    //    States: (1) empty -> no status, Send disabled; (2) garbage -> red "doesn't
+    //    look like a ZClassic address"; (3) a valid t-addr or Sprout z-addr -> red
+    //    "need a Sapling (zs…) recipient" (the channel is Sapling-only) — and Send
+    //    stays disabled even with file+consent present; (4) a valid Sapling zs-addr ->
+    //    green "Looks good". This is the inverse-polarity validator the spec (§6.4)
+    //    requires, so it gets its own coverage separate from the NFT-send t-addr one.
+    void shieldSend_recipientFourStateValidation() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+        auto* zs = new QList<QString>(); zs->append(SAPLING_ZS_A());
+        rpc->testSetZAddresses(zs);
+
+        ShieldSendDialog* dlg = new ShieldSendDialog(rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* to      = dlg->findChild<QLineEdit*>("shieldSendToEdit");
+        auto* status  = dlg->findChild<QLabel*>("shieldSendToStatus");
+        auto* consent = dlg->findChild<QCheckBox*>("shieldSendConsentCheck");
+        auto* send    = dlg->findChild<QPushButton*>("shieldSendButton");
+        QVERIFY(to && status && consent && send);
+
+        // Pre-arm the OTHER gates (valid file + consent) so the recipient state is the
+        // sole remaining lever on Send for the t-addr/Sprout case below.
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        dlg->testPickFile(writeSmallBinary(tmp.path(), "p.bin", 64));
+        consent->setChecked(true);
+
+        // State 1 — empty: no status text, Send disabled.
+        to->setText("");
+        QVERIFY2(status->text().isEmpty(), qPrintable("empty -> no status: " + status->text()));
+        QVERIFY2(!send->isEnabled(), "empty recipient must keep Send disabled");
+
+        // State 2 — garbage: red "doesn't look like a ZClassic address".
+        to->setText("not-an-address");
+        QVERIFY2(status->text().contains("doesn't look like", Qt::CaseInsensitive),
+                 qPrintable("garbage -> red invalid copy: " + status->text()));
+        QVERIFY2(!send->isEnabled(), "garbage recipient must keep Send disabled");
+
+        // State 3 — a valid t-addr is a real ZClassic address but the channel is
+        // Sapling-only: it must be REFUSED with the "need a Sapling (zs…)" hint, and
+        // Send must stay disabled even though file + consent are present.
+        to->setText("t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi");
+        QVERIFY2(status->text().contains("Sapling", Qt::CaseInsensitive),
+                 qPrintable("t-addr -> Sapling-only hint: " + status->text()));
+        QVERIFY2(!send->isEnabled(),
+                 "a valid t-addr recipient must NOT enable a Sapling-only private send");
+
+        // State 4 — a valid Sapling zs-addr: green "Looks good", and with file+consent
+        // already set, Send finally enables.
+        to->setText(SAPLING_ZS_B());
+        QVERIFY2(status->text().contains("Looks good", Qt::CaseInsensitive),
+                 qPrintable("zs-addr -> green ok copy: " + status->text()));
+        QVERIFY2(send->isEnabled(),
+                 "a valid Sapling recipient (+ file + consent) must enable Send");
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- SHIELD RECEIVE (Mode A): the cross-wallet "open the file linked to a token you
+    //    hold" path. prefillFingerprint(<64-hex>) fills the lookup box with the NFT's
+    //    document_hash and immediately runs verify-before-decrypt by FINGERPRINT (no
+    //    transfer_id). On a verified+complete result the success line shows and Save
+    //    enables — exercising the registry-free cross-wallet receive seam.
+    void shieldReceive_crossWalletByFingerprintPrefill() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+
+        DataTransferResult r;
+        r.verified = true; r.complete = true;
+        r.hexData  = QString::fromLatin1(QByteArray("xwallet-bytes").toHex());
+        r.size     = 13; r.filename = "art.png"; r.contentType = "image/png";
+        const QString fp = QString(64, QChar('f'));
+        r.fingerprint = fp;
+        rpc->testSetNextDataTransferResult(r);
+
+        ShieldReceiveDialog* dlg = new ShieldReceiveDialog(rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* id    = dlg->findChild<QLineEdit*>("shieldReceiveIdEdit");
+        auto* state = dlg->findChild<QLabel*>("shieldReceiveStateLine");
+        auto* save  = dlg->findChild<QPushButton*>("shieldReceiveSaveButton");
+        QVERIFY(id && state && save);
+
+        // Mode A entry: pre-fill the held token's fingerprint and run the lookup.
+        dlg->prefillFingerprint(fp);
+
+        // The lookup box reflects the fingerprint and the verify-by-fingerprint path
+        // reached a verified result -> Save enabled.
+        QVERIFY2(pumpUntil([&]{ return state->text().contains("verified", Qt::CaseInsensitive); }),
+                 qPrintable("cross-wallet by-fingerprint verified line: " + state->text()));
+        QCOMPARE(id->text(), fp);
+        QVERIFY2(save->isEnabled(), "a verified cross-wallet open must enable Save");
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- SHIELD RECEIVE: verify-BEFORE-open means a HASH_MISMATCH refusal leaks NO
+    //    plaintext. The daemon never returns hexdata on a verify failure, and the
+    //    dialog must hold none: Save stays disabled AND clicking Save (defensively)
+    //    surfaces "no verified file to save" rather than writing bytes. The mismatch
+    //    diagnosis shows BOTH fingerprints (honest), but never any file content.
+    void shieldReceive_mismatchVerifyBeforeOpenNoPlaintext() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+
+        ShieldReceiveDialog* dlg = new ShieldReceiveDialog(rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* id    = dlg->findChild<QLineEdit*>("shieldReceiveIdEdit");
+        auto* look  = dlg->findChild<QPushButton*>("shieldReceiveLookupButton");
+        auto* state = dlg->findChild<QLabel*>("shieldReceiveStateLine");
+        auto* meta  = dlg->findChild<QLabel*>("shieldReceiveMetaLine");
+        auto* save  = dlg->findChild<QPushButton*>("shieldReceiveSaveButton");
+        QVERIFY(id && look && state && meta && save);
+
+        // The daemon refuses (HASH_MISMATCH) and returns NO hexdata, with both
+        // fingerprints for honest diagnosis.
+        DataTransferResult r;
+        r.verified = false; r.complete = true;
+        r.error    = "content hash mismatch after reassembly";
+        r.hexData  = QString();   // daemon NEVER returns plaintext on a refusal
+        r.onchainFingerprint  = QString(64, QChar('1'));
+        r.expectedFingerprint = QString(64, QChar('2'));
+        rpc->testSetNextDataTransferResult(r);
+
+        id->setText(QString(64, QChar('2')));   // expected anchor (out-of-band)
+        look->click();
+
+        QVERIFY2(pumpUntil([&]{ return state->text().contains("doesn't match", Qt::CaseInsensitive); }),
+                 qPrintable("mismatch refusal line: " + state->text()));
+        QVERIFY2(state->text().contains("Not opened", Qt::CaseInsensitive),
+                 qPrintable("a refusal must say it did NOT open the file: " + state->text()));
+        // No plaintext: Save stays disabled, and the honest diagnosis shows the two
+        // fingerprints (abbreviated) — never any file bytes/content.
+        QVERIFY2(!save->isEnabled(), "Save must stay disabled on a verify refusal (no plaintext)");
+        QVERIFY2(meta->text().contains("On-chain", Qt::CaseInsensitive)
+                     && meta->text().contains("expected", Qt::CaseInsensitive),
+                 qPrintable("mismatch diagnosis should show both fingerprints: " + meta->text()));
+
+        // Defensive: forcing the save slot must NOT write — there is no verified file.
+        QMetaObject::invokeMethod(dlg, "onSaveDecrypted");
+        QVERIFY2(state->text().contains("no verified file", Qt::CaseInsensitive),
+                 qPrintable("forcing Save with no verified file must refuse: " + state->text()));
+
+        dlg->close();
+        w->deleteLater();
     }
 
     void perf16_modelJank() {

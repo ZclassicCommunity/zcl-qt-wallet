@@ -47,6 +47,8 @@ private slots:
     void onPosterReady(quint64 token, QImage img, int verifyState);
     void onSendGift();
     void onSell();   // open NFTSellDialog for this owned NFT (#119/PART2)
+    void onSendPrivateFile();   // SHIELD: open ShieldSendDialog (file content, not ownership)
+    void onOpenPrivateFile();   // SHIELD: open ShieldReceiveDialog pre-filled with this fingerprint
     void onSaveImage();
     void onCopyId();
     void onCopyFingerprint();
@@ -83,6 +85,7 @@ private:
     void applyNoBytesBadge();
     void backfillProvenance();     // zslp_gettoken -> Set/series
     void backfillReceived();       // gettransaction -> confirmations/blocktime
+    void backfillTransfers();      // zslp_listtransfers -> the PUBLIC transfer history
     const NFTItem& cur() const { return m_ordered[m_index]; }
     static QString shortId(const QString& hex);
 
@@ -118,10 +121,13 @@ private:
     QLabel*      m_received    = nullptr;
     QLabel*      m_setLine     = nullptr;
     QLabel*      m_fingerprint = nullptr;
+    QLabel*      m_provenance  = nullptr;   // PUBLIC transfer history (zslp_listtransfers)
     QLabel*      m_attachStatus= nullptr;   // item A: green/red attach-the-file result
     QPushButton* m_explorerBtn = nullptr;
     QPushButton* m_sendBtn     = nullptr;
     QPushButton* m_sellBtn     = nullptr;   // "Sell" (opens NFTSellDialog)
+    QPushButton* m_sendFileBtn = nullptr;   // SHIELD: "Send file privately…"
+    QPushButton* m_openFileBtn = nullptr;   // SHIELD: "Open private file"
     QPushButton* m_recheckBtn  = nullptr;   // disabled when there are no local bytes
     QPushButton* m_attachBtn   = nullptr;   // item A: "Attach the file you have…"
     QPushButton* m_saveBtn     = nullptr;   // disabled until a real image is loaded

@@ -1371,6 +1371,7 @@ void RPC::nftTakeOffer(const QString& offerBlob, bool acknowledge,
 void RPC::nftListOffers(bool mineOnly,
                         const std::function<void(QVector<NFTOfferRow>)>& onDone,
                         const std::function<void(QString errStr)>& onErr) {
+    (void)mineOnly;   // A-1: kept for forward-compat; the daemon ignores the filter.
 #ifdef ZCL_WIDGET_TEST
     {
         if (!testNextNftError.isEmpty()) {
@@ -1381,13 +1382,16 @@ void RPC::nftListOffers(bool mineOnly,
             testOfferListSet = false; testNextOfferList.clear();
             onDone(rows); return;
         }
-        (void)mineOnly;
         return;   // nothing installed -> perpetual in-flight
     }
 #endif
     if (conn == nullptr) { onErr(QObject::tr("Not connected to your node yet.")); return; }
 
-    json obj = { {"mine", mineOnly} };
+    // A-1: the daemon's nft_listoffers ignores any {"mine":...} field — every record
+    // in the local store is already the caller's — so we no longer send it (it would
+    // advertise a filter that does nothing). The mineOnly arg is kept in the wrapper
+    // signature for forward-compat but is intentionally not put on the wire.
+    json obj = json::object();
     json payload = {
         {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "nft_listoffers"},
         {"params", json::array({ obj })}
@@ -1449,6 +1453,226 @@ void RPC::nftCancelOffer(const QString& offerId,
             onDone(txid);
             refreshNFTs();   // the NFT returns to our gallery once the cancel confirms
         },
+        [=] (QNetworkReply* reply, const json& parsed) { onErr(zslpCalmError(reply, parsed)); }
+    );
+}
+
+// ===========================================================================
+// SHIELD pillar — private file send/receive over the ZDC1 shielded data-channel
+// (doc/nft/PRIVACY_TECH.md). Each wrapper mirrors the SELL wrappers: a test seam
+// (ZCL_WIDGET_TEST) drives the dialog to a terminal state with no daemon, then
+// the real path sends a SINGLE JSON OBJECT param via doRPC.
+//
+// HONESTY: the data-channel makes only FILE CONTENT private; NFT ownership stays
+// PUBLIC, and the ciphertext lives on-chain forever. The data-channel RPCs are
+// only registered under -datachannel (default OFF); when off the dispatcher
+// returns RPC_METHOD_NOT_FOUND (-32601), which datachannelCalmError maps to a
+// CALM, ACTIONABLE "enable private file transfers in Settings first" — never a
+// raw scary error, and never a pretense that the channel is on.
+// ===========================================================================
+
+// Calm error mapper for the data-channel RPCs: -32601 (method not found ==
+// channel OFF / not registered) becomes the actionable Settings hint; everything
+// else falls through to the shared zslpCalmError (lock/funds/own message).
+static QString datachannelCalmError(const QNetworkReply* reply, const json& parsed) {
+    qint64 code = 0;
+    if (parsed.is_object()) {
+        auto e = parsed.find("error");
+        if (e != parsed.end() && e->is_object()) {
+            auto c = e->find("code");
+            if (c != e->end() && c->is_number())
+                code = (qint64) c->get<json::number_integer_t>();
+        }
+    }
+    if (code == -32601)   // RPC_METHOD_NOT_FOUND -> -datachannel is off (or an old daemon)
+        return QObject::tr(
+            "Private file transfers are turned off on your node. Turn on "
+            "“Enable private file transfers” in Settings, then restart, to use this.");
+    return zslpCalmError(reply, parsed);
+}
+
+void RPC::sendDataFile(const QString& fromAddr, const QString& toAddr,
+                       const QString& hexData, const QString& filename,
+                       const QString& contentType,
+                       const std::function<void(SendDataFileResult)>& onDone,
+                       const std::function<void(QString errStr)>& onErr) {
+#ifdef ZCL_WIDGET_TEST
+    {
+        if (!testNextNftError.isEmpty()) {
+            const QString e = testNextNftError; testNextNftError.clear(); onErr(e); return;
+        }
+        if (testSendDataFileSet) {
+            const SendDataFileResult r = testNextSendDataFile;
+            testSendDataFileSet = false; onDone(r); return;
+        }
+        (void)fromAddr; (void)toAddr; (void)hexData; (void)filename; (void)contentType;
+        return;   // nothing installed -> perpetual in-flight (the swallow test)
+    }
+#endif
+    if (conn == nullptr) { onErr(QObject::tr("Not connected to your node yet.")); return; }
+    if (fromAddr.isEmpty() || toAddr.isEmpty() || hexData.isEmpty()) {
+        onErr(QObject::tr("A sender address, a recipient address, and a file are all required."));
+        return;
+    }
+
+    // Single OBJECT param. We always send hexdata (the plaintext NEVER becomes a
+    // server-side filepath) and ALWAYS acknowledge_permanent=true (the dialog earns
+    // that consent first; the daemon also refuses without it). Optional metadata only
+    // when present, so we never send "" where the daemon expects a real value.
+    json obj = {
+        {"fromaddress", fromAddr.toStdString()},
+        {"toaddress",   toAddr.toStdString()},
+        {"hexdata",     hexData.toLower().toStdString()},
+        {"acknowledge_permanent", true}
+    };
+    if (!filename.isEmpty())    obj["filename"]     = filename.toStdString();
+    if (!contentType.isEmpty()) obj["content_type"] = contentType.toStdString();
+
+    json payload = {
+        {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "z_senddatafile"},
+        {"params", json::array({ obj })}
+    };
+
+    conn->doRPC(payload,
+        [=] (const json& result) {
+            // The IMMEDIATE object carries the load-bearing facts (fingerprint = NFT
+            // document_hash, the per-transfer disclosure key) even though the send
+            // itself runs async; that is exactly what the success screen needs.
+            SendDataFileResult r;
+            r.operationId = nftJsonStr(result, "operationid");
+            r.transferId  = nftJsonStr(result, "transfer_id");
+            r.fingerprint = nftJsonStr(result, "fingerprint");
+            r.key         = nftJsonStr(result, "key");
+            r.frames      = (int) nftJsonInt(result, "frames", 0);
+            if (r.fingerprint.isEmpty() && r.transferId.isEmpty()) {
+                onErr(QObject::tr("The private file was submitted but the node returned an unexpected reply."));
+                return;
+            }
+            onDone(r);
+        },
+        [=] (QNetworkReply* reply, const json& parsed) { onErr(datachannelCalmError(reply, parsed)); }
+    );
+}
+
+void RPC::listDataTransfers(const std::function<void(QVector<DataTransferRow>)>& onDone,
+                            const std::function<void(QString errStr)>& onErr) {
+#ifdef ZCL_WIDGET_TEST
+    {
+        if (!testNextNftError.isEmpty()) {
+            const QString e = testNextNftError; testNextNftError.clear(); onErr(e); return;
+        }
+        if (testDataXferListSet) {
+            const QVector<DataTransferRow> rows = testNextDataXferList;
+            testDataXferListSet = false; onDone(rows); return;
+        }
+        return;   // nothing installed -> perpetual in-flight
+    }
+#endif
+    if (conn == nullptr) { onErr(QObject::tr("Not connected to your node yet.")); return; }
+
+    json payload = {
+        {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "z_listdatatransfers"},
+        {"params", json::array()}
+    };
+    conn->doRPC(payload,
+        [=] (const json& result) {
+            QVector<DataTransferRow> rows;
+            if (result.is_array()) {
+                for (const auto& r : result) {
+                    if (!r.is_object())
+                        continue;
+                    DataTransferRow row;
+                    row.transferId  = nftJsonStr(r, "transfer_id");
+                    row.fingerprint = nftJsonStr(r, "fingerprint");
+                    row.direction   = nftJsonStr(r, "direction");
+                    row.status      = nftJsonStr(r, "status");
+                    row.fromAddress = nftJsonStr(r, "fromaddress");
+                    row.toAddress   = nftJsonStr(r, "toaddress");
+                    row.filename    = nftJsonStr(r, "filename");
+                    row.frames      = (int) nftJsonInt(r, "frames", 0);
+                    rows.push_back(row);
+                }
+            }
+            onDone(rows);
+        },
+        [=] (QNetworkReply* reply, const json& parsed) { onErr(datachannelCalmError(reply, parsed)); }
+    );
+}
+
+void RPC::getDataTransfer(const QString& transferId, const QString& fingerprint,
+                          const QString& address, const QString& verifyFingerprint,
+                          const std::function<void(DataTransferResult)>& onDone,
+                          const std::function<void(QString errStr)>& onErr) {
+#ifdef ZCL_WIDGET_TEST
+    {
+        if (!testNextNftError.isEmpty()) {
+            const QString e = testNextNftError; testNextNftError.clear(); onErr(e); return;
+        }
+        if (testDataXferSet) {
+            const DataTransferResult r = testNextDataXfer;
+            testDataXferSet = false; onDone(r); return;
+        }
+        (void)transferId; (void)fingerprint; (void)address; (void)verifyFingerprint;
+        return;   // nothing installed -> perpetual in-flight
+    }
+#endif
+    if (conn == nullptr) { onErr(QObject::tr("Not connected to your node yet.")); return; }
+    if (transferId.isEmpty() && fingerprint.isEmpty()) {
+        onErr(QObject::tr("Enter a transfer id or a file fingerprint to look up."));
+        return;
+    }
+
+    // Identify by transfer_id OR fingerprint (whichever the caller has). Optional
+    // address (cross-wallet receive: defaults to recorded toaddress, else scans all
+    // viewable addrs) + optional out-of-band verify_fingerprint anchor.
+    json obj = json::object();
+    if (!transferId.isEmpty())        obj["transfer_id"]       = transferId.toStdString();
+    if (!fingerprint.isEmpty())       obj["fingerprint"]       = fingerprint.toLower().toStdString();
+    if (!address.isEmpty())           obj["address"]           = address.toStdString();
+    if (!verifyFingerprint.isEmpty()) obj["verify_fingerprint"]= verifyFingerprint.toLower().toStdString();
+
+    json payload = {
+        {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "z_getdatatransfer"},
+        {"params", json::array({ obj })}
+    };
+    conn->doRPC(payload,
+        [=] (const json& result) {
+            // The daemon VERIFIES BEFORE DECRYPT and returns plaintext ONLY when
+            // verified+complete. We always deliver a filled result (even a fail verdict
+            // carries the honest .error); the dialog maps .error to a distinct state.
+            DataTransferResult r;
+            r.transferId          = nftJsonStr(result, "transfer_id");
+            r.fingerprint         = nftJsonStr(result, "fingerprint");
+            r.verified            = nftJsonBool(result, "verified", false);
+            r.complete            = nftJsonBool(result, "complete", false);
+            r.framesReceived      = (int) nftJsonInt(result, "frames_received", 0);
+            r.hexData             = nftJsonStr(result, "hexdata");
+            r.size                = (int) nftJsonInt(result, "size", 0);
+            r.filename            = nftJsonStr(result, "filename");
+            r.contentType         = nftJsonStr(result, "content_type");
+            r.onchainFingerprint  = nftJsonStr(result, "onchain_fingerprint");
+            r.expectedFingerprint = nftJsonStr(result, "expected_fingerprint");
+            r.error               = nftJsonStr(result, "error");
+            onDone(r);
+        },
+        [=] (QNetworkReply* reply, const json& parsed) { onErr(datachannelCalmError(reply, parsed)); }
+    );
+}
+
+void RPC::nftListTransfers(const QString& tokenId,
+                           const std::function<void(json transfers)>& onDone,
+                           const std::function<void(QString errStr)>& onErr) {
+    if (conn == nullptr) { onErr(QObject::tr("Not connected to your node yet.")); return; }
+    if (tokenId.isEmpty()) { onErr(QObject::tr("Missing collectible id.")); return; }
+
+    // zslp_listtransfers is POSITIONAL (tokenid). Newest-first, reorg-safe. The PUBLIC
+    // chain-of-custody — honest: ownership is public, this is not a private log.
+    json payload = {
+        {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "zslp_listtransfers"},
+        {"params", json::array({ tokenId.toStdString() })}
+    };
+    conn->doRPC(payload,
+        [=] (const json& result) { onDone(result); },
         [=] (QNetworkReply* reply, const json& parsed) { onErr(zslpCalmError(reply, parsed)); }
     );
 }

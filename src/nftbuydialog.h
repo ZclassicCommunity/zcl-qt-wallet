@@ -27,8 +27,8 @@
 
 #include "precompiled.h"
 #include "rpc.h"             // NFTVerifyResult by value (held + a getter)
+#include "nftasyncdialog.h"  // shared in-flight latch + [X]-swallow + Done/Try-again
 
-#include <QDialog>
 #include <QImage>
 #include <QPixmap>
 #include <QString>
@@ -39,7 +39,7 @@ class QPushButton;
 class QCheckBox;
 class ContentEngine;
 
-class NFTBuyDialog : public QDialog {
+class NFTBuyDialog : public NftAsyncDialog {
     Q_OBJECT
 public:
     explicit NFTBuyDialog(ContentEngine* engine, RPC* rpc, QWidget* parent = nullptr);
@@ -55,8 +55,8 @@ public:
     void testPasteOffer(const QString& blob);
 #endif
 
-protected:
-    void closeEvent(QCloseEvent* e) override;
+    // The [X]-swallow while the take RPC is in flight is inherited from
+    // NftAsyncDialog::closeEvent (UAF guard).
 
 private slots:
     void onOfferTextChanged();
@@ -65,7 +65,8 @@ private slots:
     void onPosterReady(quint64 token, QImage img, int verifyState);
     void onAcknowledgeToggled(bool);
     void onBuyClicked();
-    void onDoneClicked();
+    // After success the Buy button is re-wired to QDialog::accept() by
+    // NftAsyncDialog::finishPrimaryAsDone — no per-dialog onDoneClicked needed.
 
 private:
     void runVerify();                 // start nft_verifyoffer for the current blob
@@ -73,15 +74,14 @@ private:
     void renderVerified();            // paint the card from m_verified
     void requestPoster();             // resolve documenthash -> posterForToken
     void refreshBuyEnabled();
-    static QString humanZcl(qint64 zat);
 
     ContentEngine* m_engine = nullptr;
     RPC*           m_rpc    = nullptr;
 
     QString         m_offerBlob;      // the current pasted/opened blob
     NFTVerifyResult m_verified;       // last verify result; m_verified.ok gates Buy
-    bool            m_verifyInFlight = false;
-    bool            m_inFlight       = false;   // take RPC in flight (Buy + [X] disabled)
+    bool            m_verifyInFlight = false;   // SEPARATE latch for the verify flow
+    // The take-RPC in-flight latch now lives in NftAsyncDialog (isInFlight()).
     bool            m_succeeded      = false;
     bool            m_acknowledged   = false;
 

@@ -25,7 +25,7 @@ namespace {
 }
 
 NftMintDialog::NftMintDialog(ContentEngine* engine, RPC* rpc, QWidget* parent)
-    : QDialog(parent), m_engine(engine), m_rpc(rpc) {
+    : NftAsyncDialog(parent), m_engine(engine), m_rpc(rpc) {
     setWindowTitle(tr("Make a collectible"));
     setMinimumWidth(460);
     setAcceptDrops(true);
@@ -221,11 +221,11 @@ void NftMintDialog::refreshCreateEnabled() {
         return;   // post-success: Create is gone (replaced by Done) — never re-enable
     const bool nameOk   = !m_nameEdit->text().trimmed().isEmpty();
     const bool anchorOk = !m_anchorHex.isEmpty();
-    m_createBtn->setEnabled(nameOk && anchorOk && !m_hashing && !m_inFlight);
+    m_createBtn->setEnabled(nameOk && anchorOk && !m_hashing && !isInFlight());
 }
 
 void NftMintDialog::onCreate() {
-    if (m_inFlight || m_succeeded || m_rpc == nullptr || m_anchorHex.isEmpty())
+    if (isInFlight() || m_succeeded || m_rpc == nullptr || m_anchorHex.isEmpty())
         return;
     const QString name   = m_nameEdit->text().trimmed();
     const QString ticker = m_tickerEdit->text().trimmed();
@@ -233,11 +233,9 @@ void NftMintDialog::onCreate() {
     if (name.isEmpty())
         return;
 
-    m_inFlight = true;
-    refreshCreateEnabled();
-    m_createBtn->setText(tr("Creating…"));
-    if (m_cancelBtn)
-        m_cancelBtn->setEnabled(false);   // can't bail mid-flight (also closes the UAF window)
+    // Shared scaffold: latch in-flight, relabel Create -> "Creating…", disable it
+    // and Cancel (can't bail mid-flight — also closes the UAF window).
+    beginPrimary(m_createBtn, tr("Creating…"), m_cancelBtn);
     m_resultLine->clear();
 
     // Capture the source path so we can cache the bytes on success (the new card
@@ -260,47 +258,21 @@ void NftMintDialog::onCreate() {
             if (!srcPath.isEmpty() && !anchor.isEmpty())
                 ContentEngine::cachePut(anchor, srcPath);
             // VISIBLE SUCCESS (review fix #3): do NOT accept() here — that would make the
-            // confirmation vanish before the user could read it. Switch to a terminal
-            // "done" state: show the honest 0-conf line, retire Create -> Done, re-enable
-            // the close button so the user explicitly dismisses the acknowledged result.
-            self->m_inFlight  = false;
+            // confirmation vanish before the user could read it. Show the honest 0-conf
+            // line, then retire Create -> terminal "Done" (shared scaffold).
             self->m_succeeded = true;
             self->m_resultLine->setText(
                 tr("Collectible created — it'll appear once it confirms on-chain."));
             self->m_resultLine->setStyleSheet("color:#2a9d2a;");
-            self->m_createBtn->setText(tr("Done"));
-            self->m_createBtn->setEnabled(true);
-            self->m_createBtn->disconnect(SIGNAL(clicked()));
-            connect(self->m_createBtn, &QPushButton::clicked,
-                    self.data(), &NftMintDialog::onDoneClicked);
-            if (self->m_cancelBtn)
-                self->m_cancelBtn->setEnabled(false);   // only Done dismisses now
+            self->finishPrimaryAsDone(self->m_createBtn, self->m_cancelBtn);
         },
         [self](QString errStr) {
             if (self.isNull())
                 return;   // dialog gone — safe no-op
-            self->m_inFlight = false;
-            self->m_createBtn->setText(tr("Try again"));
+            self->finishPrimaryAsRetry(self->m_createBtn, self->m_cancelBtn);
             self->m_resultLine->setText(errStr);   // honest daemon message, never fabricated
             self->m_resultLine->setStyleSheet("color:#c0392b;");
-            if (self->m_cancelBtn)
-                self->m_cancelBtn->setEnabled(true);
             self->refreshCreateEnabled();
         }
     );
-}
-
-void NftMintDialog::onDoneClicked() {
-    accept();   // the user has read the confirmation; the parent now refreshes the gallery
-}
-
-void NftMintDialog::closeEvent(QCloseEvent* e) {
-    // Swallow the window [X] while the mint RPC is in flight so the dialog can't be
-    // destroyed under the in-flight reply (review fix #5). The QPointer guard above is
-    // the true safety net; this is the honest UX (the button reads "Creating…").
-    if (m_inFlight) {
-        e->ignore();
-        return;
-    }
-    QDialog::closeEvent(e);
 }

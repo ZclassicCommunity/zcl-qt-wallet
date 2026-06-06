@@ -22,8 +22,8 @@
 #define NFTMINTDIALOG_H
 
 #include "precompiled.h"
+#include "nftasyncdialog.h"   // shared in-flight latch + [X]-swallow + Done/Try-again
 
-#include <QDialog>
 #include <QString>
 #include "contentengine.h"   // ContentDescriptor by value in a slot signature
 
@@ -32,7 +32,7 @@ class QLineEdit;
 class QPushButton;
 class RPC;
 
-class NftMintDialog : public QDialog {
+class NftMintDialog : public NftAsyncDialog {
     Q_OBJECT
 public:
     explicit NftMintDialog(ContentEngine* engine, RPC* rpc, QWidget* parent = nullptr);
@@ -52,15 +52,15 @@ protected:
     // Drag/drop a local file onto the dialog (the dropzone).
     void dragEnterEvent(QDragEnterEvent* e) override;
     void dropEvent(QDropEvent* e) override;
-    // While the mint RPC is in flight, swallow the window [X] so the dialog can't be
-    // destroyed out from under the in-flight reply (review fix #5 / UAF).
-    void closeEvent(QCloseEvent* e) override;
+    // The [X]-swallow while the mint RPC is in flight is inherited from
+    // NftAsyncDialog::closeEvent (review fix #5 / UAF).
 
 private slots:
     void onChooseFile();
     void onDescriptorReady(quint64 token, ContentDescriptor d);
     void onCreate();
-    void onDoneClicked();   // after success: explicit dismiss (accept) of the confirmation
+    // After success the primary button is re-wired to QDialog::accept() by
+    // NftAsyncDialog::finishPrimaryAsDone — no per-dialog onDoneClicked needed.
 
 private:
     void setPickedFile(const QString& path);     // begin hashing a chosen file
@@ -74,7 +74,7 @@ private:
     QString  m_srcPath;          // chosen local file
     QString  m_anchorHex;        // computed document_hash (empty until ready)
     bool     m_hashing   = false;
-    bool     m_inFlight  = false;   // mint RPC in flight (Cancel + [X] disabled)
+    // m_inFlight now lives in NftAsyncDialog (isInFlight()/setInFlight()).
     bool     m_succeeded = false;   // mint returned; dialog now shows the confirmation
     quint64  m_hashToken = 0;
 
