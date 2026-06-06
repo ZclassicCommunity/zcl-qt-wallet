@@ -272,6 +272,27 @@ void Settings::setAllowCustomFees(bool allow) {
     QSettings().setValue("options/customfees", allow);
 }
 
+bool Settings::getCoinControlEnabled() {
+    // COIN CONTROL is an Advanced, opt-in feature. Default OFF so the Send tab is
+    // unchanged for everyone who doesn't deliberately turn it on.
+    return QSettings().value("options/coincontrol", false).toBool();
+}
+
+void Settings::setCoinControlEnabled(bool on) {
+    QSettings().setValue("options/coincontrol", on);
+}
+
+bool Settings::getManualShieldedSelection() {
+    // Manual shielded-note selection is OFF by default: auto-selection is privacy-
+    // optimized, and hand-picking notes can reduce privacy. Surfaced only inside the
+    // Coin Control dialog, and only when Coin Control itself is enabled.
+    return QSettings().value("options/coincontrolshielded", false).toBool();
+}
+
+void Settings::setManualShieldedSelection(bool on) {
+    QSettings().setValue("options/coincontrolshielded", on);
+}
+
 bool Settings::isWalletBackedUp() {
     // Load from the QT Settings. Defaults to false so a brand-new wallet is
     // treated as un-backed-up until the user actually confirms a backup.

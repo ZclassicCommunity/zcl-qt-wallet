@@ -634,11 +634,45 @@ void RPC::fillTxJsonParams(json& params, Tx tx) {
         allRecepients.push_back(rec);
     }
 
-    // Add sender    
+    // Add sender
     params.push_back(tx.fromAddr.toStdString());
     params.push_back(allRecepients);
 
-    // Add fees if custom fees are allowed.
+    // COIN CONTROL — when the user pinned a specific input set, the typed inputs array
+    // is the 5TH positional z_sendmany argument, so minconf (3rd) and fee (4th) MUST be
+    // present even if custom fees are off (positional args cannot be skipped). We
+    // therefore append minconf=1 + the (default or custom) fee here, then the inputs
+    // array. EMPTY selectedInputs keeps the EXACT legacy shape below: fee/minconf are
+    // appended ONLY when custom fees are on, and no inputs array is added — so the
+    // default-empty path is byte-identical to today's behavior.
+    //
+    // Consensus impact: NONE. The inputs array only restricts which already-valid UTXOs/
+    // notes the daemon may spend; it does not touch tx/note format, validation, fees,
+    // change routing, or any consensus rule. minconf=1 matches z_sendmany's own default,
+    // and tx.fee is the same fee the legacy path sends.
+    if (!tx.selectedInputs.isEmpty()) {
+        params.push_back(1);                          // 3rd: minconf (z_sendmany default)
+        params.push_back(tx.fee);                     // 4th: fee (default or custom)
+
+        json inputs = json::array();
+        for (const SelectedInput& s : tx.selectedInputs) {
+            json in = json::object();
+            in["txid"] = s.txid.toStdString();
+            if (s.type == "transparent") {
+                in["vout"] = s.index;                 // transparent: output index
+            } else if (s.type == "sapling") {
+                in["outindex"] = s.index;             // sapling: note output index
+            } else { // sprout
+                in["jsindex"]    = s.jsindex;         // sprout: JoinSplit index
+                in["jsoutindex"] = s.index;           //         JoinSplit output index
+            }
+            inputs.push_back(in);
+        }
+        params.push_back(inputs);                      // 5th: typed inputs array
+        return;
+    }
+
+    // Legacy path (no coin control): unchanged. Add fee/minconf only with custom fees.
     if (Settings::getInstance()->getAllowCustomFees()) {
         params.push_back(1); // minconf
         params.push_back(tx.fee);
@@ -968,6 +1002,12 @@ void RPC::getInfoThenRefresh(bool force) {
         int curBlock  = reply["blocks"].get<json::number_integer_t>();
         int version = reply["version"].get<json::number_integer_t>();
         Settings::getInstance()->setZClassicdVersion(version);
+
+        // COIN CONTROL — probe the daemon's z_sendmany inputs-param support ONCE per
+        // session (one-shot internally) so the Send-tab Coin Control button is offered
+        // ONLY on a daemon that can honor a pinned input set. Cheap (a single `help`
+        // call) and self-latching; hidden until/unless the probe confirms support.
+        probeCoinControlCapability();
 
         if ( force || (curBlock != lastBlock) ) {
             // Something changed, so refresh everything.
@@ -1470,10 +1510,28 @@ bool RPC::processUnspent(const json& reply, QMap<QString, double>* balancesMap, 
         // is used rather than contains() -- the bundled nlohmann::json 3.3 predates it.)
         bool coinbase = it.find("generated") != it.end() && it["generated"].get<json::boolean_t>();
 
-        newUtxos->push_back(
-            UnspentOutput{ qsAddr, QString::fromStdString(it["txid"]),
-                            Settings::getDecimalString(it["amount"].get<json::number_float_t>()),
-                            (int)confirmations, it["spendable"].get<json::boolean_t>(), coinbase });
+        UnspentOutput uo{ qsAddr, QString::fromStdString(it["txid"]),
+                          Settings::getDecimalString(it["amount"].get<json::number_float_t>()),
+                          (int)confirmations, it["spendable"].get<json::boolean_t>(), coinbase };
+
+        // COIN CONTROL — capture the per-output coordinates straight from the daemon's
+        // own reply so a pinned z_sendmany inputs array can name THIS exact input. Field
+        // sets are disjoint across pools, so we only read the key present for the row's
+        // type and leave the others at their -1/false sentinels. find()/end() (not
+        // contains()) matches the bundled nlohmann::json 3.3. No money math here -- pure
+        // pass-through coordinates + the read-only "change" flag for the table column.
+        if (it.find("vout") != it.end() && it["vout"].is_number())
+            uo.vout = (int)it["vout"].get<json::number_integer_t>();        // transparent (listunspent)
+        if (it.find("outindex") != it.end() && it["outindex"].is_number())
+            uo.outindex = (int)it["outindex"].get<json::number_integer_t>(); // Sapling (z_listunspent)
+        if (it.find("jsindex") != it.end() && it["jsindex"].is_number())
+            uo.jsindex = (int)it["jsindex"].get<json::number_integer_t>();    // Sprout (z_listunspent)
+        if (it.find("jsoutindex") != it.end() && it["jsoutindex"].is_number())
+            uo.jsoutindex = (int)it["jsoutindex"].get<json::number_integer_t>();
+        if (it.find("change") != it.end() && it["change"].is_boolean())
+            uo.change = it["change"].get<json::boolean_t>();
+
+        newUtxos->push_back(uo);
 
         (*balancesMap)[qsAddr] = (*balancesMap)[qsAddr] + it["amount"].get<json::number_float_t>();
     }
@@ -2372,6 +2430,59 @@ QString RPC::getDefaultSaplingAddress() {
 QString RPC::getDefaultTAddress() {
     if (getAllTAddresses()->length() > 0)
         return getAllTAddresses()->at(0);
-    else 
+    else
         return QString();
+}
+
+// COIN CONTROL — one-shot daemon-capability probe (see rpc.h). Fires `help z_sendmany`
+// and parses the synopsis for an `inputs` argument. The stock ZClassic z_sendmany help
+// reads `z_sendmany "fromaddress" [...] ( minconf ) ( fee )` with NO inputs param and
+// rejects params.size() > 4, so this latches coinControlCapable=false there and the
+// Coin Control UI stays hidden -- the spec's fail-safe gate (never silently drop a
+// selection on a daemon that can't honor it). A future daemon that advertises an
+// `inputs` argument flips it on. Conservative: ANY RPC error leaves the capability OFF.
+void RPC::probeCoinControlCapability() {
+    if (coinControlProbed)
+        return;                 // one-shot per session
+    if (conn == nullptr)
+        return;                 // retry on a later poll once connected
+
+    json payload = {
+        {"jsonrpc", "1.0"},
+        {"id", "someid"},
+        {"method", "help"},
+        {"params", {"z_sendmany"}}
+    };
+
+    // Use the error-AWARE doRPC so a transient/failed probe does NOT latch the capability
+    // (it stays un-probed and retries on the next poll); only a clean answer decides.
+    conn->doRPC(payload, [this] (const json& reply) {
+        coinControlProbed = true;
+        // The help RPC returns the method's help string. Look for an `inputs` argument in
+        // the SYNOPSIS / arguments list. We require the token to appear as an argument
+        // (a quoted "inputs" key or an `inputs` arg line), not merely anywhere, so a
+        // mention in prose can't false-enable it. Default OFF if not clearly present.
+        QString help;
+        if (reply.is_string())
+            help = QString::fromStdString(reply.get<std::string>());
+
+        // Accept either the CLI synopsis form `( inputs )` / `[ inputs ]` or the
+        // arguments-list form `"inputs"` (the daemon's standard help layout). Both are
+        // unambiguous markers that z_sendmany takes a 5th inputs argument.
+        const bool hasInputsArg =
+            help.contains("\"inputs\"") ||
+            help.contains("( inputs )") ||
+            help.contains("[ inputs ]") ||
+            help.contains("(inputs)");
+
+        coinControlCapable = hasInputsArg;
+        if (main) {
+            main->logger->write(QString("Coin Control daemon capability: %1")
+                                .arg(coinControlCapable ? "supported" : "not supported"));
+            main->refreshCoinControlVisibility();
+        }
+    }, [this] (QNetworkReply*, const json&) {
+        // Probe failed (warmup/transient). Do NOT latch: leave it un-probed so a later
+        // poll retries; the UI stays hidden meanwhile (coinControlSupported() is false).
+    });
 }

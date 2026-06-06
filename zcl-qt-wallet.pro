@@ -51,6 +51,7 @@ SOURCES += \
     src/3rdparty/qrcode/QrSegment.cpp \
     src/settings.cpp \
     src/sendtab.cpp \
+    src/coincontroldialog.cpp \
     src/senttxstore.cpp \
     src/txtablemodel.cpp \
     src/turnstile.cpp \
@@ -76,6 +77,7 @@ HEADERS += \
     src/3rdparty/qrcode/QrSegment.hpp \
     src/3rdparty/json/json.hpp \
     src/settings.h \
+    src/coincontroldialog.h \
     src/txtablemodel.h \
     src/senttxstore.h \
     src/turnstile.h \
@@ -95,7 +97,8 @@ FORMS += \
     src/turnstile.ui \
     src/turnstileprogress.ui \
     src/privkey.ui \
-    src/memodialog.ui \ 
+    src/memodialog.ui \
+    src/coincontroldialog.ui \
     src/connection.ui \
     src/addressbook.ui \
     src/createzclassicconfdialog.ui \

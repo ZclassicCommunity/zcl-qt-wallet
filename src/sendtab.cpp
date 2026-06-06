@@ -7,6 +7,7 @@
 #include "settings.h"
 #include "rpc.h"
 #include "recurring.h"
+#include "coincontroldialog.h"
 
 using json = nlohmann::json;
 
@@ -135,8 +136,87 @@ void MainWindow::setupSendTab() {
     ui->lblRecurDesc->setVisible(false);
     ui->btnRecurSchedule->setVisible(false);
 
+    // COIN CONTROL — build the (Advanced + daemon-gated) "Coin Control…" button next to
+    // the from-address combo. Hidden by default; refreshCoinControlVisibility() decides.
+    setupCoinControlButton();
+
     // Set the default state for the whole page
     removeExtraAddresses();
+}
+
+// COIN CONTROL — add the "Coin Control…" button into the existing from-address row
+// (horizontalLayout_8, which holds inputsCombo) programmatically, so the checked-in
+// mainwindow.ui is untouched (same idiom as the nav rail / network help panel). Hidden
+// unless both the Advanced setting and daemon support are present.
+void MainWindow::setupCoinControlButton() {
+    if (coinControlBtn)
+        return;   // idempotent
+
+    coinControlBtn = new QPushButton(tr("Coin Control…"), this);
+    coinControlBtn->setObjectName("coinControlBtn");
+    coinControlBtn->setToolTip(tr("Choose exactly which of your confirmed inputs this "
+                                  "payment spends. Advanced; only restricts which valid "
+                                  "inputs are used."));
+    coinControlBtn->setVisible(false);   // refreshCoinControlVisibility() reveals it
+    QObject::connect(coinControlBtn, &QPushButton::clicked, this, &MainWindow::openCoinControl);
+
+    // Place it on the SAME ROW as the from-address combo (horizontalLayout_8 holds
+    // inputsCombo in mainwindow.ui). findChild keeps us off a hard-coded ui->member and
+    // degrades gracefully: if the named row layout isn't found we fall back to the combo's
+    // parent-widget layout so the button is always reachable, never orphaned.
+    if (auto* hl = ui->groupBox_4->findChild<QHBoxLayout*>("horizontalLayout_8")) {
+        hl->addWidget(coinControlBtn);
+    } else if (ui->inputsCombo->parentWidget() && ui->inputsCombo->parentWidget()->layout()) {
+        ui->inputsCombo->parentWidget()->layout()->addWidget(coinControlBtn);
+    }
+
+    refreshCoinControlVisibility();
+}
+
+// COIN CONTROL — show the button ONLY when BOTH the Advanced opt-in is on AND the daemon
+// advertises z_sendmany inputs support. Called from setup, from the Settings save, and
+// from the RPC capability probe's completion. Safe before the button exists (no-op).
+void MainWindow::refreshCoinControlVisibility() {
+    if (!coinControlBtn)
+        return;
+    const bool show = Settings::getInstance()->getCoinControlEnabled()
+                   && rpc && rpc->coinControlSupported();
+    coinControlBtn->setVisible(show);
+    // If the feature is no longer available, drop any pending selection so a hidden
+    // button can never carry a stale pin into the next send (fail-safe to auto-select).
+    if (!show)
+        pendingSelectedInputs.clear();
+}
+
+// COIN CONTROL — open the dialog for the current from-address, seeded with the running
+// amount + fee so it can show live coverage, and with any prior selection preserved.
+void MainWindow::openCoinControl() {
+    QString fromAddr = ui->inputsCombo->currentText();
+    if (fromAddr.isEmpty()) {
+        QMessageBox::information(this, tr("Coin Control"),
+            tr("Choose an address to pay from first, then pick its inputs."),
+            QMessageBox::Ok);
+        return;
+    }
+
+    // Target = recipients (on-screen amounts) + fee, in integer zatoshis. This is a
+    // DISPLAY aid for the coverage readout only; the authoritative affordability /
+    // privacy checks remain in createTxFromSendPage()/the send guards. We read the
+    // on-screen amounts directly (no Tx build) so opening the dialog never triggers the
+    // auto-shield change machinery.
+    qint64 targetZat = 0;
+    QRegExp re("Amount[0-9]+", Qt::CaseInsensitive);
+    for (auto* fld : ui->sendToWidgets->findChildren<QLineEdit*>(re))
+        targetZat += toZat(fld->text().trimmed().toDouble());
+    targetZat += toZat(Settings::getInstance()->getAllowCustomFees()
+                       ? ui->minerFeeAmt->text().toDouble()
+                       : Settings::getMinerFee());
+
+    const bool allowShielded = Settings::getInstance()->getManualShieldedSelection();
+
+    CoinControlDialog dlg(this, rpc, fromAddr, targetZat, allowShielded, pendingSelectedInputs);
+    if (dlg.exec())
+        pendingSelectedInputs = dlg.selection();
 }
 
 void MainWindow::editSchedule() {
@@ -241,6 +321,13 @@ void MainWindow::inputComboTextChanged(int index) {
     recomputeMaxIfChecked();   // from-address changed -> its balance drives the "Send max" amount
     updateSendPrivacyBadge();  // from-address private/public-ness feeds the verdict
     updateSendTotals();
+
+    // COIN CONTROL — a coin-control selection is scoped to ONE from-address (the dialog
+    // filtered by it). Changing the from-address invalidates that pin, so drop it: a
+    // stale selection from another address must never be applied to a send (createTx only
+    // applies pendingSelectedInputs for the CURRENT from-addr, but clearing here keeps the
+    // model honest and avoids surprising the user with an inherited selection).
+    pendingSelectedInputs.clear();
 }
 
     
@@ -546,6 +633,11 @@ void MainWindow::removeExtraAddresses() {
     // Clear the live privacy badge + running totals back to their resting state.
     updateSendPrivacyBadge();
     updateSendTotals();
+
+    // COIN CONTROL — the form is being reset (dispatched send, Cancel, or first setup), so
+    // any pinned input selection no longer applies. Drop it so the NEXT payment starts
+    // from auto-select unless the user opens Coin Control again.
+    pendingSelectedInputs.clear();
 }
 
 void MainWindow::maxAmountChecked(int checked) {
@@ -625,6 +717,19 @@ Tx MainWindow::createTxFromSendPage() {
     tx.fromAddr = ui->inputsCombo->currentText();
     sendChangeToSapling = sendChangeToSapling && Settings::isTAddress(tx.fromAddr);
 
+    // COIN CONTROL — carry the user's pinned inputs onto the Tx, but ONLY when the
+    // feature is actually live (Advanced setting ON + daemon support). The selection is
+    // address-scoped (the dialog filtered by the from-addr and inputComboTextChanged()
+    // clears it on any from-addr change), so an applied selection always matches
+    // tx.fromAddr. EMPTY (the common case) leaves tx.selectedInputs == {} => auto-select,
+    // byte-identical to today. Coin control restricts inputs only; it never changes the
+    // auto-shield change-routing decision below, only the totals it is sized against.
+    if (rpc && rpc->coinControlSupported()
+            && Settings::getInstance()->getCoinControlEnabled()
+            && !pendingSelectedInputs.isEmpty()) {
+        tx.selectedInputs = pendingSelectedInputs;
+    }
+
     // For each addr/amt in the sendTo tab
     int totalItems = ui->sendToWidgets->children().size() - 2;   // The last one is a spacer, so ignore that
     bool   sproutRecipient = false;
@@ -697,8 +802,18 @@ Tx MainWindow::createTxFromSendPage() {
         // has-change send). The coinbase-inclusive total is the affordability ceiling:
         // the daemon CAN spend coinbase, but only to a single zaddr with full
         // consumption (no change), so it is fundable even when not "eligible" for change.
-        const qint64 eligibleZat       = confirmedSpendableZat(tx.fromAddr, /*includeCoinbase=*/false);
-        const qint64 confirmedTotalZat = confirmedSpendableZat(tx.fromAddr, /*includeCoinbase=*/true);
+        //
+        // COIN CONTROL — when the user pinned inputs the daemon spends ONLY those, so we
+        // size the change against the SELECTED subset, not the whole address. (EMPTY
+        // selection => the whole-address totals below, byte-identical to today.) Either
+        // way the change math stays integer-zatoshi and the no-leak guard is preserved.
+        const bool hasSelection = !tx.selectedInputs.isEmpty();
+        const qint64 eligibleZat       = hasSelection
+            ? selectedSpendableZat(tx, /*includeCoinbase=*/false)
+            : confirmedSpendableZat(tx.fromAddr, /*includeCoinbase=*/false);
+        const qint64 confirmedTotalZat = hasSelection
+            ? selectedSpendableZat(tx, /*includeCoinbase=*/true)
+            : confirmedSpendableZat(tx.fromAddr, /*includeCoinbase=*/true);
 
         qint64 sendZat = 0;
         for (const ToFields& t : tx.toAddrs)        // recipients only -- change not added yet
@@ -831,6 +946,54 @@ qint64 MainWindow::confirmedSpendableZat(const QString& addr, bool includeCoinba
     return sum;
 }
 
+// COIN CONTROL — selection-aware spendable total (see mainwindow.h). Matches each pinned
+// SelectedInput against the LIVE UTXO set by the exact coordinates the daemon will pin
+// (txid + per-pool index/jsindex), and sums ONLY those still confirmed + spendable. This
+// is the load-bearing money-safety primitive for a coin-control send: it re-verifies each
+// selected input is still live before the irrevocable send, and (because a since-spent/
+// unconfirmed input simply doesn't match) it can only UNDER-count, never assert phantom
+// funds. allStillSpendable is set false if ANY selected input no longer matches a live
+// confirmed-spendable row, so the caller fails closed. Returns 0 if UTXOs aren't loaded.
+qint64 MainWindow::selectedSpendableZat(const Tx& tx, bool includeCoinbase, bool* allStillSpendable) {
+    if (allStillSpendable) *allStillSpendable = false;
+    if (!rpc || !rpc->getUTXOs())
+        return 0;
+
+    // Per-pool coordinate match against a live UnspentOutput row. Mirrors the keys the
+    // typed-inputs builder (fillTxJsonParams) emits, so "still spendable" here means
+    // "the exact input we will pin is present + confirmed + spendable".
+    auto fnMatch = [](const SelectedInput& s, const UnspentOutput& u) -> bool {
+        if (s.txid != u.txid) return false;
+        if (s.type == "transparent") return u.vout == s.index;
+        if (s.type == "sapling")     return u.outindex == s.index;
+        /* sprout */                 return u.jsindex == s.jsindex && u.jsoutindex == s.index;
+    };
+
+    qint64 sum = 0;
+    bool   all = true;
+    for (const SelectedInput& s : tx.selectedInputs) {
+        bool found = false;
+        for (const UnspentOutput& u : *rpc->getUTXOs()) {
+            if (!fnMatch(s, u))
+                continue;
+            // A live match exists; require it still confirmed + spendable (+ coinbase
+            // policy) to count it. A coinbase input excluded by includeCoinbase=false is
+            // simply not summed, but it is NOT a "no longer spendable" failure.
+            if (u.confirmations > 0 && u.spendable) {
+                if (includeCoinbase || !u.coinbase)
+                    sum += toZat(u.amount.toDouble());
+                found = true;
+            }
+            break;   // matched this selected input (live or not); stop scanning
+        }
+        if (!found)
+            all = false;   // a selected input vanished / unconfirmed / unspendable
+    }
+
+    if (allStillSpendable) *allStillSpendable = all;
+    return sum;
+}
+
 // FAIL-OPEN spendable accessor. The daemon (z_sendmany, minconf=1) spends only
 // CONFIRMED, spendable inputs, so the amount the GUI offers / validates for the Available
 // line + send-max must be the confirmed-spendable figure -- NOT the minconf=0
@@ -898,25 +1061,64 @@ MainWindow::RepollResult MainWindow::repollFromAddrUtxos() {
 // seconds (poll staleness + dwell) to one RPC round-trip; fully closing it needs daemon-side
 // input pinning (z_sendmany with a fixed input set), which is a separate, daemon-side change.
 bool MainWindow::verifyAutoShieldUnchanged(const Tx& tx) {
-    if (!tx.autoShieldGuardActive)
-        return true;                                   // no-op for non-auto-shield sends
+    const bool hasSelection = !tx.selectedInputs.isEmpty();
 
-    const RepollResult r = repollFromAddrUtxos();
-    if (r != RepollResult::Refreshed) {                // could not verify -> FAIL CLOSED
-        QMessageBox::warning(this, tr("Could not verify balance"),
-            tr("Your balance could not be re-checked before sending, so for your privacy "
-               "the transaction was NOT sent. Please try again in a moment."),
-            QMessageBox::Ok);
-        return false;
+    // COIN CONTROL — when the user pinned inputs we MUST re-verify, before the irrevocable
+    // send, that every pinned input is STILL confirmed + spendable (a re-org or a parallel
+    // spend could have removed one during the confirm dwell; sending a now-invalid pinned
+    // set would make the daemon reject the whole tx). This runs for ANY selection-aware
+    // send, including a z-from send that does NOT arm the auto-shield change guard.
+    if (hasSelection) {
+        const RepollResult rs = repollFromAddrUtxos();
+        if (rs != RepollResult::Refreshed) {           // could not verify -> FAIL CLOSED
+            QMessageBox::warning(this, tr("Could not verify your selected inputs"),
+                tr("The inputs you chose could not be re-checked before sending, so the "
+                   "transaction was NOT sent. Please try again in a moment."),
+                QMessageBox::Ok);
+            return false;
+        }
+        bool allStillSpendable = false;
+        selectedSpendableZat(tx, /*includeCoinbase=*/true, &allStillSpendable);
+        if (!allStillSpendable) {
+            QMessageBox::warning(this, tr("Selected inputs changed — not sent"),
+                tr("One or more of the inputs you chose in Coin Control is no longer "
+                   "available to spend (it may have been spent or is reconfirming). The "
+                   "transaction was NOT sent. Please reopen Coin Control and choose again."),
+                QMessageBox::Ok);
+            return false;
+        }
+        // Fall through: if this is ALSO an auto-shield send the change-leak checks below
+        // run, sized against the selected subset (selectedSpendableZat). If it is not an
+        // auto-shield send, the guard is inactive and we return true after this re-verify.
+    }
+
+    if (!tx.autoShieldGuardActive)
+        return true;                                   // selection re-verified (or no-op)
+
+    // For a NON-selection auto-shield send we still need the fresh transparent re-poll the
+    // original guard relies on. (A selection-aware send already re-polled above.)
+    if (!hasSelection) {
+        const RepollResult r = repollFromAddrUtxos();
+        if (r != RepollResult::Refreshed) {            // could not verify -> FAIL CLOSED
+            QMessageBox::warning(this, tr("Could not verify balance"),
+                tr("Your balance could not be re-checked before sending, so for your privacy "
+                   "the transaction was NOT sent. Please try again in a moment."),
+                QMessageBox::Ok);
+            return false;
+        }
     }
 
     // Full-consume (no change) send: safe only while the live confirmed TOTAL still equals
     // exactly what we sized the spend against. Any new confirmation grows the total beyond
     // the frozen amount -> the daemon can fund the amount and leave the surplus as PUBLIC
     // change -> abort. (A coinbase-inclusive total is the right basis: the daemon draws the
-    // whole balance to the single z-recipient.)
+    // whole balance to the single z-recipient.) With a pinned input set the "total" is the
+    // selected subset (the daemon spends only those), not the whole address.
     if (tx.autoShieldFullConsume) {
-        if (confirmedSpendableZat(tx.fromAddr, /*includeCoinbase=*/true) == tx.builtTargetZat)
+        const qint64 liveTotal = hasSelection
+            ? selectedSpendableZat(tx, /*includeCoinbase=*/true)
+            : confirmedSpendableZat(tx.fromAddr, /*includeCoinbase=*/true);
+        if (liveTotal == tx.builtTargetZat)
             return true;                               // still an exact full consume -> SAFE
         QMessageBox::warning(this, tr("Balance changed — not sent"),
             tr("Your balance for this address changed while you were confirming. For your "
@@ -925,7 +1127,9 @@ bool MainWindow::verifyAutoShieldUnchanged(const Tx& tx) {
         return false;
     }
 
-    const qint64 liveEligibleZat = confirmedSpendableZat(tx.fromAddr, /*includeCoinbase=*/false);
+    const qint64 liveEligibleZat = hasSelection
+        ? selectedSpendableZat(tx, /*includeCoinbase=*/false)
+        : confirmedSpendableZat(tx.fromAddr, /*includeCoinbase=*/false);
     if (liveEligibleZat == tx.builtEligibleZat)
         return true;                                   // verified identical -> SAFE to send
 
@@ -933,7 +1137,9 @@ bool MainWindow::verifyAutoShieldUnchanged(const Tx& tx) {
     // emit the surplus as PUBLIC change; a SHRUNK set would make it reject. Either way the
     // stale change must NOT be sent. When the shortfall is purely mined (coinbase) funds,
     // steer the user to the dedicated shield; otherwise show the generic notice.
-    const qint64 liveTotalZat = confirmedSpendableZat(tx.fromAddr, /*includeCoinbase=*/true);
+    const qint64 liveTotalZat = hasSelection
+        ? selectedSpendableZat(tx, /*includeCoinbase=*/true)
+        : confirmedSpendableZat(tx.fromAddr, /*includeCoinbase=*/true);
     if (tx.builtTargetZat <= liveTotalZat && tx.builtTargetZat > liveEligibleZat) {
         QMessageBox::warning(this, tr("Shield your mined funds first"),
             tr("Part of this address's balance is newly mined (coinbase) coins, which can "

@@ -28,6 +28,22 @@ struct ToFields {
     QString encodedMemo;
 };
 
+// COIN CONTROL — one user-pinned input. A LEAN value carrying only the daemon
+// coordinates needed to name an already-valid UTXO/note in a typed z_sendmany inputs
+// array, plus its confirmed value in INTEGER ZATOSHIS (the selection-aware send guards
+// size against this, never a re-derived double). `type` is "transparent" / "sapling" /
+// "sprout"; `index` is the transparent vout OR the Sapling outindex; `jsindex` is the
+// Sprout JoinSplit index (with `index` reused as jsoutindex for that pool). Coin control
+// ONLY restricts which already-valid inputs the wallet offers the daemon -- it never
+// changes tx/note format, fees, change routing, or any consensus rule.
+struct SelectedInput {
+    QString type;        // "transparent" | "sapling" | "sprout"
+    QString txid;
+    int     index;       // transparent vout | sapling outindex | sprout jsoutindex
+    int     jsindex;     // sprout JoinSplit index (-1 for transparent/sapling)
+    qint64  amountZat;   // confirmed value of THIS input, integer zatoshi
+};
+
 // Struct used to represent a Transaction.
 struct Tx {
     QString         fromAddr;
@@ -48,6 +64,15 @@ struct Tx {
     bool   autoShieldFullConsume = false;  // true: no-change full balance spend (check total)
     qint64 builtEligibleZat      = 0;      // confirmedSpendableZat(fromAddr,false) at build time
     qint64 builtTargetZat        = 0;      // recipients (excl. change row) + fee, at build time
+
+    // COIN CONTROL — the user-pinned inputs from the Coin Control dialog. DEFAULT-EMPTY
+    // (the {} keeps Tx a C++14 brace-init aggregate, so the positional Tx{from,to,fee}
+    // brace-inits still compile). EMPTY == today's behavior EXACTLY: the daemon
+    // auto-selects inputs (no inputs array is appended in fillTxJsonParams, the send
+    // guards size against the whole address as before). NON-EMPTY restricts the daemon
+    // to spend ONLY these already-valid inputs -- a selection restriction only, never a
+    // consensus/format/fee/change change.
+    QList<SelectedInput> selectedInputs = {};
 };
 
 // PRIV-11 / UX-12 — the four-way SendCategory enum + the pure free classifier
@@ -119,6 +144,15 @@ public:
     void updateLabels();
     void updateTAddrCombo(bool checked);
     void updateFromCombo();
+
+    // COIN CONTROL — re-evaluate whether the Send-tab "Coin Control…" button is shown:
+    // visible ONLY when BOTH the Advanced opt-in (Settings::getCoinControlEnabled()) is
+    // ON and the connected daemon advertises z_sendmany inputs support
+    // (RPC::coinControlSupported()). PUBLIC so the RPC capability probe can call it on its
+    // completion (and the Settings save calls it too). Safe before the button is built
+    // (no-op). When the feature becomes unavailable it also clears any pending selection,
+    // so a hidden button can never carry a stale pin into a send.
+    void refreshCoinControlVisibility();
 
     Ui::MainWindow*     ui;
 
@@ -424,6 +458,18 @@ private:
     // match the daemon's has-change input set. Null-safe (returns 0 if UTXOs not loaded).
     qint64  confirmedSpendableZat(const QString& addr, bool includeCoinbase);
 
+    // COIN CONTROL selection-aware spendable total. When tx.selectedInputs is non-empty,
+    // the daemon will spend ONLY those inputs, so the auto-shield change + the pre-send
+    // race gate must size against the SELECTED subset, NOT the whole address. Sums (in
+    // integer zatoshis) each selected input that is STILL present in the live UTXO set as
+    // confirmed + spendable (a since-spent/unconfirmed selection drops out, so the total
+    // can only shrink, never assert phantom funds); includeCoinbase=false additionally
+    // excludes coinbase, matching confirmedSpendableZat's contract. allStillSpendable (if
+    // non-null) is set false iff ANY selected input is no longer live-confirmed-spendable,
+    // so the send guards can fail closed before the irrevocable send. Returns 0 if the
+    // UTXO set isn't loaded (caller treats that as "cannot verify").
+    qint64  selectedSpendableZat(const Tx& tx, bool includeCoinbase, bool* allStillSpendable = nullptr);
+
     // FAIL-OPEN spendable accessor (the load-bearing money-safety primitive). Returns the
     // CONFIRMED, spendable balance of `addr` (via confirmedSpendableZat, coinbase-inclusive)
     // ONLY when the UTXO set is actually loaded; otherwise it falls back to the minconf=0
@@ -455,6 +501,22 @@ private:
     void setupTurnstileDialog();
     void turnstileDoMigration(QString fromAddr = "");
     void turnstileProgress();
+
+    // COIN CONTROL — built programmatically in setupSendTab() (no .ui structural change,
+    // same idiom as the nav rail / network help panel). The button sits next to the
+    // from-address combo and opens the Coin Control dialog, which edits the pending
+    // tx.selectedInputs. Hidden unless BOTH the Advanced "Enable Coin Control" setting is
+    // ON and the connected daemon advertises z_sendmany inputs support
+    // (RPC::coinControlSupported()). openCoinControl() runs the dialog; the chosen
+    // selection is held here until the next send and applied to the Tx in
+    // createTxFromSendPage().
+    void setupCoinControlButton();
+    void openCoinControl();
+    QPushButton*         coinControlBtn   = nullptr;
+    // The user's pinned inputs for the NEXT send. Default-empty => auto-select (today's
+    // behavior). Cleared on a successful send (removeExtraAddresses) and whenever the
+    // from-address changes, so a stale selection from another address can never be used.
+    QList<SelectedInput> pendingSelectedInputs = {};
 
     void cancelButton();
     void sendButton();
