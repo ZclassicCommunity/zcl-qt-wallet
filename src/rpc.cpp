@@ -10,6 +10,9 @@
 #include <QEventLoop>
 #include <QElapsedTimer>
 
+#include <tuple>
+#include <limits>
+
 using json = nlohmann::json;
 
 RPC::RPC(MainWindow* main) {
@@ -1931,6 +1934,39 @@ void RPC::watchTxStatus() {
     });
 }
 
+// A release tag like "v2.1.2-beta7" must compare HIGHER than "v2.1.2-beta6" and a
+// FINAL "v2.1.2" must outrank any "-betaN" of the same X.Y.Z. QVersionNumber alone
+// drops the "-betaN" suffix (so every 2.1.2-betaN parses to 2.1.2 and compares
+// EQUAL — existing beta users would never be told a newer beta exists). Build a
+// suffix-aware comparable key: (major, minor, patch, preReleaseRank) where a final
+// release uses INT_MAX (ranks above any pre-release) and "-betaN" uses N.
+static std::tuple<int, int, int, int> versionKey(const QString& rawTag) {
+    QString tag = rawTag;
+    if (tag.startsWith("v"))
+        tag = tag.right(tag.length() - 1);
+
+    // QVersionNumber parses the leading X.Y.Z and hands back the index at which the
+    // non-numeric suffix (e.g. "-beta7") begins via the suffixIndex out-param.
+    int suffixIndex = 0;
+    auto v = QVersionNumber::fromString(tag, &suffixIndex);
+
+    const int finalRank = std::numeric_limits<int>::max();
+    int preReleaseRank  = finalRank;   // no suffix => final release => ranks highest
+
+    QString suffix = tag.mid(suffixIndex);   // e.g. "-beta7" (empty for a final release)
+    int betaPos = suffix.indexOf("beta", 0, Qt::CaseInsensitive);
+    if (betaPos >= 0) {
+        bool ok = false;
+        int n = suffix.mid(betaPos + 4).toInt(&ok);   // 4 == strlen("beta")
+        if (ok)
+            preReleaseRank = n;   // betaN ordered numerically (beta7 > beta6)
+        else
+            preReleaseRank = 0;   // "beta" with no number: below any numbered beta, below final
+    }
+
+    return std::make_tuple(v.majorVersion(), v.minorVersion(), v.microVersion(), preReleaseRank);
+}
+
 void RPC::checkForUpdate(bool silent) {
     if  (conn == nullptr)
         return noConnection();
@@ -1960,7 +1996,11 @@ void RPC::checkForUpdate(bool silent) {
             if (reply->error() == QNetworkReply::NoError) {
 
                 auto releases = QJsonDocument::fromJson(reply->readAll()).array();
-                QVersionNumber maxVersion(0, 0, 0);
+
+                // Track the highest release by suffix-aware key, keeping its original
+                // display string (e.g. "2.1.2-beta7") for the dialog and QSettings.
+                auto maxKey = std::make_tuple(0, 0, 0, 0);
+                QString maxVersionStr;
 
                 for (QJsonValue rel : releases) {
                     if (!rel.toObject().contains("tag_name"))
@@ -1971,39 +2011,44 @@ void RPC::checkForUpdate(bool silent) {
                         tag = tag.right(tag.length() - 1);
 
                     if (!tag.isEmpty()) {
-                        auto v = QVersionNumber::fromString(tag);
-                        if (v > maxVersion)
-                            maxVersion = v;
+                        auto key = versionKey(tag);
+                        if (key > maxKey) {
+                            maxKey        = key;
+                            maxVersionStr = tag;
+                        }
                     }
                 }
 
-                auto currentVersion = QVersionNumber::fromString(APP_VERSION);
-                
-                // Get the max version that the user has hidden updates for
+                QString currentVersionStr = QString(APP_VERSION);
+                auto currentKey           = versionKey(currentVersionStr);
+
+                // Get the max version that the user has hidden updates for. Stored as a
+                // version STRING; re-key it the same way so beta-vs-beta hides correctly.
                 QSettings s;
-                auto maxHiddenVersion = QVersionNumber::fromString(s.value("update/lastversion", "0.0.0").toString());
+                QString hiddenVersionStr = s.value("update/lastversion", "0.0.0").toString();
+                auto maxHiddenKey        = versionKey(hiddenVersionStr);
 
-                qDebug() << "Version check: Current " << currentVersion << ", Available " << maxVersion;
+                qDebug() << "Version check: Current " << currentVersionStr << ", Available " << maxVersionStr;
 
-                if (maxVersion > currentVersion && !suppressFirstModal && (!silent || maxVersion > maxHiddenVersion)) {
-                    auto ans = QMessageBox::information(main, QObject::tr("Update Available"), 
+                if (maxKey > currentKey && !suppressFirstModal && (!silent || maxKey > maxHiddenKey)) {
+                    auto ans = QMessageBox::information(main, QObject::tr("Update Available"),
                         QObject::tr("A new release v%1 is available! You have v%2.\n\nWould you like to visit the releases page?")
-                            .arg(maxVersion.toString())
-                            .arg(currentVersion.toString()),
+                            .arg(maxVersionStr)
+                            .arg(currentVersionStr),
                         QMessageBox::Yes, QMessageBox::Cancel);
                     if (ans == QMessageBox::Yes) {
                         QDesktopServices::openUrl(QUrl("https://github.com/ZclassicCommunity/zcl-qt-wallet/releases"));
                     } else {
                         // If the user selects cancel, don't bother them again for this version
-                        s.setValue("update/lastversion", maxVersion.toString());
+                        s.setValue("update/lastversion", maxVersionStr);
                     }
                 } else {
                     if (!silent) {
-                        QMessageBox::information(main, QObject::tr("No updates available"), 
+                        QMessageBox::information(main, QObject::tr("No updates available"),
                             QObject::tr("You already have the latest release v%1")
-                                .arg(currentVersion.toString()));
+                                .arg(currentVersionStr));
                     }
-                } 
+                }
             } else {
                 // A user-initiated check must never silently do nothing: report the
                 // failure and offer the releases page so the Help menu always responds.
