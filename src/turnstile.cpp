@@ -3,6 +3,7 @@
 #include "balancestablemodel.h"
 #include "rpc.h"
 #include "settings.h"
+#include "securestore.h"
 
 using json = nlohmann::json;
 
@@ -19,22 +20,25 @@ void printPlan(QList<TurnstileMigrationItem> plan) {
     }
 }
 
-QString Turnstile::writeableFile() {
-    auto filename = QStringLiteral("turnstilemigrationplan.dat");
-
+static QString turnstilePath(const QString& filename) {
     auto dir = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation));
     if (!dir.exists())
         QDir().mkpath(dir.absolutePath());
+    return Settings::getInstance()->isTestnet() ? dir.filePath("testnet-" % filename)
+                                                : dir.filePath(filename);
+}
 
-    if (Settings::getInstance()->isTestnet()) {
-        return dir.filePath("testnet-" % filename);
-    } else {
-        return dir.filePath(filename);
-    }
+QString Turnstile::writeableFile() {
+    return turnstilePath(QStringLiteral("turnstilemigrationplan.enc"));
+}
+
+static QString turnstileLegacyFile() {
+    return turnstilePath(QStringLiteral("turnstilemigrationplan.dat"));
 }
 
 void Turnstile::removeFile() {
-    QFile(writeableFile()).remove();
+    QFile::remove(writeableFile());
+    QFile::remove(turnstileLegacyFile());
 }
 
 // Data stream write/read methods for migration items
@@ -53,24 +57,24 @@ void Turnstile::writeMigrationPlan(QList<TurnstileMigrationItem> plan) {
     //qDebug() << QString("Writing plan");
     printPlan(plan);
 
-    QFile file(writeableFile());
-    file.open(QIODevice::ReadWrite | QIODevice::Truncate);
-    QDataStream out(&file);   // we will serialize the data into the file
-    out << plan;
-    file.close();
+    // The migration plan reveals z→t→z linkage — encrypted at rest.
+    QByteArray bytes;
+    {
+        QDataStream out(&bytes, QIODevice::WriteOnly);
+        out << plan;
+    }
+    SecureStore::getInstance()->writeFile(writeableFile(), bytes);
 }
 
 QList<TurnstileMigrationItem> Turnstile::readMigrationPlan() {
-    QFile file(writeableFile());
-    
     QList<TurnstileMigrationItem> plan;
-    if (!file.exists()) return plan;
 
-    file.open(QIODevice::ReadOnly);
-    QDataStream in(&file);    // read the data serialized from the file
-    in >> plan; 
+    // Read the encrypted plan; migrate a legacy plaintext .dat on first read.
+    QByteArray bytes = SecureStore::getInstance()->migrateIfNeeded(turnstileLegacyFile(), writeableFile());
+    if (bytes.isEmpty()) return plan;
 
-    file.close();
+    QDataStream in(&bytes, QIODevice::ReadOnly);
+    in >> plan;
 
     // Sort to see when the next step is.
     std::sort(plan.begin(), plan.end(), [&] (auto a, auto b) {
