@@ -825,15 +825,20 @@ void RPC::refreshReceivedZTrans(QList<QString> zaddrs) {
 } 
 
 // Phase C1: fetch the wallet's REAL on-chain ZSLP NFTs and feed the native
-// Collections gallery. See the rpc.h doc for the contract. Two-stage, fully async:
+// Collections gallery. See the rpc.h doc for the contract. SINGLE async call:
 //
-//   1. zslp_listmytokens  -> [{tokenid,ticker,name,decimals,balance,addresses[]}...]
+//   zslp_listmytokens -> [{tokenid,ticker,name,decimals,documenturl,documenthash,
+//                          genesisheight,totalminted,mintbatonvout,hasmintbaton,
+//                          balance,addresses[]}...]
 //      (the indexed tokens intersected with THIS wallet's t-addresses; ZSLP rides
 //       transparent dust so only t-addrs hold tokens). RPC_MISC_ERROR here means the
 //       daemon lacks -zslpindex -> feed an empty "index off" set (no crash/dialog).
-//   2. for each listed token, zslp_gettoken "tokenid" -> the on-chain metadata we
-//      need for the card (documenturl/documenthash/decimals/genesisheight). We batch
-//      these so they fire in parallel and the gallery is fed once they've all landed.
+//
+// C-3 / A-3: the daemon now embeds the FULL token metadata object (same shape as
+// zslp_gettoken) directly in each list row, so the gallery reads every card field
+// (name/ticker/documenthash/genesisheight) straight off the list. The old per-token
+// zslp_gettoken fan-out (one extra RPC per token, purely to recover documenthash/
+// genesisheight) is DELETED — one round-trip per refresh, native fast.
 //
 // An NFT (1-of-1) is decimals==0 && balance==1; we still list other tokens but they
 // read as the same card shape. The token id (genesis txid) is the stable identity.
@@ -963,96 +968,60 @@ void RPC::refreshNFTs() {
                 return;
             }
 
-            // Stage 2: zslp_gettoken for every token id, in one parallel batch, then
-            // build the NFTItem set once all replies have landed. The token id
-            // (genesis txid) is the stable identity; all card metadata (name, ticker,
-            // documenthash, genesisheight) comes from zslp_gettoken below, so we only
-            // need the id list here.
-            QList<QString> tokenIds;
-            for (auto& t : myTokens) {
-                QString tid = nftJsonStr(t, "tokenid");
-                if (!tid.isEmpty())
-                    tokenIds.push_back(tid);
+            // C-3 / A-3: build the gallery straight from the enriched list — each row
+            // already carries the FULL token metadata (the daemon embeds TokenToJSON),
+            // so there is NO Stage-2 zslp_gettoken fan-out anymore. One round-trip.
+            QVector<NFTItem> items;
+            items.reserve((int)myTokens.size());
+
+            for (auto& tok : myTokens) {
+                // Each row is a token metadata object. nftJsonStr returns "" for any
+                // missing/typed-wrong key (never asserts/throws), so a malformed row
+                // simply yields no tokenid -> skip. Mirrors the old per-reply guard.
+                if (!tok.is_object())
+                    continue;
+                QString tid = nftJsonStr(tok, "tokenid");
+                if (tid.isEmpty())
+                    continue;
+
+                NFTItem it;
+
+                QString name   = nftJsonStr(tok, "name");
+                QString ticker = nftJsonStr(tok, "ticker");
+
+                // name || ticker || short tokenid — never show a bare hash if we
+                // have a human label; never show nothing.
+                if (!name.isEmpty())
+                    it.name = name;
+                else if (!ticker.isEmpty())
+                    it.name = ticker;
+                else
+                    it.name = tid.left(10) + QStringLiteral("…");
+
+                // collection: the ticker groups a card-set; fall back to "ZSLP".
+                it.collection = !ticker.isEmpty() ? ticker : QStringLiteral("ZSLP");
+
+                // identity = the genesis txid (the token id).
+                it.txid = tid;
+
+                // on-chain fingerprint (may be "" if the mint set no doc hash —
+                // then the card just can't be verified, stays pending).
+                it.docHashHex = nftJsonStr(tok, "documenthash");
+
+                // PRIVACY: NEVER point the image pipeline at documenturl. Local
+                // bytes only; empty here keeps verifyState pending (no fetch).
+                it.cachePath = QString();
+
+                it.receivedHeight = nftJsonInt(tok, "genesisheight", 0);
+
+                // Public ZSLP rides transparent dust -> not shielded.
+                it.isPrivate   = false;
+                it.verifyState = 0;   // pending until local bytes verify
+
+                items.push_back(it);
             }
 
-            if (tokenIds.isEmpty()) {
-                main->setNFTItems(QVector<NFTItem>(), /*indexOff=*/false);
-                return;
-            }
-
-            conn->doBatchRPC<QString>(tokenIds,
-                [=] (QString tid) -> json {
-                    return json {
-                        {"jsonrpc", "1.0"},
-                        {"id", "someid"},
-                        {"method", "zslp_gettoken"},
-                        {"params", { tid.toStdString() }}
-                    };
-                },
-                [=] (QMap<QString, json>* replies) {
-                    QVector<NFTItem> items;
-                    items.reserve(replies->size());
-
-                    // Iterate the ORIGINAL list order (tokenIds) for a stable layout;
-                    // the batch map is keyed by tokenid so order is otherwise arbitrary.
-                    for (const QString& tid : tokenIds) {
-                        if (!replies->contains(tid))
-                            continue;
-                        // doBatchRPC stores parsed["result"] directly (an EMPTY object
-                        // on any error / discarded reply), so `tok` IS the token's
-                        // metadata object — not a {result:...} envelope. An empty object
-                        // is NOT discarded and IS an object, so we cannot probe it with
-                        // operator[] (that would assert-abort); nftJsonStr returns "" for
-                        // a missing key, so an errored/empty reply yields no tokenid -> skip.
-                        const json& tok = replies->value(tid);
-                        if (tok.is_discarded() || !tok.is_object())
-                            continue;
-                        if (nftJsonStr(tok, "tokenid").isEmpty())
-                            continue;
-
-                        NFTItem it;
-
-                        QString name   = nftJsonStr(tok, "name");
-                        QString ticker = nftJsonStr(tok, "ticker");
-
-                        // name || ticker || short tokenid — never show a bare hash if we
-                        // have a human label; never show nothing.
-                        if (!name.isEmpty())
-                            it.name = name;
-                        else if (!ticker.isEmpty())
-                            it.name = ticker;
-                        else
-                            it.name = tid.left(10) + QStringLiteral("…");
-
-                        // collection: the ticker groups a card-set; fall back to "ZSLP".
-                        it.collection = !ticker.isEmpty() ? ticker : QStringLiteral("ZSLP");
-
-                        // identity = the genesis txid (the token id).
-                        it.txid = tid;
-
-                        // on-chain fingerprint (may be "" if the mint set no doc hash —
-                        // then the card just can't be verified, stays pending).
-                        it.docHashHex = nftJsonStr(tok, "documenthash");
-
-                        // PRIVACY: NEVER point the image pipeline at documenturl. Local
-                        // bytes only; empty here keeps verifyState pending (no fetch).
-                        it.cachePath = QString();
-
-                        it.receivedHeight = nftJsonInt(tok, "genesisheight", 0);
-
-                        // Public ZSLP rides transparent dust -> not shielded.
-                        it.isPrivate   = false;
-                        it.verifyState = 0;   // pending until local bytes verify
-
-                        items.push_back(it);
-                    }
-
-                    main->setNFTItems(items, /*indexOff=*/false);
-
-                    // doBatchRPC hands us ownership of the map; free it.
-                    delete replies;
-                }
-            );
+            main->setNFTItems(items, /*indexOff=*/false);
         },
         [=] (QNetworkReply*, const json& parsed) {
             // GRACEFUL FALLBACK: the most common failure is the daemon running WITHOUT
@@ -1453,10 +1422,8 @@ void RPC::nftTakeOffer(const QString& offerBlob, bool acknowledge,
     );
 }
 
-void RPC::nftListOffers(bool mineOnly,
-                        const std::function<void(QVector<NFTOfferRow>)>& onDone,
+void RPC::nftListOffers(const std::function<void(QVector<NFTOfferRow>)>& onDone,
                         const std::function<void(QString errStr)>& onErr) {
-    (void)mineOnly;   // A-1: kept for forward-compat; the daemon ignores the filter.
 #ifdef ZCL_WIDGET_TEST
     {
         if (!testNextNftError.isEmpty()) {
@@ -1472,14 +1439,13 @@ void RPC::nftListOffers(bool mineOnly,
 #endif
     if (conn == nullptr) { onErr(QObject::tr("Not connected to your node yet.")); return; }
 
-    // A-1: the daemon's nft_listoffers ignores any {"mine":...} field — every record
-    // in the local store is already the caller's — so we no longer send it (it would
-    // advertise a filter that does nothing). The mineOnly arg is kept in the wrapper
-    // signature for forward-compat but is intentionally not put on the wire.
-    json obj = json::object();
+    // A-1: the daemon's nft_listoffers no longer accepts a "mine" filter — every
+    // record in the local store is already the caller's — so we send NO params and
+    // never put a dead "mine" field (or a stray empty object) on the wire. The daemon
+    // guard is `params.size() > 0`, so we must send an empty params array to match.
     json payload = {
         {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "nft_listoffers"},
-        {"params", json::array({ obj })}
+        {"params", json::array()}
     };
 
     conn->doRPC(payload,

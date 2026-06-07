@@ -367,9 +367,9 @@ public:
                       const std::function<void(QString txid, qint64 overshootZat)>& onDone,
                       const std::function<void(QString errStr)>& onErr);
 
-    // List local offers (the store is all "mine"). onDone(rows); onErr(calm).
-    void nftListOffers(bool mineOnly,
-                       const std::function<void(QVector<NFTOfferRow>)>& onDone,
+    // List local offers (the store is all "mine" — the daemon has no "mine" filter,
+    // so this takes no filter arg). onDone(rows); onErr(calm).
+    void nftListOffers(const std::function<void(QVector<NFTOfferRow>)>& onDone,
                        const std::function<void(QString errStr)>& onErr);
 
     // Cancel an outstanding sell offer by self-spending its NFT UTXO. onDone(txid).
