@@ -36,4 +36,21 @@ bool nftValidateTAddrInto(QLabel* status, const QString& addr,
 // translation in one place.
 QString nftPublicTradeNote();
 
+// Resolve a LOCAL bytes path for an NFT whose on-chain fingerprint is
+// `docHashHex` (lowercase SHA-256 hex), WITHOUT any network access — the ONE
+// privacy-safe rule shared by the gallery feed and the detail/buy views.
+//
+// Lookup order (all local; never a remote documenturl):
+//   1) the content-addressed blob store (ContentEngine::cacheGet) — bytes the
+//      user already minted (cachePut) or attached + verified in the detail view;
+//   2) a BUNDLED app resource whose own bytes hash to docHashHex — the wallet
+//      ships a handful of sample images, so a collectible minted from one of them
+//      renders from inside the app (no fetch, no leak). The map is built once and
+//      hashes the :/nft resources at first use.
+//
+// Returns "" (empty sentinel) when no local bytes are known for that hash — the
+// caller then shows its honest "image not on this computer" fallback. An empty or
+// non-hex docHashHex returns "" too.
+QString nftResolveLocalBytes(const QString& docHashHex);
+
 #endif // NFTCOMMON_H

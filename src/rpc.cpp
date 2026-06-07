@@ -929,6 +929,10 @@ void RPC::probeNFTCapability() {
         [this] (const json&) {
             // The method exists and answered -> NFT-capable.
             nftCapability = NftCap::Supported;
+            if (main != nullptr) main->logger->write(QString("NFT capability: %1").arg("supported"));
+            // Deterministic stderr marker for the E2E harness + support logs.
+            fprintf(stderr, "ZQW-E2E NFT capability: %s\n", "supported");
+            fflush(stderr);
             if (main != nullptr) main->onNFTCapabilityResolved();
         },
         [this] (QNetworkReply*, const json& parsed) {
@@ -938,6 +942,11 @@ void RPC::probeNFTCapability() {
             // than falsely hiding NFTs on a healthy NFT node that hiccuped once.
             nftCapability = (jsonRpcErrorCode(parsed) == -32601)
                               ? NftCap::Unsupported : NftCap::Supported;
+            const bool supported = (nftCapability == NftCap::Supported);
+            if (main != nullptr) main->logger->write(QString("NFT capability: %1").arg(supported ? "supported" : "unsupported"));
+            // Deterministic stderr marker for the E2E harness + support logs.
+            fprintf(stderr, "ZQW-E2E NFT capability: %s\n", supported ? "supported" : "unsupported");
+            fflush(stderr);
             if (main != nullptr) main->onNFTCapabilityResolved();
         });
 }

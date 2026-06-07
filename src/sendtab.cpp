@@ -7,6 +7,7 @@
 #include "settings.h"
 #include "rpc.h"
 #include "recurring.h"
+#include "flowlayout.h"   // fit fix: re-home the bottom action row so it wraps
 
 using json = nlohmann::json;
 
@@ -21,8 +22,60 @@ static inline qint64 toZat(double zcl) {
 }
 
 void MainWindow::setupSendTab() {
+    // FIT FIX (E2E-caught): the Send page is the WIDEST tabWidget page, and the
+    // QTabWidget reserves the widest page's minimum width for the WHOLE window —
+    // so the Send page alone was pinning the window's effective minimum width
+    // above a small (820/900px) screen, clipping the right-hand content. The
+    // culprit inside it is sendToScrollArea: its .ui sizeAdjustPolicy was
+    // AdjustToContents, which makes the scroll area GROW to its inner widget's
+    // full content width (~394px) and refuse to shrink — defeating the whole
+    // point of a scroll area. Make it actually shrink-and-scroll: ignore the
+    // content's preferred size for the minimum, allow a horizontal scrollbar to
+    // appear only when needed, give it a small honest minimum, and an Ignored
+    // horizontal size policy so the page can be made narrower than its content
+    // (the content scrolls internally instead of clipping). This drops the Send
+    // page's minimum width well under the 648 floor, so the window minimum is
+    // governed by the deliberate setMinimumWidth(648), not an emergent child min.
+    ui->sendToScrollArea->setSizeAdjustPolicy(QAbstractScrollArea::AdjustIgnored);
+    ui->sendToScrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    ui->sendToScrollArea->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    ui->sendToScrollArea->setMinimumWidth(0);
+    {
+        QSizePolicy sp = ui->sendToScrollArea->sizePolicy();
+        sp.setHorizontalPolicy(QSizePolicy::Ignored);   // page may be narrower than content -> scroll
+        ui->sendToScrollArea->setSizePolicy(sp);
+    }
+
+    // FIT FIX (the REAL Send-page pinch the E2E diag named): the bottom
+    // fee/totals/Review-&-send/Cancel row (horizontalLayout_6) is a NON-wrapping
+    // QHBoxLayout, so its minimum width is the SUM of every child's minimum
+    // (network-fee label + amount + unit + totals + two buttons ≈ 556px). Since a
+    // QTabWidget reserves the WIDEST page's minimum for the whole window, that one
+    // row alone pinned the window minimum to ~728px — the thing that kept the app
+    // from fitting a small screen. Re-home those same widgets into a FlowLayout
+    // (same pattern as the Collections action row) so they WRAP onto a second line
+    // on a narrow window instead of summing. A FlowLayout's minimum width is the
+    // widest SINGLE child (~150px), not the sum, which drops the Send page well
+    // under the honest 648 floor. No widgets are removed — they just reflow.
+    if (ui->horizontalLayout_6 && ui->verticalLayout_4) {
+        QHBoxLayout* oldRow = ui->horizontalLayout_6;
+        int pos = ui->verticalLayout_4->indexOf(oldRow);
+        if (pos >= 0) {
+            auto* flow = new FlowLayout(/*margin=*/0, /*hSpacing=*/8, /*vSpacing=*/8);
+            // Move every item out of the old row, preserving order, into the flow.
+            while (oldRow->count() > 0) {
+                QLayoutItem* it = oldRow->takeAt(0);
+                flow->addItem(it);   // FlowLayout takes ownership of the QLayoutItem
+            }
+            // Replace the now-empty QHBoxLayout in the page layout with the flow.
+            ui->verticalLayout_4->removeItem(oldRow);
+            delete oldRow;           // empty layout; its items already re-homed
+            ui->verticalLayout_4->insertLayout(pos, flow);
+        }
+    }
+
     // Create the validator for send to/amount fields
-    auto amtValidator = new QRegExpValidator(QRegExp("[0-9]{0,8}\\.?[0-9]{0,8}"));    
+    auto amtValidator = new QRegExpValidator(QRegExp("[0-9]{0,8}\\.?[0-9]{0,8}"));
     ui->Amount1->setValidator(amtValidator);
 
     // Send button

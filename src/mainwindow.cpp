@@ -18,6 +18,7 @@
 #include "nftdetaildialog.h"
 #include "nftmintdialog.h"
 #include "nftbuydialog.h"
+#include "nftcommon.h"
 #include "shieldsenddialog.h"
 #include "shieldreceivedialog.h"
 #include "flowlayout.h"
@@ -49,6 +50,9 @@
 #include <QTabBar>
 #include <QSignalBlocker>
 #include <QFileInfo>     // showExternalNodeAuthFailed: open the conf's folder
+#include <QTimer>        // UI-test seam: singleShot(0) last-word tab selection
+#include <QScreen>       // window-clip fix: per-screen availableGeometry fallback
+#include <QGuiApplication> // window-clip fix: primaryScreen()
 
 using json = nlohmann::json;
 
@@ -197,6 +201,16 @@ MainWindow::MainWindow(QWidget *parent) :
     // Receive QR floor dropped 200 -> 140. If the rail width or those mins change, revisit 648.
     setMinimumWidth(648);
 
+    // SMALL-SCREEN FOOTER FIX: declare an HONEST minimum height too, so the status
+    // footer ("Connected · …" / "Starting (block N) ⚠") and the bottom "Advanced"
+    // rail item are ALWAYS reserved and never sliced off the bottom on a short
+    // screen. QMainWindow lays out [menubar | central | statusbar]; with a firm
+    // floor the central area gives up space to the footer instead of the footer
+    // being pushed off-screen. 480 fits a 560px-tall screen (minus WM chrome) while
+    // still reserving the menubar + footer; the restore clamp below never opens
+    // taller than the actual screen, so this is a floor, not a forced size.
+    setMinimumHeight(480);
+
     rpc = new RPC(this);
 
     restoreSavedStates();
@@ -204,11 +218,70 @@ MainWindow::MainWindow(QWidget *parent) :
     // Opt-in tray-resident mode: set up the tray icon + app-exit semantics to
     // match the saved preference (default OFF -> no tray, quit-on-close as before).
     applyTraySetting(Settings::getInstance()->getKeepInTray());
+
+    // UI-TEST SEAM (last word). ZQW_UITEST_TAB=collections lands the offscreen E2E
+    // on the Collections gallery. setupNavRail() already honors this seam during
+    // construction, but several later code paths (currentChanged sync, the cold
+    // open's first refresh, etc.) could re-select Home and clobber it. Scheduling
+    // this with singleShot(0) makes it the LAST thing to run after the constructor
+    // and the initial show event, so it is the authoritative final selection. Also
+    // syncs the nav-rail checked state so the rail highlight matches. NEVER active
+    // in normal use (the env var is set only by the headless test harness).
+    QTimer::singleShot(0, this, [this]() {
+        if (qgetenv("ZQW_UITEST_TAB") != "collections" || !nftTab)
+            return;
+        int i = ui->tabWidget->indexOf(nftTab);
+        if (i < 0)
+            return;
+        ui->tabWidget->setCurrentIndex(i);
+        if (navRailGroup) {
+            if (QAbstractButton* b = navRailGroup->button(i)) {
+                QSignalBlocker block(navRailGroup);
+                b->setChecked(true);
+            }
+        }
+    });
 }
 
 void MainWindow::restoreSavedStates() {
     QSettings s;
-    restoreGeometry(s.value("geometry").toByteArray());
+    const QByteArray savedGeom = s.value("geometry").toByteArray();
+    restoreGeometry(savedGeom);
+
+    // WINDOW-CLIP FIX: the .ui default is 968x616; setMinimumWidth(648) only
+    // constrains the floor, nothing clamped the INITIAL size to the actual
+    // screen. On a fresh profile (no saved geometry) the window opened at 968px
+    // even on a 900px / 820px screen, hard-clipping the right-hand Address
+    // Balances panel (the Amount column ran off-screen). When there is no saved
+    // geometry to restore, clamp the opening size to the available screen so it
+    // never opens wider/taller than what fits. Respects the tested 648 min width.
+    //
+    // Two-source clamp: QApplication::desktop()->availableGeometry(this) can be
+    // unreliable before the window is mapped (it may report a virtual-desktop
+    // union, or 0). So we take the MIN of that and the primary QScreen's
+    // available geometry, ignoring any non-positive reading. The companion fix
+    // is the REAL one: relaxing the Send page's scroll-area minimum (see
+    // setupSendTab) drops the window's effective minimum-size-hint below the 648
+    // floor, so this clamp is no longer fighting an emergent child minimum that
+    // would otherwise yank the width back up after the resize.
+    if (savedGeom.isEmpty()) {
+        int availW = 0, availH = 0;
+        auto consider = [&](const QRect& r) {
+            if (r.width()  > 0) availW = (availW == 0) ? r.width()  : qMin(availW, r.width());
+            if (r.height() > 0) availH = (availH == 0) ? r.height() : qMin(availH, r.height());
+        };
+        consider(QApplication::desktop()->availableGeometry(this));
+        if (QScreen* s = QGuiApplication::primaryScreen())
+            consider(s->availableGeometry());
+
+        if (availW > 0 && availH > 0) {
+            const int minW = minimumWidth();   // honest tested floor (648)
+            int w = qMin(width(),  availW);
+            int h = qMin(height(), availH);
+            w = qMax(w, qMin(minW, availW));   // never below the min, but never wider than the screen
+            resize(w, h);
+        }
+    }
 
     ui->balancesTable->horizontalHeader()->restoreState(s.value("baltablegeometry").toByteArray());
     ui->transactionsTable->horizontalHeader()->restoreState(s.value("tratablegeometry").toByteArray());
@@ -622,8 +695,13 @@ void MainWindow::setupStatusBar() {
 // which we move to row 1 while the banner takes row 0.
 void MainWindow::setupSyncBanner() {
     syncBanner = new QWidget(ui->tab);
+    // Inset + rounded styling (vision-review): give the banner an objectName so the
+    // colored states can paint a rounded #syncBanner rect that reads as a card,
+    // rather than a hard full-bleed edge-to-edge orange bar clipped at the window
+    // edge. The outer margins (set on the grid cell below) provide the inset.
+    syncBanner->setObjectName("syncBanner");
     auto* bannerLayout = new QHBoxLayout(syncBanner);
-    bannerLayout->setContentsMargins(8, 6, 8, 6);
+    bannerLayout->setContentsMargins(12, 8, 12, 8);
     bannerLayout->setSpacing(10);
 
     syncStatusLabel = new QLabel(syncBanner);
@@ -663,6 +741,9 @@ void MainWindow::setupSyncBanner() {
     // Move the existing balances content (horizontalLayout_5) down to row 1 and
     // place the banner on row 0. takeAt(0) is safe: gridLayout_2 has one item.
     auto* grid = ui->gridLayout_2;
+    // Inset the banner from the window edges so the rounded card has breathing room
+    // and never paints flush against (and hard-clipped by) the right window edge.
+    grid->setContentsMargins(8, 8, 8, 4);
     QLayoutItem* existing = grid->takeAt(0);
     grid->addWidget(syncBanner, 0, 0, 1, 1);
     if (existing && existing->layout()) {
@@ -1396,6 +1477,9 @@ void MainWindow::setupNavRail() {
         central->addWidget(ui->tabWidget, 0, 1);
         central->setColumnStretch(0, 0);   // rail: fixed width
         central->setColumnStretch(1, 1);   // content: takes the rest
+        // Row 0 takes ALL the central height so the rail (darker #0c0e12 surface)
+        // fills the page top-to-bottom — no lighter gap below it at any window size.
+        central->setRowStretch(0, 1);
     } else {
         // Fallback (shouldn't happen given the .ui): wrap in a fresh HBox.
         auto* hbox = new QHBoxLayout(ui->centralWidget);
@@ -1407,7 +1491,10 @@ void MainWindow::setupNavRail() {
 
     // 8) Open on Home (Balance, index 0) — not Receive. Check the Home button to
     //    match. (The .ui's currentIndex=2 default is overridden here and by the
-    //    ctor's setCurrentIndex(0).)
+    //    ctor's setCurrentIndex(0).) The ZQW_UITEST_TAB=collections E2E seam is
+    //    applied LAST, as a singleShot(0) at the end of the constructor, so it is
+    //    authoritative over this (and any other) tab selection; here we always
+    //    behave exactly as in normal use and open on Home.
     ui->tabWidget->setCurrentIndex(0);
     if (auto* home = navRailGroup->button(0))
         home->setChecked(true);
@@ -1451,7 +1538,7 @@ void MainWindow::setSyncStatus(bool isSyncing, int blockNumber, int estimatedHei
             syncQuietPill->setText(pill);
             syncQuietPill->setVisible(true);
         }
-        applyBannerStyle("QWidget { background-color: transparent; }");
+        applyBannerStyle("#syncBanner { background-color: transparent; }");
         return;
     }
 
@@ -1477,7 +1564,7 @@ void MainWindow::setSyncStatus(bool isSyncing, int blockNumber, int estimatedHei
                 .arg(blockNumber));
         else
             syncStatusLabel->setText(tr("Starting your node…"));
-        applyBannerStyle("QWidget { background-color: #d9822b; } QLabel { color: white; }");
+        applyBannerStyle("#syncBanner { background-color: #d9822b; border-radius: 8px; } QLabel { color: white; }");
         return;
     }
 
@@ -1524,7 +1611,7 @@ void MainWindow::setSyncStatus(bool isSyncing, int blockNumber, int estimatedHei
     }
 
     syncStatusLabel->setText(tr("Syncing blockchain… %1%").arg(pct) % heightText % etaText);
-    applyBannerStyle("QWidget { background-color: #d9822b; } QLabel { color: white; }");
+    applyBannerStyle("#syncBanner { background-color: #d9822b; border-radius: 8px; } QLabel { color: white; }");
 }
 
 // P0-6: called from rpc.cpp's noConnection() so the user sees a clear,
@@ -1536,7 +1623,7 @@ void MainWindow::setSyncStatusConnecting() {
     if (syncQuietPill) syncQuietPill->setVisible(false);
     syncStatusLabel->setVisible(true);
     syncStatusLabel->setText(tr("Connecting to your ZClassic node…"));
-    applyBannerStyle("QWidget { background-color: #555555; } QLabel { color: white; }");
+    applyBannerStyle("#syncBanner { background-color: #555555; border-radius: 8px; } QLabel { color: white; }");
 }
 
 // C9: called from rpc.cpp when the node is "syncing" but has 0 peers. A fresh
@@ -1553,7 +1640,7 @@ void MainWindow::setSyncStatusWaitingForPeers(bool longStretch) {
         syncStatusLabel->setText(tr("Still no peers — please check your internet connection."));
     else
         syncStatusLabel->setText(tr("Waiting for peers… check your internet connection"));
-    applyBannerStyle("QWidget { background-color: #d9822b; } QLabel { color: white; }");
+    applyBannerStyle("#syncBanner { background-color: #d9822b; border-radius: 8px; } QLabel { color: white; }");
 }
 
 // Bootstrap snapshot download in progress: show real determinate progress instead of
@@ -1580,7 +1667,7 @@ void MainWindow::setSyncStatusBootstrapSnapshot(int pct, qint64 received, qint64
         detail = detail % QString(" • ") % tr("%1 MB/s").arg(mbps, 0, 'f', 1);
 
     syncStatusLabel->setText(tr("Downloading blockchain snapshot… %1%").arg(pct) % detail);
-    applyBannerStyle("QWidget { background-color: #d9822b; } QLabel { color: white; }");
+    applyBannerStyle("#syncBanner { background-color: #d9822b; border-radius: 8px; } QLabel { color: white; }");
 }
 
 // SELF-HEAL (B-side): non-blocking validation banner. An empty message clears it
@@ -1596,7 +1683,7 @@ void MainWindow::setBootstrapValidationBanner(const QString& msg) {
     syncStatusLabel->setVisible(true);
     syncProgressBar->setVisible(false);
     syncStatusLabel->setText(msg);
-    applyBannerStyle("QWidget { background-color: #2c5d8f; } QLabel { color: white; }");
+    applyBannerStyle("#syncBanner { background-color: #2c5d8f; border-radius: 8px; } QLabel { color: white; }");
 }
 
 // Non-modal notification. Prefer a system-tray balloon (visible even when the main
@@ -1659,7 +1746,7 @@ void MainWindow::autoHealStubChain() {
     if (syncStatusLabel != nullptr) {
         syncProgressBar->setVisible(false);
         syncStatusLabel->setText(tr("Re-downloading blockchain…"));
-        applyBannerStyle("QWidget { background-color: #2c5d8f; } QLabel { color: white; }");
+        applyBannerStyle("#syncBanner { background-color: #2c5d8f; border-radius: 8px; } QLabel { color: white; }");
     }
     notify(tr("Re-downloading blockchain"),
         tr("ZClassic couldn't find any peers and the local copy is incomplete, so it is "
@@ -3276,6 +3363,12 @@ void MainWindow::setupNFTTab() {
         loadNFTFixtures();
     });
 #endif
+
+    // NOTE: the ZQW_UITEST_TAB=collections E2E tab-selection seam used to live here,
+    // but it was clobbered by later tab selections (setupNavRail / the cold-open
+    // refresh). It now fires as a singleShot(0) at the very END of the MainWindow
+    // constructor (the authoritative last word). Kept in one place to avoid two
+    // racing seams.
 }
 
 // ----------------------------------------------------------------------------
@@ -3463,16 +3556,29 @@ void MainWindow::setNFTItems(const QVector<NFTItem>& items, bool indexOff) {
     // Real data now owns the gallery; never let a (dev) fixture feed clobber it.
     nftFixturesLoaded = true;
 
-    nftModel->setItems(items);
+    // RESOLVE LOCAL BYTES (offline, privacy-safe) so the card shows the REAL image
+    // when we already hold it. RPC::refreshNFTs leaves cachePath empty (it must never
+    // point at a remote documenturl); here we back-fill it from LOCAL sources ONLY —
+    // the content-addressed blob store (bytes the user minted/attached) and bundled
+    // app resources whose own bytes hash to the on-chain fingerprint. nftResolveLocalBytes
+    // does ZERO network I/O, so the privacy contract is intact: an item with no local
+    // bytes simply keeps cachePath == "" and shows the friendly hash-art fallback.
+    QVector<NFTItem> resolved = items;
+    for (int row = 0; row < resolved.size(); ++row) {
+        NFTItem& it = resolved[row];
+        if (it.cachePath.isEmpty())
+            it.cachePath = nftResolveLocalBytes(it.docHashHex);
+    }
 
-    // Kick off the threaded decode + verify ONLY for items that carry a LOCAL bytes
-    // path. In C1 every public-ZSLP item has an empty cachePath (no local bytes yet),
-    // so this loop is a no-op for them and NOTHING is fetched over the network — the
-    // privacy contract. When the private data channel (or an explicit user fetch)
-    // later populates a local cachePath, those items decode + verify here.
+    nftModel->setItems(resolved);
+
+    // Kick off the threaded decode + verify ONLY for items that resolved to a LOCAL
+    // bytes path above. Items with no local bytes are a no-op here and NOTHING is
+    // fetched over the network — the privacy contract. They stay at verifyState 0 and
+    // render the friendly hash-art placeholder until the user supplies the file.
     if (nftImgCache) {
-        for (int row = 0; row < items.size(); ++row) {
-            const NFTItem& it = items.at(row);
+        for (int row = 0; row < resolved.size(); ++row) {
+            const NFTItem& it = resolved.at(row);
             if (it.cachePath.isEmpty())
                 continue;   // PRIVACY: no local bytes -> no fetch, stays pending
             nftImgCache->request(it.docHashHex, it.cachePath, it.docHashHex, nftThumbPx);

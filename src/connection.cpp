@@ -2403,6 +2403,9 @@ void ConnectionLoader::classifyForeignDaemon(Connection* connection) {
             QSettings().setValue("heal/daemonHasBootstrapRpc", 1);
             d->hide();
             main->logger->write("Attached to a ZClassic node already running (probing NFT support).");
+            // Deterministic stderr marker for the E2E harness + support logs:
+            // a successful getinfo/getbootstrapinfo on a node we did NOT spawn.
+            fprintf(stderr, "ZQW-E2E attached to node\n"); fflush(stderr);
             this->doRPCSetConnection(connection);
         },
         [=] (auto, auto) {
@@ -2416,6 +2419,9 @@ void ConnectionLoader::classifyForeignDaemon(Connection* connection) {
             QSettings().setValue("heal/daemonHasBootstrapRpc", 0);
             d->hide();
             main->logger->write("Pre-existing ZClassic node has an older feature set (no getbootstrapinfo) — attaching anyway.");
+            // Deterministic stderr marker for the E2E harness + support logs:
+            // a successful attach to a foreign (older) node we did NOT spawn.
+            fprintf(stderr, "ZQW-E2E attached to node\n"); fflush(stderr);
             this->doRPCSetConnection(connection);
         });
 }

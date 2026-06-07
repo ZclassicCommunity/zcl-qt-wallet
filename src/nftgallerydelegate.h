@@ -5,7 +5,9 @@
 // Each card draws (top to bottom):
 //   * a rounded card body (card #15171c) with a 1px hairline (#2a2d35);
 //   * a square thumbnail area (inset #1d2027) — the model's QPixmap if ready,
-//     else a calm static "image not on this device" placeholder;
+//     else a friendly deterministic "hash-art" tile (a unique gradient + quiet
+//     identicon derived from the on-chain fingerprint) with a small "tap to add
+//     image" affordance, so a card without local bytes is never an empty grey slab;
 //   * an ownership pill — ALWAYS amber "Public" (#119: ZSLP ownership is always
 //     public; there is no private-ownership state to render);
 //   * a verify badge (green check / red x / amber question) from the bundled
@@ -48,6 +50,12 @@ private:
     // Tinted, cached SVG icon (alpha-mask -> SourceIn fill), keyed by
     // resource+color+px. Mirrors PrivacyBadgeDelegate::icon().
     const QPixmap& tintedIcon(const QString& resource, const QColor& color, int px) const;
+
+    // Paint a deterministic "hash-art" tile (a unique 2-stop gradient + a quiet
+    // identicon grid) derived from the on-chain fingerprint, into `rect`. Used as
+    // the friendly placeholder when an NFT's image bytes are not on this computer —
+    // so a card is never an empty/broken grey slab. Pure of any I/O or network.
+    static void paintHashArt(QPainter* painter, const QRect& rect, const QString& docHashHex);
 
     mutable QHash<QString, QPixmap> _iconCache;   // populated by const paint()
 };

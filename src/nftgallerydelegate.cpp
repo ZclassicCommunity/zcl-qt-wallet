@@ -19,6 +19,8 @@
 #include <QModelIndex>
 #include <QColor>
 #include <QFont>
+#include <QCryptographicHash>
+#include <QByteArray>
 
 namespace {
     const QColor kCard    ("#15171c");
@@ -89,6 +91,59 @@ const QPixmap& NFTGalleryDelegate::tintedIcon(const QString& resource,
     return it.value();
 }
 
+void NFTGalleryDelegate::paintHashArt(QPainter* painter, const QRect& rect,
+                                      const QString& docHashHex) {
+    // Derive 32 deterministic bytes from the fingerprint so the SAME NFT always
+    // gets the SAME face (and two different NFTs almost never collide). A bare hex
+    // anchor is already 32 bytes of entropy; a missing/odd hash is folded through
+    // SHA-256 so we always have a full seed (and an empty hash still yields a
+    // stable, calm tile rather than a crash).
+    QByteArray seed = QByteArray::fromHex(docHashHex.toLatin1());
+    if (seed.size() < 16)
+        seed = QCryptographicHash::hash(docHashHex.toUtf8(), QCryptographicHash::Sha256);
+    auto b = [&](int i) -> int {
+        return seed.isEmpty() ? 0 : static_cast<uchar>(seed.at(i % seed.size()));
+    };
+
+    // Two stops on the dark palette: a hue from the hash, kept muted (mid sat /
+    // value) so it never fights the card chrome or screams brighter than a real
+    // photo would. The second stop is a darker shade of the same hue for depth.
+    const int hue = b(0) * 360 / 256;
+    QColor top  = QColor::fromHsv(hue, 90, 110);
+    QColor bot  = QColor::fromHsv((hue + 28) % 360, 110, 64);
+    QLinearGradient grad(rect.topLeft(), rect.bottomRight());
+    grad.setColorAt(0.0, top);
+    grad.setColorAt(1.0, bot);
+    painter->fillRect(rect, grad);
+
+    // A quiet 5x5 identicon, mirrored left<->right (the classic GitHub-style look),
+    // in a soft light ink so it reads as "this card's mark", not noise. Cells are
+    // chosen from the seed bits; the centre column + a small margin keep it tidy.
+    const int grid = 5;
+    const qreal cell = rect.width() / static_cast<qreal>(grid + 2);   // 1-cell margin each side
+    const qreal ox = rect.left() + cell;
+    const qreal oy = rect.top()  + (rect.height() - cell * grid) / 2.0;
+    QColor ink("#e6e6e6"); ink.setAlpha(40);
+    painter->setPen(Qt::NoPen);
+    painter->setBrush(ink);
+    const int cols = (grid + 1) / 2;     // 3 unique columns, mirrored to 5
+    for (int gx = 0; gx < cols; ++gx) {
+        for (int gy = 0; gy < grid; ++gy) {
+            // one bit per cell from the seed stream
+            const int bit = (b(1 + gx * grid + gy) >> (gy % 8)) & 1;
+            if (!bit)
+                continue;
+            const QRectF c(ox + gx * cell, oy + gy * cell, cell, cell);
+            painter->drawRect(c);
+            const int mx = grid - 1 - gx;     // mirror across the centre column
+            if (mx != gx) {
+                const QRectF cm(ox + mx * cell, oy + gy * cell, cell, cell);
+                painter->drawRect(cm);
+            }
+        }
+    }
+}
+
 void NFTGalleryDelegate::paint(QPainter* painter, const QStyleOptionViewItem& option,
                                const QModelIndex& index) const {
     if (!index.isValid()) {
@@ -140,20 +195,31 @@ void NFTGalleryDelegate::paint(QPainter* painter, const QStyleOptionViewItem& op
                             thumbRect.width(), thumbRect.height()));
         painter->restore();
     } else {
-        // No thumbnail. For on-chain NFTs the bytes are NOT on this computer (we never
-        // auto-fetch), and no decode is in flight — so this is a TERMINAL state, not a
-        // spinner (review fix #4). Paint a calm, static "no image here" placeholder
-        // with a one-line caption, NOT a loading shimmer that reads as endless work.
+        // No local image bytes (we never auto-fetch — privacy hard rule). Instead of a
+        // cold "Image not on this device" slab that reads as broken/empty, paint a
+        // FRIENDLY, deterministic hash-art tile derived from the on-chain fingerprint:
+        // a unique 2-stop gradient + a quiet identicon grid, so every card has its own
+        // recognisable, never-blank face. A small bottom affordance ("tap to add image")
+        // states the honest next step WITHOUT implying a download we never perform.
+        const QString docHash = index.data(NFTGalleryModel::DocHashRole).toString();
         painter->save();
         painter->setClipPath(thumbClip);
-        painter->fillRect(thumbRect, kInset);
+        paintHashArt(painter, thumbRect, docHash);
+
+        // A subtle bottom scrim + one-line affordance. Honest: no "download" verb — the
+        // image lives on the owner's computer; opening the card lets them point at it.
+        QRect strip(thumbRect.left(), thumbRect.bottom() - 22,
+                    thumbRect.width(), 22);
+        QColor scrim("#0f1115"); scrim.setAlpha(150);
+        painter->fillRect(strip, scrim);
         QFont capFont = option.font;
-        if (capFont.pointSizeF() > 0) capFont.setPointSizeF(capFont.pointSizeF() * 0.80);
+        if (capFont.pointSizeF() > 0) capFont.setPointSizeF(capFont.pointSizeF() * 0.74);
         painter->setFont(capFont);
-        painter->setPen(kDim);
-        painter->drawText(thumbRect.adjusted(8, 8, -8, -8),
-                          Qt::AlignCenter | Qt::TextWordWrap,
-                          tr("Image not on\nthis device"));
+        painter->setPen(QColor("#c8ccd4"));
+        const QFontMetrics cfmCap(capFont);
+        painter->drawText(strip, Qt::AlignCenter,
+                          cfmCap.elidedText(tr("Tap to add image"),
+                                            Qt::ElideRight, strip.width() - 8));
         painter->restore();
     }
 

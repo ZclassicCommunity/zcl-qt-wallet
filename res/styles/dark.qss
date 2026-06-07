@@ -141,7 +141,12 @@ QMenu { background-color: #1d2027; color: #e6e6e6; border: 1px solid #2a2d35; bo
 QMenu::item { padding: 7px 22px; border-radius: 6px; }
 QMenu::item:selected { background-color: #2a2e37; }
 QMenu::separator { height: 1px; background: #2a2d35; margin: 4px 8px; }
-QStatusBar { background-color: #0f1115; color: #9aa0a6; border-top: 1px solid #2a2d35; }
+/* The footer must NEVER be bisected by the window's bottom edge: a firm min-height
+ * plus vertical padding reserves enough room that the "Connected · checking…" /
+ * "Starting (block N) ⚠" glyph baselines always sit fully inside the window, even
+ * at the smallest supported height. */
+QStatusBar { background-color: #0f1115; color: #9aa0a6; border-top: 1px solid #2a2d35;
+             min-height: 26px; padding: 3px 8px; }
 QStatusBar::item { border: none; }
 QProgressBar {
     background-color: #1d2027; border: 1px solid #2a2d35; border-radius: 8px;
