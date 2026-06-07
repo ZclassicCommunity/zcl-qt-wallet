@@ -1,48 +1,33 @@
 #include "senttxstore.h"
 #include "settings.h"
+#include "securestore.h"
 
-/// Get the location of the app data file to be written. 
-QString SentTxStore::writeableFile() {
-    auto filename = QStringLiteral("senttxstore.dat");
+// The shielded send history (recipient z-addresses + amounts for sends the daemon can't even
+// see) is the most OPSEC-sensitive file the GUI keeps. SecureStore owns the path, the testnet-
+// prefix, the atomic owner-only (0600) write, and — when the user has opted into encryption —
+// the encryption + transparent migration. The logical store name is all the caller passes.
+static const QString kStore = QStringLiteral("senttxstore");
 
-    auto dir = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation));
-    if (!dir.exists())
-        QDir().mkpath(dir.absolutePath());
-
-    if (Settings::getInstance()->isTestnet()) {
-        return dir.filePath("testnet-" % filename);
-    } else {
-        return dir.filePath(filename);
-    }
-}
-
-// delete the sent history. 
+// delete the sent history (both plaintext and encrypted forms).
 void SentTxStore::deleteHistory() {
-    QFile data(writeableFile());
-    data.remove();
-    data.close();
+    SecureStore::getInstance()->removeStore(kStore);
 }
 
 QList<TransactionItem> SentTxStore::readSentTxFile() {
-    QFile data(writeableFile());
-    if (!data.exists()) {
-        return QList<TransactionItem>();
-    }
-    
-    QJsonDocument jsonDoc;
-    
-    data.open(QFile::ReadOnly);    
-    jsonDoc = QJsonDocument::fromJson(data.readAll());
-    data.close();
+    bool ok = true;
+    QByteArray bytes = SecureStore::getInstance()->loadStore(kStore, ok);
+    if (!ok || bytes.isEmpty())
+        return QList<TransactionItem>();   // unreadable (corrupt) or absent -> show nothing
+
+    QJsonDocument jsonDoc = QJsonDocument::fromJson(bytes);
 
     QList<TransactionItem> items;
-
     for (auto i : jsonDoc.array()) {
         auto sentTx = i.toObject();
-        TransactionItem t{"send", (qint64)sentTx["datetime"].toVariant().toLongLong(), 
-                          sentTx["address"].toString(), 
-                          sentTx["txid"].toString(), 
-                          sentTx["amount"].toDouble() + sentTx["fee"].toDouble(), 
+        TransactionItem t{"send", (qint64)sentTx["datetime"].toVariant().toLongLong(),
+                          sentTx["address"].toString(),
+                          sentTx["txid"].toString(),
+                          sentTx["amount"].toDouble() + sentTx["fee"].toDouble(),
                           0, sentTx["from"].toString(), ""};
         items.push_back(t);
     }
@@ -55,33 +40,21 @@ void SentTxStore::addToSentTx(Tx tx, QString txid) {
     if (!Settings::getInstance()->getSaveZtxs())
         return;
 
-    // Also, only store outgoing txs where the from address is a z-Addr. Else, regular zclassicd 
+    // Also, only store outgoing txs where the from address is a z-Addr. Else, regular zclassicd
     // stores it just fine
-    if (!tx.fromAddr.startsWith("z")) 
+    if (!tx.fromAddr.startsWith("z"))
         return;
 
-    QFile data(writeableFile());
-    QJsonDocument jsonDoc;
-
-    // If data doesn't exist, then create a blank one
-    if (!data.exists()) {
-        QJsonArray a;
-        jsonDoc.setArray(a);
-
-        QFile newFile(writeableFile());
-        newFile.open(QFile::WriteOnly);
-        // 0600: this file records every outgoing shielded send (recipient addresses
-        // + amounts) as plaintext JSON. Restrict it to the owner so other local
-        // users/processes cannot harvest the user's private send history. (On
-        // Windows the POSIX bits map weakly; this mainly hardens Linux/macOS.)
-        newFile.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
-        newFile.write(jsonDoc.toJson());
-        newFile.close();
-    } else {
-        data.open(QFile::ReadOnly);    
-        jsonDoc = QJsonDocument().fromJson(data.readAll());
-        data.close();
+    // Load the existing history. If it exists but can't be read (corrupt encrypted file), DO NOT
+    // overwrite it — that would permanently destroy the only record of past shielded sends.
+    bool ok = true;
+    QByteArray existing = SecureStore::getInstance()->loadStore(kStore, ok);
+    if (!ok) {
+        qDebug() << "SentTxStore: existing history is unreadable; refusing to overwrite it.";
+        return;
     }
+    QJsonDocument jsonDoc = existing.isEmpty() ? QJsonDocument(QJsonArray())
+                                              : QJsonDocument::fromJson(existing);
 
     // Calculate total amount in this tx
     double totalAmount = 0;
@@ -112,11 +85,8 @@ void SentTxStore::addToSentTx(Tx tx, QString txid) {
 
     jsonDoc.setArray(list);
 
-    QFile writer(writeableFile());
-    if (writer.open(QFile::WriteOnly | QFile::Truncate)) {
-        // 0600 owner-only (see above): this is the plaintext shielded send history.
-        writer.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
-        writer.write(jsonDoc.toJson());
-    }
-    writer.close();
+    // Atomic, owner-only (0600) write — encrypted iff the user opted in. A failed write must not
+    // pass silently: this is the only record of the send.
+    if (!SecureStore::getInstance()->saveStore(kStore, jsonDoc.toJson()))
+        qDebug() << "SentTxStore: write FAILED — this send was not recorded to local history.";
 }

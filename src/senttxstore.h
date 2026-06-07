@@ -11,10 +11,6 @@ public:
 
     static QList<TransactionItem> readSentTxFile();
     static void                   addToSentTx(Tx tx, QString txid);
-
-private:
-    static QString writeableFile();
-    
 };
 
 #endif // SENTTXSTORE_H

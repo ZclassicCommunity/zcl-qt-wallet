@@ -510,7 +510,9 @@ void TestLogic::sentTxStore_perms_and_testnetName() {
 
     SentTxStore::addToSentTx(tx, "deadbeefcafetxid");
 
-    // The file must exist under a "testnet-"-prefixed name in AppDataLocation.
+    // The file must exist under a "testnet-"-prefixed name in AppDataLocation. Encryption is
+    // OPT-IN (default OFF), so the store writes owner-only (0600) plaintext senttxstore.dat via
+    // SecureStore. (The encrypted .enc path + its AEAD are validated separately against libsodium.)
     QString expected = QDir(sandboxAppData()).filePath("testnet-senttxstore.dat");
     QVERIFY2(QFile::exists(expected), qPrintable("missing: " + expected));
 

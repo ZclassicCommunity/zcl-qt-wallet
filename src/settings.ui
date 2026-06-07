@@ -192,6 +192,23 @@
          </property>
         </widget>
        </item>
+       <item row="15" column="0" colspan="2">
+        <widget class="QCheckBox" name="chkEncryptData">
+         <property name="text">
+          <string>Encrypt my wallet data with a password</string>
+         </property>
+        </widget>
+       </item>
+       <item row="16" column="0" colspan="2">
+        <widget class="QLabel" name="label_encrypt">
+         <property name="text">
+          <string>Protects the private files this app keeps on disk (your shielded transaction history and address labels) so a stolen laptop or backup can't read them. You set a password the next time you open ZclWallet. There is no recovery — if you forget it you can only erase that data and start fresh. Your coins are safe either way.</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
        <item row="3" column="0">
         <widget class="QCheckBox" name="chkCustomFees">
          <property name="text">
@@ -243,14 +260,14 @@
          </property>
         </widget>
        </item>
-       <item row="15" column="0" colspan="2">
+       <item row="17" column="0" colspan="2">
         <widget class="Line" name="line_2">
          <property name="orientation">
           <enum>Qt::Horizontal</enum>
          </property>
         </widget>
        </item>
-       <item row="16" column="0" colspan="2">
+       <item row="18" column="0" colspan="2">
         <spacer name="verticalSpacer_2">
          <property name="orientation">
           <enum>Qt::Vertical</enum>

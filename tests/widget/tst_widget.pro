@@ -55,6 +55,7 @@ SOURCES += \
     ../../src/3rdparty/qrcode/QrCode.cpp \
     ../../src/3rdparty/qrcode/QrSegment.cpp \
     ../../src/settings.cpp \
+    ../../src/securestore.cpp \
     ../../src/sendtab.cpp \
     ../../src/senttxstore.cpp \
     ../../src/txtablemodel.cpp \

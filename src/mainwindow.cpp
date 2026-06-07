@@ -44,7 +44,12 @@ MainWindow::MainWindow(QWidget *parent) :
     ui(new Ui::MainWindow)
 {
     ui->setupUi(this);
-    logger = new Logger(this, QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath("zcl-qt-wallet.log"));
+    // OPSEC: the debug log is plaintext on disk, so it's OFF by default. Power users can opt in
+    // (Settings) when they need diagnostics; an empty filename makes Logger a no-op sink.
+    QString logFile = Settings::getInstance()->getSaveDebugLog()
+        ? QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath("zcl-qt-wallet.log")
+        : QString();
+    logger = new Logger(this, logFile);
 
     // SELF-HEAL: a heal/inProgress flag seen at PROCESS STARTUP is necessarily stale —
     // it's a persisted QSettings flag that a prior session set just before a deferred
@@ -1906,6 +1911,9 @@ void MainWindow::setupSettingsModal() {
         // Save sent transactions
         settings.chkSaveTxs->setChecked(Settings::getInstance()->getSaveZtxs());
 
+        // Encrypt wallet data at rest (opt-in, default OFF). Applied on the next launch.
+        settings.chkEncryptData->setChecked(Settings::getInstance()->getEncryptAtRest());
+
         // Keep running in the background (tray-resident). Disable + explain when
         // there is no system tray available so the user isn't offered a no-op.
         settings.chkKeepInTray->setChecked(Settings::getInstance()->getKeepInTray());
@@ -2007,6 +2015,23 @@ void MainWindow::setupSettingsModal() {
 
             // Auto shield
             Settings::getInstance()->setAutoShield(settings.chkAutoShield->isChecked());
+
+            // Encrypt wallet data at rest (opt-in). The master password is set/unlocked at the
+            // next launch, so a change only takes effect then; say so plainly.
+            bool wasEncrypt = Settings::getInstance()->getEncryptAtRest();
+            bool encrypt    = settings.chkEncryptData->isChecked();
+            if (encrypt != wasEncrypt) {
+                Settings::getInstance()->setEncryptAtRest(encrypt);
+                QMessageBox::information(this, tr("Encrypt wallet data"),
+                    encrypt
+                      ? tr("Encryption will be set up the next time you open ZclWallet — you'll "
+                           "choose a password then. There is no recovery if you forget it (your "
+                           "coins are safe regardless).")
+                      : tr("Wallet-data encryption will be turned off the next time you open "
+                           "ZclWallet. Any existing encrypted data stays on disk; re-enable this "
+                           "to read it again."),
+                    QMessageBox::Ok);
+            }
 
             // Keep running in the background (tray-resident). Apply immediately
             // so the change takes effect this session, no restart needed.

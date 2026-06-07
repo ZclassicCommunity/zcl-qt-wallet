@@ -56,6 +56,7 @@ SOURCES += \
     ../src/addresscombo.cpp \
     ../src/privacybadgedelegate.cpp \
     shim/addressbook_stub.cpp \
+    shim/securestore_stub.cpp \
     tst_logic.cpp
 
 # Static-Qt offscreen platform plugin import (no X server in the chroot).

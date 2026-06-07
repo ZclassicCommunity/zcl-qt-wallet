@@ -291,6 +291,27 @@ void Settings::setSaveZtxs(bool save) {
     QSettings().setValue("options/savesenttx", save);
 }
 
+bool Settings::getSaveDebugLog() {
+    // OPSEC: the debug log is plaintext on disk, so default OFF. Opt-in for diagnostics.
+    return QSettings().value("options/savedebuglog", false).toBool();
+}
+
+void Settings::setSaveDebugLog(bool save) {
+    QSettings().setValue("options/savedebuglog", save);
+}
+
+bool Settings::getEncryptAtRest() {
+    // OPSEC (opt-in): encrypt the sensitive files the GUI writes (shielded send history,
+    // address labels, turnstile plan) with a master password. DEFAULT OFF — when off, those
+    // files are written owner-only (0600) plaintext exactly as before, with no password prompt
+    // and no startup cost. When on, the password is set/unlocked at the next launch.
+    return QSettings().value("options/encryptdata", false).toBool();
+}
+
+void Settings::setEncryptAtRest(bool enable) {
+    QSettings().setValue("options/encryptdata", enable);
+}
+
 bool Settings::getKeepInTray() {
     // Default ON: closing the window keeps the node warm in the tray so RE-OPENING
     // is instant (attaches to the already-loaded daemon) instead of paying the

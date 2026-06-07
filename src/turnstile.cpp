@@ -3,6 +3,7 @@
 #include "balancestablemodel.h"
 #include "rpc.h"
 #include "settings.h"
+#include "securestore.h"
 
 using json = nlohmann::json;
 
@@ -19,22 +20,13 @@ void printPlan(QList<TurnstileMigrationItem> plan) {
     }
 }
 
-QString Turnstile::writeableFile() {
-    auto filename = QStringLiteral("turnstilemigrationplan.dat");
-
-    auto dir = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation));
-    if (!dir.exists())
-        QDir().mkpath(dir.absolutePath());
-
-    if (Settings::getInstance()->isTestnet()) {
-        return dir.filePath("testnet-" % filename);
-    } else {
-        return dir.filePath(filename);
-    }
-}
+// The z→t→z migration plan reveals address linkage — OPSEC-sensitive. SecureStore owns the
+// path/testnet-prefix/atomic-0600 write and, when the user opted into encryption, the
+// encryption + transparent migration. The caller passes only the logical store name.
+static const QString kStore = QStringLiteral("turnstilemigrationplan");
 
 void Turnstile::removeFile() {
-    QFile(writeableFile()).remove();
+    SecureStore::getInstance()->removeStore(kStore);
 }
 
 // Data stream write/read methods for migration items
@@ -53,24 +45,24 @@ void Turnstile::writeMigrationPlan(QList<TurnstileMigrationItem> plan) {
     //qDebug() << QString("Writing plan");
     printPlan(plan);
 
-    QFile file(writeableFile());
-    file.open(QIODevice::ReadWrite | QIODevice::Truncate);
-    QDataStream out(&file);   // we will serialize the data into the file
-    out << plan;
-    file.close();
+    QByteArray bytes;
+    {
+        QDataStream out(&bytes, QIODevice::WriteOnly);
+        out << plan;
+    }
+    if (!SecureStore::getInstance()->saveStore(kStore, bytes))
+        qDebug() << "Turnstile: write FAILED — migration plan not saved.";
 }
 
 QList<TurnstileMigrationItem> Turnstile::readMigrationPlan() {
-    QFile file(writeableFile());
-    
     QList<TurnstileMigrationItem> plan;
-    if (!file.exists()) return plan;
 
-    file.open(QIODevice::ReadOnly);
-    QDataStream in(&file);    // read the data serialized from the file
-    in >> plan; 
+    bool ok = true;
+    QByteArray bytes = SecureStore::getInstance()->loadStore(kStore, ok);
+    if (!ok || bytes.isEmpty()) return plan;
 
-    file.close();
+    QDataStream in(&bytes, QIODevice::ReadOnly);
+    in >> plan;
 
     // Sort to see when the next step is.
     std::sort(plan.begin(), plan.end(), [&] (auto a, auto b) {

@@ -2,6 +2,7 @@
 #include "ui_addressbook.h"
 #include "ui_mainwindow.h"
 #include "settings.h"
+#include "securestore.h"
 #include "mainwindow.h"
 #include "rpc.h"
 
@@ -241,42 +242,31 @@ AddressBook::AddressBook() {
     readFromStorage();
 }
 
-void AddressBook::readFromStorage() {
-    QFile file(AddressBook::writeableFile());
+// Address labels link real-world identities to addresses — OPSEC-sensitive. SecureStore owns
+// the path/testnet-prefix/atomic-0600 write and, when the user opted into encryption, the
+// encryption + transparent migration. The caller passes only the logical store name.
+static const QString kStore = QStringLiteral("addresslabels");
 
-    if (!file.exists()) {
-        return;
-    }
+void AddressBook::readFromStorage() {
+    bool ok = true;
+    QByteArray bytes = SecureStore::getInstance()->loadStore(kStore, ok);
+    if (!ok || bytes.isEmpty())
+        return;   // unreadable (corrupt) or absent -> keep whatever is in memory
 
     allLabels.clear();
-    file.open(QIODevice::ReadOnly);
-    QDataStream in(&file);    // read the data serialized from the file
+    QDataStream in(&bytes, QIODevice::ReadOnly);
     QString version;
-    in >> version >> allLabels; 
-
-    file.close();
+    in >> version >> allLabels;
 }
 
 void AddressBook::writeToStorage() {
-    QFile file(AddressBook::writeableFile());
-    file.open(QIODevice::ReadWrite | QIODevice::Truncate);
-    QDataStream out(&file);   // we will serialize the data into the file
-    out << QString("v1") << allLabels;
-    file.close();
-}
-
-QString AddressBook::writeableFile() {
-    auto filename = QStringLiteral("addresslabels.dat");
-
-    auto dir = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation));
-    if (!dir.exists())
-        QDir().mkpath(dir.absolutePath());
-
-    if (Settings::getInstance()->isTestnet()) {
-        return dir.filePath("testnet-" % filename);
-    } else {
-        return dir.filePath(filename);
+    QByteArray bytes;
+    {
+        QDataStream out(&bytes, QIODevice::WriteOnly);
+        out << QString("v1") << allLabels;
     }
+    if (!SecureStore::getInstance()->saveStore(kStore, bytes))
+        qDebug() << "AddressBook: write FAILED — address labels were not saved.";
 }
 
 

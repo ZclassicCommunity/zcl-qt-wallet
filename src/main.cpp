@@ -4,6 +4,7 @@
 #include "mainwindow.h"
 #include "rpc.h"
 #include "settings.h"
+#include "securestore.h"
 #include "turnstile.h"
 #include "notifyserver.h"   // NOTIFY-SRV connector mode (--notify)
 #include "guistartup.h"     // [gui-startup] client-side startup timing milestones
@@ -327,6 +328,23 @@ public:
                 QObject::tr("A required security library (libsodium) failed to "
                             "initialize. Please reinstall ZclWallet."));
             return 1;
+        }
+
+        // OPSEC (opt-in): when the user has enabled "Encrypt wallet data at rest" (Settings,
+        // default OFF), unlock or first-run set up the master-password store BEFORE any window or
+        // store touches disk, so transaction history, address labels and the turnstile plan are
+        // never written in the clear. If an opted-in user declines (cancel/quit), refuse to start
+        // rather than fall back to plaintext. We SKIP the gate entirely when:
+        //   • the user hasn't opted in (default) — stores stay owner-only (0600) plaintext, exactly
+        //     as before: no password, no startup cost, no lock-out risk;
+        //   • running --headless (no operator to type a password); or
+        //   • under the offscreen E2E / automation seam (ZQW_NO_SECURESTORE) — so headless tests
+        //     never block on a modal gate.
+        if (Settings::getInstance()->getEncryptAtRest()
+                && !parser.isSet(headlessOption)
+                && !qEnvironmentVariableIsSet("ZQW_NO_SECURESTORE")) {
+            if (!SecureStore::getInstance()->bootstrap(nullptr))
+                return 0;
         }
 
         // Check for embedded option
