@@ -55,7 +55,6 @@ public:
     static double       minMigrationAmount;
 private:
     QList<int>          getBlockNumbers(int start, int end, int count);
-    QString             writeableFile();
 
     void                doSendTx(Tx tx, std::function<void(void)> cb);
 

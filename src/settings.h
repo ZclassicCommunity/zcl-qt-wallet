@@ -62,6 +62,11 @@ public:
     bool    getSaveDebugLog();
     void    setSaveDebugLog(bool save);
 
+    // OPSEC opt-in (default OFF): encrypt the GUI's sensitive at-rest files behind a master
+    // password. Off => owner-only (0600) plaintext as before, no prompt, no startup cost.
+    bool    getEncryptAtRest();
+    void    setEncryptAtRest(bool enable);
+
     // Opt-in: keep ZclWallet (and its embedded node) running in the system tray
     // when the window is closed, so the next launch is instant instead of paying
     // the ~1-minute node warmup again. Default OFF -> behaves exactly as before.

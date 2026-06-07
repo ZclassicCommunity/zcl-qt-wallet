@@ -242,12 +242,16 @@ AddressBook::AddressBook() {
     readFromStorage();
 }
 
+// Address labels link real-world identities to addresses — OPSEC-sensitive. SecureStore owns
+// the path/testnet-prefix/atomic-0600 write and, when the user opted into encryption, the
+// encryption + transparent migration. The caller passes only the logical store name.
+static const QString kStore = QStringLiteral("addresslabels");
+
 void AddressBook::readFromStorage() {
-    // Address labels link real-world identities to addresses — encrypted at rest. Transparently
-    // migrate a legacy plaintext addresslabels.dat to the encrypted .enc on first read.
-    QByteArray bytes = SecureStore::getInstance()->migrateIfNeeded(legacyFile(), writeableFile());
-    if (bytes.isEmpty())
-        return;
+    bool ok = true;
+    QByteArray bytes = SecureStore::getInstance()->loadStore(kStore, ok);
+    if (!ok || bytes.isEmpty())
+        return;   // unreadable (corrupt) or absent -> keep whatever is in memory
 
     allLabels.clear();
     QDataStream in(&bytes, QIODevice::ReadOnly);
@@ -261,23 +265,8 @@ void AddressBook::writeToStorage() {
         QDataStream out(&bytes, QIODevice::WriteOnly);
         out << QString("v1") << allLabels;
     }
-    SecureStore::getInstance()->writeFile(writeableFile(), bytes);
-}
-
-static QString addrBookPath(const QString& filename) {
-    auto dir = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation));
-    if (!dir.exists())
-        QDir().mkpath(dir.absolutePath());
-    return Settings::getInstance()->isTestnet() ? dir.filePath("testnet-" % filename)
-                                                : dir.filePath(filename);
-}
-
-QString AddressBook::writeableFile() {
-    return addrBookPath(QStringLiteral("addresslabels.enc"));
-}
-
-QString AddressBook::legacyFile() {
-    return addrBookPath(QStringLiteral("addresslabels.dat"));
+    if (!SecureStore::getInstance()->saveStore(kStore, bytes))
+        qDebug() << "AddressBook: write FAILED — address labels were not saved.";
 }
 
 

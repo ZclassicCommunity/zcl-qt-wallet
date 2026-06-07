@@ -20,25 +20,13 @@ void printPlan(QList<TurnstileMigrationItem> plan) {
     }
 }
 
-static QString turnstilePath(const QString& filename) {
-    auto dir = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation));
-    if (!dir.exists())
-        QDir().mkpath(dir.absolutePath());
-    return Settings::getInstance()->isTestnet() ? dir.filePath("testnet-" % filename)
-                                                : dir.filePath(filename);
-}
-
-QString Turnstile::writeableFile() {
-    return turnstilePath(QStringLiteral("turnstilemigrationplan.enc"));
-}
-
-static QString turnstileLegacyFile() {
-    return turnstilePath(QStringLiteral("turnstilemigrationplan.dat"));
-}
+// The z→t→z migration plan reveals address linkage — OPSEC-sensitive. SecureStore owns the
+// path/testnet-prefix/atomic-0600 write and, when the user opted into encryption, the
+// encryption + transparent migration. The caller passes only the logical store name.
+static const QString kStore = QStringLiteral("turnstilemigrationplan");
 
 void Turnstile::removeFile() {
-    QFile::remove(writeableFile());
-    QFile::remove(turnstileLegacyFile());
+    SecureStore::getInstance()->removeStore(kStore);
 }
 
 // Data stream write/read methods for migration items
@@ -57,21 +45,21 @@ void Turnstile::writeMigrationPlan(QList<TurnstileMigrationItem> plan) {
     //qDebug() << QString("Writing plan");
     printPlan(plan);
 
-    // The migration plan reveals z→t→z linkage — encrypted at rest.
     QByteArray bytes;
     {
         QDataStream out(&bytes, QIODevice::WriteOnly);
         out << plan;
     }
-    SecureStore::getInstance()->writeFile(writeableFile(), bytes);
+    if (!SecureStore::getInstance()->saveStore(kStore, bytes))
+        qDebug() << "Turnstile: write FAILED — migration plan not saved.";
 }
 
 QList<TurnstileMigrationItem> Turnstile::readMigrationPlan() {
     QList<TurnstileMigrationItem> plan;
 
-    // Read the encrypted plan; migrate a legacy plaintext .dat on first read.
-    QByteArray bytes = SecureStore::getInstance()->migrateIfNeeded(turnstileLegacyFile(), writeableFile());
-    if (bytes.isEmpty()) return plan;
+    bool ok = true;
+    QByteArray bytes = SecureStore::getInstance()->loadStore(kStore, ok);
+    if (!ok || bytes.isEmpty()) return plan;
 
     QDataStream in(&bytes, QIODevice::ReadOnly);
     in >> plan;

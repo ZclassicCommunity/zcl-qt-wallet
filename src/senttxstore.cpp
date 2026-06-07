@@ -2,43 +2,26 @@
 #include "settings.h"
 #include "securestore.h"
 
-// Helper: build a path in the app data dir, with the testnet- prefix when needed.
-static QString sentTxPath(const QString& filename) {
-    auto dir = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation));
-    if (!dir.exists())
-        QDir().mkpath(dir.absolutePath());
-    return Settings::getInstance()->isTestnet() ? dir.filePath("testnet-" % filename)
-                                                : dir.filePath(filename);
-}
+// The shielded send history (recipient z-addresses + amounts for sends the daemon can't even
+// see) is the most OPSEC-sensitive file the GUI keeps. SecureStore owns the path, the testnet-
+// prefix, the atomic owner-only (0600) write, and — when the user has opted into encryption —
+// the encryption + transparent migration. The logical store name is all the caller passes.
+static const QString kStore = QStringLiteral("senttxstore");
 
-/// The encrypted store (current format). Sent z-tx history is OPSEC-sensitive (recipient
-/// addresses + amounts for shielded sends the daemon can't even see), so it is encrypted at rest
-/// via SecureStore — written atomically, owner-only (0600).
-QString SentTxStore::writeableFile() {
-    return sentTxPath(QStringLiteral("senttxstore.enc"));
-}
-
-// The legacy plaintext file, migrated to .enc on first read.
-static QString legacyFile() {
-    return sentTxPath(QStringLiteral("senttxstore.dat"));
-}
-
-// delete the sent history.
+// delete the sent history (both plaintext and encrypted forms).
 void SentTxStore::deleteHistory() {
-    QFile::remove(writeableFile());
-    QFile::remove(legacyFile());
+    SecureStore::getInstance()->removeStore(kStore);
 }
 
 QList<TransactionItem> SentTxStore::readSentTxFile() {
-    // Reads the encrypted store; transparently migrates a legacy plaintext senttxstore.dat.
-    QByteArray bytes = SecureStore::getInstance()->migrateIfNeeded(legacyFile(), writeableFile());
-    if (bytes.isEmpty())
-        return QList<TransactionItem>();
+    bool ok = true;
+    QByteArray bytes = SecureStore::getInstance()->loadStore(kStore, ok);
+    if (!ok || bytes.isEmpty())
+        return QList<TransactionItem>();   // unreadable (corrupt) or absent -> show nothing
 
     QJsonDocument jsonDoc = QJsonDocument::fromJson(bytes);
 
     QList<TransactionItem> items;
-
     for (auto i : jsonDoc.array()) {
         auto sentTx = i.toObject();
         TransactionItem t{"send", (qint64)sentTx["datetime"].toVariant().toLongLong(),
@@ -62,10 +45,16 @@ void SentTxStore::addToSentTx(Tx tx, QString txid) {
     if (!tx.fromAddr.startsWith("z"))
         return;
 
-    // Load the existing (encrypted) history, migrating any legacy plaintext first.
-    QByteArray existing = SecureStore::getInstance()->migrateIfNeeded(legacyFile(), writeableFile());
+    // Load the existing history. If it exists but can't be read (corrupt encrypted file), DO NOT
+    // overwrite it — that would permanently destroy the only record of past shielded sends.
+    bool ok = true;
+    QByteArray existing = SecureStore::getInstance()->loadStore(kStore, ok);
+    if (!ok) {
+        qDebug() << "SentTxStore: existing history is unreadable; refusing to overwrite it.";
+        return;
+    }
     QJsonDocument jsonDoc = existing.isEmpty() ? QJsonDocument(QJsonArray())
-                                               : QJsonDocument::fromJson(existing);
+                                              : QJsonDocument::fromJson(existing);
 
     // Calculate total amount in this tx
     double totalAmount = 0;
@@ -96,6 +85,8 @@ void SentTxStore::addToSentTx(Tx tx, QString txid) {
 
     jsonDoc.setArray(list);
 
-    // Encrypted, atomic, owner-only write via SecureStore.
-    SecureStore::getInstance()->writeFile(writeableFile(), jsonDoc.toJson());
+    // Atomic, owner-only (0600) write — encrypted iff the user opted in. A failed write must not
+    // pass silently: this is the only record of the send.
+    if (!SecureStore::getInstance()->saveStore(kStore, jsonDoc.toJson()))
+        qDebug() << "SentTxStore: write FAILED — this send was not recorded to local history.";
 }

@@ -58,6 +58,7 @@
 #include <QColor>
 #include <QStyle>
 #include <memory>
+#include "securestore.h"   // OPSEC regression test exercises the REAL SecureStore (libsodium)
 
 #include <QLocalSocket>
 #include <QSignalSpy>
@@ -2044,6 +2045,56 @@ private slots:
         }
         settleAndDelete(w);
         S->setHeadless(savedHeadless);
+    }
+
+    // ---- OPSEC regression: SecureStore must NEVER overwrite an existing encrypted store it
+    // cannot decrypt (corruption) — that would destroy the only record of z->z sends — and a
+    // round-trip must reproduce the bytes. This is the regression guard for the corrupt-.enc
+    // no-clobber chokepoint in SecureStore::saveStore(). Exercises the REAL securestore.cpp
+    // (libsodium) this target links. Declared LAST so it cannot leave the SecureStore singleton
+    // unlocked for an earlier test; it re-locks + purges the sandbox on the way out.
+    void opsec_noClobberAndRoundTrip() {
+        Settings::getInstance()->setTestnet(false);
+        auto* ss = SecureStore::getInstance();
+        ss->purgeAllData();                       // clean any prior verifier/state in the sandbox
+        QVERIFY2(ss->createMaster(SecureStore::SecretPassword, "correct horse battery", QString()),
+                 "createMaster (Argon2id MODERATE) should succeed and unlock");
+        QVERIFY(ss->isUnlocked());
+
+        const QString base = QStringLiteral("opsec_rt");
+        const QByteArray A = QByteArrayLiteral("[{\"txid\":\"aaa\",\"amount\":1.5}]");
+        QVERIFY2(ss->saveStore(base, A), "first encrypted save should succeed");
+
+        bool ok = false;
+        QByteArray got = ss->loadStore(base, ok);
+        QVERIFY2(ok, "load of a good .enc must report ok=true");
+        QCOMPARE(got, A);                          // round-trip reproduces the plaintext
+
+        const QString enc = QDir(SecureStore::dataDir()).filePath(base + ".enc");
+        QVERIFY(QFile::exists(enc));
+        QByteArray blob;
+        { QFile f(enc); QVERIFY(f.open(QIODevice::ReadOnly)); blob = f.readAll(); }
+        QVERIFY(blob.size() > 0);
+        blob[blob.size() - 1] = static_cast<char>(blob.at(blob.size() - 1) ^ 0xFF);  // corrupt the tag
+        { QFile f(enc); QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate)); f.write(blob); }
+        const QByteArray corrupt = blob;           // snapshot to prove it is left intact
+
+        // loadStore on a corrupt .enc must report a HARD error (ok=false), never empty-as-"no data".
+        ok = true;
+        QByteArray got2 = ss->loadStore(base, ok);
+        QVERIFY2(!ok, "load of an undecryptable .enc must set ok=false (the no-clobber signal)");
+        QVERIFY(got2.isEmpty());
+
+        // The chokepoint: saveStore must REFUSE to overwrite the undecryptable .enc...
+        const QByteArray B = QByteArrayLiteral("[{\"txid\":\"bbb\",\"amount\":9.9}]");
+        QVERIFY2(!ss->saveStore(base, B), "saveStore must refuse to clobber an undecryptable .enc");
+        // ...and the ciphertext on disk must be byte-identical (recoverable, not destroyed).
+        QByteArray after;
+        { QFile f(enc); QVERIFY(f.open(QIODevice::ReadOnly)); after = f.readAll(); }
+        QCOMPARE(after, corrupt);
+
+        ss->purgeAllData();                        // leave the singleton locked + the sandbox clean
+        QVERIFY(!ss->isUnlocked());
     }
 #endif
 
