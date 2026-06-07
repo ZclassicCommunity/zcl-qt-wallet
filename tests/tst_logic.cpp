@@ -511,7 +511,8 @@ void TestLogic::sentTxStore_perms_and_testnetName() {
     SentTxStore::addToSentTx(tx, "deadbeefcafetxid");
 
     // The file must exist under a "testnet-"-prefixed name in AppDataLocation.
-    QString expected = QDir(sandboxAppData()).filePath("testnet-senttxstore.dat");
+    // (Now the encrypted store: senttxstore.enc, written 0600 via SecureStore.)
+    QString expected = QDir(sandboxAppData()).filePath("testnet-senttxstore.enc");
     QVERIFY2(QFile::exists(expected), qPrintable("missing: " + expected));
 
     // Permissions must be owner-read + owner-write only (0600), no group/other.
@@ -533,7 +534,7 @@ void TestLogic::sentTxStore_perms_and_testnetName() {
 // =====================================================================
 void TestLogic::sentTxStore_gating() {
     Settings::getInstance()->setTestnet(false);
-    QString file = QDir(sandboxAppData()).filePath("senttxstore.dat");
+    QString file = QDir(sandboxAppData()).filePath("senttxstore.enc");
 
     auto mkTx = [](const QString& from) {
         Tx tx; tx.fromAddr = from; tx.fee = 0.0001;

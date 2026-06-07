@@ -2,6 +2,7 @@
 #include "ui_addressbook.h"
 #include "ui_mainwindow.h"
 #include "settings.h"
+#include "securestore.h"
 #include "mainwindow.h"
 #include "rpc.h"
 
@@ -242,41 +243,41 @@ AddressBook::AddressBook() {
 }
 
 void AddressBook::readFromStorage() {
-    QFile file(AddressBook::writeableFile());
-
-    if (!file.exists()) {
+    // Address labels link real-world identities to addresses — encrypted at rest. Transparently
+    // migrate a legacy plaintext addresslabels.dat to the encrypted .enc on first read.
+    QByteArray bytes = SecureStore::getInstance()->migrateIfNeeded(legacyFile(), writeableFile());
+    if (bytes.isEmpty())
         return;
-    }
 
     allLabels.clear();
-    file.open(QIODevice::ReadOnly);
-    QDataStream in(&file);    // read the data serialized from the file
+    QDataStream in(&bytes, QIODevice::ReadOnly);
     QString version;
-    in >> version >> allLabels; 
-
-    file.close();
+    in >> version >> allLabels;
 }
 
 void AddressBook::writeToStorage() {
-    QFile file(AddressBook::writeableFile());
-    file.open(QIODevice::ReadWrite | QIODevice::Truncate);
-    QDataStream out(&file);   // we will serialize the data into the file
-    out << QString("v1") << allLabels;
-    file.close();
+    QByteArray bytes;
+    {
+        QDataStream out(&bytes, QIODevice::WriteOnly);
+        out << QString("v1") << allLabels;
+    }
+    SecureStore::getInstance()->writeFile(writeableFile(), bytes);
 }
 
-QString AddressBook::writeableFile() {
-    auto filename = QStringLiteral("addresslabels.dat");
-
+static QString addrBookPath(const QString& filename) {
     auto dir = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation));
     if (!dir.exists())
         QDir().mkpath(dir.absolutePath());
+    return Settings::getInstance()->isTestnet() ? dir.filePath("testnet-" % filename)
+                                                : dir.filePath(filename);
+}
 
-    if (Settings::getInstance()->isTestnet()) {
-        return dir.filePath("testnet-" % filename);
-    } else {
-        return dir.filePath(filename);
-    }
+QString AddressBook::writeableFile() {
+    return addrBookPath(QStringLiteral("addresslabels.enc"));
+}
+
+QString AddressBook::legacyFile() {
+    return addrBookPath(QStringLiteral("addresslabels.dat"));
 }
 
 

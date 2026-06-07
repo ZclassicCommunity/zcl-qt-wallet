@@ -59,6 +59,7 @@ private:
     void writeToStorage();
 
     QString writeableFile();
+    QString legacyFile();
     QList<QPair<QString, QString>> allLabels;
 
     static AddressBook* instance;

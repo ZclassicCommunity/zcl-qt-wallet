@@ -50,6 +50,7 @@ SOURCES += \
     src/3rdparty/qrcode/QrCode.cpp \
     src/3rdparty/qrcode/QrSegment.cpp \
     src/settings.cpp \
+    src/securestore.cpp \
     src/sendtab.cpp \
     src/senttxstore.cpp \
     src/txtablemodel.cpp \
@@ -76,6 +77,7 @@ HEADERS += \
     src/3rdparty/qrcode/QrSegment.hpp \
     src/3rdparty/json/json.hpp \
     src/settings.h \
+    src/securestore.h \
     src/txtablemodel.h \
     src/senttxstore.h \
     src/turnstile.h \

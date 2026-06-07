@@ -4,6 +4,7 @@
 #include "mainwindow.h"
 #include "rpc.h"
 #include "settings.h"
+#include "securestore.h"
 #include "turnstile.h"
 #include "notifyserver.h"   // NOTIFY-SRV connector mode (--notify)
 #include "guistartup.h"     // [gui-startup] client-side startup timing milestones
@@ -327,6 +328,14 @@ public:
                 QObject::tr("A required security library (libsodium) failed to "
                             "initialize. Please reinstall ZclWallet."));
             return 1;
+        }
+
+        // OPSEC: unlock (or first-run set up) the master-password-encrypted data store BEFORE any
+        // window or store reads/writes a file, so transaction history, address labels and the
+        // turnstile plan are never written in the clear. If the user declines (cancel/quit),
+        // refuse to start rather than fall back to plaintext.
+        if (!SecureStore::getInstance()->bootstrap(nullptr)) {
+            return 0;
         }
 
         // Check for embedded option
