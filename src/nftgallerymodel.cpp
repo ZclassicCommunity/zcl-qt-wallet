@@ -65,8 +65,10 @@ QVariant NFTGalleryModel::data(const QModelIndex& index, int role) const {
                 else                          state = tr("Checking this image…");
             } else {
                 // No local bytes: it's yours, just not pictured here — a fact, not loading.
-                state = tr("You hold this collectible. Its image isn't on this computer "
-                           "(open it to check it yourself).");
+                // We never auto-fetch the image (privacy hard rule); opening it lets the
+                // user point the wallet at the local file they already hold. Do NOT say
+                // "download" — that invents a fetch the wallet never performs.
+                state = tr("You hold this. Its image isn't on this computer — open it to check your copy.");
             }
             return head + "\n" + state;
         }

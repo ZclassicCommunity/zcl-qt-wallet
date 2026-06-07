@@ -33,17 +33,34 @@ ShieldSendDialog::ShieldSendDialog(RPC* rpc, QWidget* parent)
     outer->setContentsMargins(18, 18, 18, 18);
     outer->setSpacing(12);
 
-    // --- Honesty banner (verbatim §6, load-bearing) -------------------------
+    // --- Honesty banner (load-bearing §6): a plain lead line + a grey caveat block.
+    // The caveat keeps the does-NOT-hide-ownership + stored-forever facts verbatim.
     auto* banner = new QLabel(
-        tr("This makes the file's contents private — it's encrypted so only the person "
-           "you send it to can open it. It does NOT make ownership of an NFT private: who "
-           "holds a token is always public on the ledger. The encrypted file is stored "
-           "permanently and publicly on every node — it can never be deleted, only kept "
-           "unreadable to others."), this);
+        tr("Only this file's contents are encrypted — just the person you send it to "
+           "can open it."), this);
     banner->setObjectName("shieldSendBanner");
     banner->setWordWrap(true);
-    banner->setStyleSheet("color:#9aa0a6;");
     outer->addWidget(banner);
+
+    auto* bannerCaveat = new QLabel(
+        tr("It does NOT hide who owns an NFT — that's always public. The encrypted file "
+           "is stored on every node forever; it can never be deleted, only kept "
+           "unreadable."), this);
+    bannerCaveat->setObjectName("shieldSendBannerCaveat");
+    bannerCaveat->setProperty("hint", true);
+    bannerCaveat->setWordWrap(true);
+    bannerCaveat->setStyleSheet("color:#9aa0a6; font-size:12pt;");
+    outer->addWidget(bannerCaveat);
+
+    // --- Metadata-leak honesty (§6.6) — part of the one honesty block up top.
+    auto* leakNote = new QLabel(
+        tr("Sending a private file is itself visible on the ledger (the encrypted "
+           "contents are not). Private does not mean undetectable."), this);
+    leakNote->setObjectName("shieldSendLeakNote");
+    leakNote->setProperty("hint", true);
+    leakNote->setWordWrap(true);
+    leakNote->setStyleSheet("color:#9aa0a6; font-size:12pt;");
+    outer->addWidget(leakNote);
 
     auto* sep0 = new QFrame(this);
     sep0->setFrameShape(QFrame::HLine);
@@ -67,7 +84,9 @@ ShieldSendDialog::ShieldSendDialog(RPC* rpc, QWidget* parent)
 
     auto* capNote = new QLabel(
         tr("Files must be 40,000 bytes or smaller to fit in one private transfer."), this);
-    capNote->setStyleSheet("color:#9aa0a6; font-size:11px;");
+    capNote->setObjectName("shieldSendCapNote");
+    capNote->setProperty("hint", true);
+    capNote->setStyleSheet("color:#9aa0a6; font-size:12pt;");
     capNote->setWordWrap(true);
     outer->addWidget(capNote);
 
@@ -104,20 +123,6 @@ ShieldSendDialog::ShieldSendDialog(RPC* rpc, QWidget* parent)
     m_toStatus->setWordWrap(true);
     m_toStatus->setMinimumHeight(18);   // reserved height so layout never jumps
     outer->addWidget(m_toStatus);
-
-    auto* changeNote = new QLabel(
-        tr("Any change returns to your sending address, shielded."), this);
-    changeNote->setStyleSheet("color:#9aa0a6; font-size:11px;");
-    outer->addWidget(changeNote);
-
-    // --- Metadata-leak honesty (§6.6) ---------------------------------------
-    auto* leakNote = new QLabel(
-        tr("Sending a private file is itself visible on the ledger (the encrypted "
-           "contents are not). Private does not mean undetectable."), this);
-    leakNote->setObjectName("shieldSendLeakNote");
-    leakNote->setWordWrap(true);
-    leakNote->setStyleSheet("color:#9aa0a6; font-size:11px;");
-    outer->addWidget(leakNote);
 
     // --- Mandatory permanence consent (§6.3 / daemon acknowledge_permanent) --
     m_consent = new QCheckBox(
@@ -178,8 +183,7 @@ void ShieldSendDialog::beginPick(const QString& path) {
     if (bytes.size() > nftdc::ZDC_MAX_FILE_BYTES) {
         m_hexData.clear(); m_fileBytes = 0; m_fileName.clear(); m_filePath.clear();
         m_fileLine->setText(
-            tr("This file is too large to send privately in one transfer "
-               "(%1 bytes; the limit is 40,000 bytes).").arg(bytes.size()));
+            tr("Too large: %1 bytes. The limit is 40,000.").arg(bytes.size()));
         m_fileLine->setStyleSheet("color:#c0392b;");
         refreshSendEnabled();
         return;
@@ -197,7 +201,7 @@ void ShieldSendDialog::beginPick(const QString& path) {
     m_hexData  = QString::fromLatin1(bytes.toHex());   // lowercase hex, binary-safe
     m_fileBytes = bytes.size();
     m_fileLine->setText(tr("%1 — %2 bytes").arg(m_fileName).arg(m_fileBytes));
-    m_fileLine->setStyleSheet("color:#2a9d2a;");
+    m_fileLine->setStyleSheet("color:#34c759;");
     refreshSendEnabled();
 }
 
@@ -210,7 +214,7 @@ void ShieldSendDialog::onRecipientChanged(const QString& text) {
         m_toStatus->setStyleSheet("color:#c0392b;");
     } else if (Settings::getInstance()->isSaplingAddress(addr)) {
         m_toStatus->setText(tr("Looks good — a Sapling (zs…) address."));
-        m_toStatus->setStyleSheet("color:#2a9d2a;");
+        m_toStatus->setStyleSheet("color:#34c759;");
     } else {
         // A t-addr or a Sprout z-addr: the data-channel is Sapling-only.
         m_toStatus->setText(
@@ -272,7 +276,7 @@ void ShieldSendDialog::onSendClicked() {
             self->m_succeeded = true;
             self->m_resultLine->setText(
                 tr("Sent. The encrypted file is on its way — confirming on-chain."));
-            self->m_resultLine->setStyleSheet("color:#2a9d2a;");
+            self->m_resultLine->setStyleSheet("color:#34c759;");
             self->m_toEdit->setEnabled(false);
             self->m_consent->setEnabled(false);
 
@@ -320,8 +324,9 @@ void ShieldSendDialog::onSendClicked() {
                     tr("Anyone with this key and fingerprint can open and verify this "
                        "file — share it only with people you want to read it."), self);
                 keyWarn->setObjectName("shieldSendKeyWarn");
+                keyWarn->setProperty("hint", true);
                 keyWarn->setWordWrap(true);
-                keyWarn->setStyleSheet("color:#d9822b; font-size:11px;");
+                keyWarn->setStyleSheet("color:#d9822b; font-size:12pt;");
                 layout->insertWidget(layout->count() - 1, keyWarn);
             }
 

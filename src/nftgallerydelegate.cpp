@@ -63,14 +63,6 @@ QColor NFTGalleryDelegate::verifyColor(int verifyState) {
     }
 }
 
-QString NFTGalleryDelegate::privacyLabel(bool isPrivate) {
-    return isPrivate ? QStringLiteral("Private") : QStringLiteral("Public");
-}
-
-QColor NFTGalleryDelegate::privacyColor(bool isPrivate) {
-    return isPrivate ? kGreen : kAmber;
-}
-
 const QPixmap& NFTGalleryDelegate::tintedIcon(const QString& resource,
                                               const QColor& color, int px) const {
     const QString key = resource + "|" + color.name() + "|" + QString::number(px);

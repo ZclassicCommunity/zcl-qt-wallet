@@ -82,7 +82,7 @@ NFTBuyDialog::NFTBuyDialog(ContentEngine* engine, RPC* rpc, QWidget* parent)
 
     m_nameLbl = new QLabel(this);
     m_nameLbl->setObjectName("nftBuyName");
-    m_nameLbl->setStyleSheet("font-size:15px; font-weight:700;");
+    m_nameLbl->setStyleSheet("font-size:13pt; font-weight:700;");
     m_nameLbl->setWordWrap(true);
 
     m_priceLbl = new QLabel(this);
@@ -117,7 +117,7 @@ NFTBuyDialog::NFTBuyDialog(ContentEngine* engine, RPC* rpc, QWidget* parent)
     outer->addWidget(m_publicNote);
 
     m_ackBox = new QCheckBox(
-        tr("I understand any small overpayment becomes a network fee."), this);
+        tr("I understand any extra I pay goes to the network, not the seller."), this);
     m_ackBox->setObjectName("nftBuyAcknowledge");
     outer->addWidget(m_ackBox);
 
@@ -169,7 +169,7 @@ void NFTBuyDialog::resetVerifyGate() {
 
 void NFTBuyDialog::onOpenFileClicked() {
     const QString path = QFileDialog::getOpenFileName(
-        this, tr("Open an offer"), QString(), tr("NFT offer (*.znftoffer);;All files (*)"));
+        this, tr("Open an offer"), QString(), tr("Offer file (*.znftoffer);;All files (*)"));
     if (path.isEmpty())
         return;
     QFile f(path);
@@ -210,7 +210,7 @@ void NFTBuyDialog::runVerify() {
     m_verifyBtn->setText(tr("Checking…"));
     resetVerifyGate();
     m_verdictLbl->setText(tr("Checking this offer…"));
-    m_verdictLbl->setStyleSheet("color:#d9822b;");
+    m_verdictLbl->setStyleSheet("color:#9aa0a6;");   // neutral while in progress; amber is the refusal
 
     const QString blobAtRequest = m_offerBlob;
     QPointer<NFTBuyDialog> self(this);
@@ -261,7 +261,7 @@ void NFTBuyDialog::renderVerified() {
     if (vr.ok) {
         // GREEN — only ever rendered on a real ok==true verdict.
         m_verdictLbl->setText(tr("✓ Verified — you will own this if you pay."));
-        m_verdictLbl->setStyleSheet("color:#2a9d2a; font-weight:600;");
+        m_verdictLbl->setStyleSheet("color:#34c759; font-weight:600;");
         m_confirmLine->setText(tr("You pay %1 ZCL (+ a small network fee). You receive "
                                   "this collectible.").arg(Settings::zatToDecimalString(vr.priceZat)));
     } else {
@@ -372,7 +372,7 @@ void NFTBuyDialog::onBuyClicked() {
             if (overshootZat > 0)
                 msg += tr(" Network fee: %1 ZCL.").arg(Settings::zatToDecimalString(overshootZat));
             self->m_resultLine->setText(msg);
-            self->m_resultLine->setStyleSheet("color:#2a9d2a;");
+            self->m_resultLine->setStyleSheet("color:#34c759;");
             self->finishPrimaryAsDone(self->m_buyBtn, self->m_closeBtn);
         },
         [self](QString errStr) {

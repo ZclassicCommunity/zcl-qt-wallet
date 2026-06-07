@@ -906,10 +906,8 @@ static qint64 jsonRpcErrorCode(const json& parsed) {
 // support. HONESTY: name the exact cause + the exact fix. Coin is ZCL, never ZEC.
 QString RPC::nftUnsupportedGuidance() {
     return QObject::tr(
-        "Collectibles need this wallet's built-in node. You're connected to an older "
-        "ZClassic node that doesn't support collectibles yet. Quit any other running "
-        "ZClassic node, then restart this wallet so it uses its built-in node "
-        "(v2.1.2-beta7 or newer), or upgrade your node to v2.1.2-beta7+.");
+        "Collectibles need ZClassic v2.1.2-beta7 or newer. Quit any other ZClassic "
+        "node, then restart this wallet to use its built-in node.");
 }
 
 void RPC::probeNFTCapability() {
@@ -1069,14 +1067,14 @@ static QString zslpCalmError(const QNetworkReply* reply, const json& parsed) {
     }
     // -32601 RPC_METHOD_NOT_FOUND: the attached node has NO NFT RPCs (an OLDER/foreign
     // node, NOT this wallet's embedded one). BUG #1 — NEVER surface the raw "method not
-    // found"; route to the shared honest guidance (quit the other node + restart, or
-    // upgrade). -13 RPC_WALLET_UNLOCK_NEEDED, -6 RPC_WALLET_INSUFFICIENT_FUNDS,
+    // found"; route to the shared honest guidance (quit the other node + restart on
+    // beta7+). -13 RPC_WALLET_UNLOCK_NEEDED, -6 RPC_WALLET_INSUFFICIENT_FUNDS,
     // -1  RPC_MISC_ERROR (the -zslpindex-off throw, GetZSLPStoreOrThrow).
     switch (code) {
         case -32601: return RPC::nftUnsupportedGuidance();
         case -13: return QObject::tr("Your wallet is locked. Unlock it, then try again.");
         case -6:  return QObject::tr("Not enough funds to cover the network fee for this collectible action.");
-        case -1:  return QObject::tr("Collectibles tracking is turned off on your node, so collectibles can't be created or sent right now.");
+        case -1:  return QObject::tr("Collectibles tracking is off. Add \"zslpindex=1\" to your node config, then restart — the wallet catches up once.");
         default:  break;
     }
     if (!msg.isEmpty())
@@ -2906,8 +2904,8 @@ void RPC::checkForUpdate(bool silent) {
                 qDebug() << "Version check: Current " << currentVersion << ", Available " << maxVersion;
 
                 if (maxVersion > currentVersion && !suppressFirstModal && (!silent || maxVersion > maxHiddenVersion)) {
-                    auto ans = QMessageBox::information(main, QObject::tr("Update Available"), 
-                        QObject::tr("A new release v%1 is available! You have v%2.\n\nWould you like to visit the releases page?")
+                    auto ans = QMessageBox::information(main, QObject::tr("Update Available"),
+                        QObject::tr("Update available: v%1 (you have v%2). Open the releases page?")
                             .arg(maxVersion.toString())
                             .arg(currentVersion.toString()),
                         QMessageBox::Yes, QMessageBox::Cancel);

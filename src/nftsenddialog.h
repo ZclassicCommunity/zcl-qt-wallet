@@ -49,7 +49,7 @@ private:
     bool         m_succeeded = false;   // send returned; dialog now shows the confirmation
 
     QLineEdit*   m_recipient = nullptr;
-    QLabel*      m_addrStatus= nullptr;   // live valid/invalid line (green/amber/red)
+    QLabel*      m_addrStatus= nullptr;   // live valid/invalid line (success-green / red)
     QLabel*      m_resultLine= nullptr;   // success/error line (reserved height)
     QPushButton* m_sendBtn   = nullptr;
     QPushButton* m_cancelBtn = nullptr;   // disabled while in flight

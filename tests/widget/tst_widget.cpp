@@ -1921,12 +1921,22 @@ private slots:
                      && line.contains("isn't on this computer", Qt::CaseInsensitive),
                  qPrintable("verify line is not the terminal no-bytes copy: " + line));
 
-        // The Re-check button must be DISABLED in this state (no dead click).
-        QPushButton* recheck = nullptr;
-        for (QPushButton* b : dlg->findChildren<QPushButton*>())
-            if (b->text().contains("Re-check", Qt::CaseInsensitive)) { recheck = b; break; }
-        QVERIFY2(recheck, "detail dialog must have a Re-check button");
-        QVERIFY2(!recheck->isEnabled(), "Re-check must be disabled with no local bytes");
+        // The single state-aware verify button (objectName nftVerifyFileButton, formerly
+        // the Re-check/attach pair). With NO local bytes it must NOT offer a dead "Re-check"
+        // (there is nothing to re-check) — it flips to the actionable "Check my file…" path
+        // (the user picks the local file they hold; nothing is uploaded). This test item
+        // HAS an on-chain fingerprint (it.docHashHex set), so that path is the ONLY route to
+        // a green badge and the button is enabled; a hash-less NFT would disable it instead.
+        auto* verify = dlg->findChild<QPushButton*>("nftVerifyFileButton");
+        QVERIFY2(verify, "detail dialog must expose the verify button by objectName");
+        QVERIFY2(verify->text().contains("Check my file", Qt::CaseInsensitive),
+                 qPrintable("no-bytes verify button must offer 'Check my file…', not a dead "
+                            "re-check: " + verify->text()));
+        QVERIFY2(!verify->text().contains("Re-check", Qt::CaseInsensitive),
+                 qPrintable("no-bytes state must NOT label the button 'Re-check' (nothing to "
+                            "re-check): " + verify->text()));
+        QVERIFY2(verify->isEnabled(),
+                 "with an on-chain fingerprint the user CAN check their local file");
 
         dlg->close();   // WA_DeleteOnClose -> deleted; closing the UAF surface too
     }
@@ -2477,8 +2487,10 @@ private slots:
         auto* note  = dlg->findChild<QLabel*>("nftSellPublicNote");
         QVERIFY(price && buyer && list && note);
 
-        // Honest public-settlement line present.
-        QVERIFY2(note->text().contains("publicly on-chain", Qt::CaseInsensitive)
+        // Honest public-settlement line present: the trade is public and BOTH addresses
+        // (plus the price) are visible on the ledger. New copy: "This trade is public —
+        // the price and both addresses are visible on the ledger."
+        QVERIFY2(note->text().contains("public", Qt::CaseInsensitive)
                      && note->text().contains("addresses are visible", Qt::CaseInsensitive),
                  qPrintable("sell must state the public-settlement truth: " + note->text()));
 
@@ -2743,7 +2755,10 @@ private slots:
         auto* buyNote  = buy->findChild<QLabel*>("nftBuyPublicNote");
         QVERIFY(sellNote && buyNote);
         QCOMPARE(sellNote->text(), buyNote->text());   // single source -> identical
-        QVERIFY2(sellNote->text().contains("publicly", Qt::CaseInsensitive),
+        // New copy: "This trade is public — the price and both addresses are visible on the
+        // ledger." The load-bearing honesty word is "public" (the trade is not private).
+        QVERIFY2(sellNote->text().contains("public", Qt::CaseInsensitive)
+                     && sellNote->text().contains("visible", Qt::CaseInsensitive),
                  qPrintable("public-trade note must stay honest: " + sellNote->text()));
         sell->close();
         buy->close();
@@ -3291,7 +3306,15 @@ private slots:
         QVERIFY2(!view->isHidden(), "supported node => the grid is shown");
         auto* mint = w->findChild<QPushButton*>("nftMakeButton");
         QVERIFY2(mint && mint->isEnabled(), "supported node => Mint re-enabled");
-        QVERIFY2(mint->toolTip().isEmpty(), "supported node => no leftover tooltip");
+        // A supported node must NOT leave the unsupported guidance stuck on the button.
+        // applyNFTSupportGating() RESTORES each button's own honesty tooltip (stashed in
+        // the honestTooltip dynamic property) rather than clearing it — so the tooltip is
+        // the button's content-only-privacy/affordance copy, never the "built-in node"
+        // unsupported guidance.
+        QVERIFY2(!mint->toolTip().contains("built-in node", Qt::CaseInsensitive),
+                 qPrintable("supported node => the unsupported guidance must be gone from the "
+                            "tooltip, not stuck: " + mint->toolTip()));
+        QCOMPARE(mint->toolTip(), mint->property("honestTooltip").toString());
 
         w->deleteLater();
     }
@@ -3310,8 +3333,12 @@ private slots:
         QVERIFY2(g.contains("Quit", Qt::CaseInsensitive)
                      && g.contains("restart", Qt::CaseInsensitive),
                  qPrintable("guidance must tell the user to quit + restart: " + g));
-        QVERIFY2(g.contains("upgrade", Qt::CaseInsensitive),
-                 qPrintable("guidance must offer the upgrade path: " + g));
+        // It must offer the upgrade path. New copy names the version that works
+        // ("ZClassic v2.1.2-beta7 or newer") instead of the bare word "upgrade" — same
+        // honest actionable upgrade route, more specific.
+        QVERIFY2(g.contains("beta7", Qt::CaseInsensitive)
+                     && g.contains("newer", Qt::CaseInsensitive),
+                 qPrintable("guidance must offer the version-upgrade path: " + g));
         // Coin is ZCL, never ZEC/Zcash in user copy.
         QVERIFY2(!g.contains("ZEC") && !g.contains("Zcash"),
                  qPrintable("user copy must say ZClassic/ZCL, never ZEC/Zcash: " + g));

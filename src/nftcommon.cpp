@@ -25,7 +25,7 @@ bool nftValidateTAddrInto(QLabel* status, const QString& addrIn,
     }
     if (Settings::isTAddress(addr)) {
         status->setText(QObject::tr("Looks good — a public (transparent) address."));
-        status->setStyleSheet("color:#d9822b;");
+        status->setStyleSheet("color:#34c759;");   // success text (matches the shield dialog)
         return true;
     }
     // A valid shielded (z-) address: the public ZSLP path can't deliver to it.
@@ -36,6 +36,5 @@ bool nftValidateTAddrInto(QLabel* status, const QString& addrIn,
 
 QString nftPublicTradeNote() {
     return QObject::tr(
-        "This trade settles publicly on-chain — the price and both addresses are "
-        "visible. Only the negotiation can be private.");
+        "This trade is public — the price and both addresses are visible on the ledger.");
 }

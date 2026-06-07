@@ -26,13 +26,23 @@
    <item>
     <widget class="QTabWidget" name="tabWidget">
      <property name="currentIndex">
-      <number>2</number>
+      <number>1</number>
      </property>
      <widget class="QWidget" name="tab">
       <attribute name="title">
-       <string>zclassicd connection</string>
+       <string>Advanced</string>
       </attribute>
       <layout class="QVBoxLayout" name="verticalLayout_3">
+       <item>
+        <widget class="QLabel" name="lblAdvancedIntro">
+         <property name="text">
+          <string>Most people never need this. ZClassic runs its own node for you automatically. Only change these to connect to a node you run yourself.</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
        <item>
         <widget class="QLabel" name="confMsg">
          <property name="text">
@@ -148,7 +158,7 @@
        <item row="10" column="0" colspan="2">
         <widget class="QLabel" name="lblTor">
          <property name="text">
-          <string>Connect to the Tor network via SOCKS proxy running on 127.0.0.1:9050. Please note that you'll have to install and run the Tor service externally.</string>
+          <string>Routes your connection through Tor for more anonymity. You must install and run Tor yourself.</string>
          </property>
          <property name="wordWrap">
           <bool>true</bool>
@@ -165,7 +175,7 @@
        <item row="1" column="0" colspan="2">
         <widget class="QLabel" name="label_5">
          <property name="text">
-          <string>Private transactions are saved locally and shown in the transactions tab.  If you uncheck this, private transactions will not appear in the transactions tab.</string>
+          <string>Saves private transactions locally so they show in the Transactions tab.</string>
          </property>
          <property name="wordWrap">
           <bool>true</bool>
@@ -202,7 +212,7 @@
        <item row="7" column="0" colspan="2">
         <widget class="QLabel" name="label_7">
          <property name="text">
-          <string>Normally, change from t-Addresses goes to another t-Address. Checking this option will send the change to your shielded sapling address instead. Check this option to increase your privacy.</string>
+          <string>Sends your change to a shielded (private) address instead of a public one. More private.</string>
          </property>
          <property name="wordWrap">
           <bool>true</bool>
@@ -219,7 +229,7 @@
        <item row="12" column="0" colspan="2">
         <widget class="QLabel" name="label_tray">
          <property name="text">
-          <string>When you close the window, ZclWallet keeps running in the system tray (notification area) and the node stays warm, so the next time you open it there's no ~1-minute startup wait. Use the tray icon (or File &gt; Exit) to quit completely.</string>
+          <string>Closing the window keeps ZClassic in the tray so it reopens instantly. Quit fully from the tray icon or File &gt; Exit.</string>
          </property>
          <property name="wordWrap">
           <bool>true</bool>
@@ -229,14 +239,14 @@
        <item row="13" column="0" colspan="2">
         <widget class="QCheckBox" name="chkNatpmp">
          <property name="text">
-          <string>Help the network: open my port automatically (NAT-PMP/PCP, no UPnP)</string>
+          <string>Help the network (open my port)</string>
          </property>
         </widget>
        </item>
        <item row="14" column="0" colspan="2">
         <widget class="QLabel" name="label_natpmp">
          <property name="text">
-          <string>Asks your router to forward this node's connection port so other peers can reach you, strengthening the network. Uses the modern, safe NAT-PMP/PCP protocols (never UPnP) and opens only this node's own port. If your router doesn't support it, nothing happens. Default: off.</string>
+          <string>Asks your router to let other peers reach you, strengthening the network. Uses safe NAT-PMP/PCP (never UPnP); if your router doesn't support it, nothing happens. Default: off.</string>
          </property>
          <property name="wordWrap">
           <bool>true</bool>
@@ -260,7 +270,7 @@
        <item row="18" column="0" colspan="2">
         <widget class="QLabel" name="label_datachannel">
          <property name="text">
-          <string>Lets you send and receive files whose CONTENTS are private (encrypted). This does NOT make NFT ownership private — who holds a token is always public — and the encrypted file is stored on every node permanently and can never be deleted. Adds datachannel=1 to your node's config; takes effect after a restart. Default: off.</string>
+          <string>Lets you send and receive files whose contents are private (encrypted). It does NOT make collectible ownership private — who holds a token is always public — and the encrypted file is stored on every node permanently and can never be deleted. Restart to apply. Default: off.</string>
          </property>
          <property name="wordWrap">
           <bool>true</bool>
@@ -283,7 +293,7 @@
        <item row="4" column="0" colspan="2">
         <widget class="QLabel" name="label_6">
          <property name="text">
-          <string>Allow overriding the default fees when sending transactions. Enabling this option may compromise your privacy since fees are transparent. </string>
+          <string>Lets you set your own fee when sending. Custom fees are public and may reduce your privacy.</string>
          </property>
          <property name="wordWrap">
           <bool>true</bool>
@@ -335,7 +345,7 @@
        <item row="1" column="0">
         <widget class="QLabel" name="label_9">
          <property name="text">
-          <string>Rescan the blockchain for any missing wallet transactions and to correct your wallet balance. This may take several hours. You need to restart ZclWallet for this to take effect</string>
+          <string>Re-checks the blockchain for missing wallet transactions and corrects your balance. Takes a while; restart to apply.</string>
          </property>
          <property name="wordWrap">
           <bool>true</bool>
@@ -372,7 +382,7 @@
        <item row="4" column="0">
         <widget class="QLabel" name="label_11">
          <property name="text">
-          <string>Rebuild the entire blockchain from the genesis block, by rescanning all the block files. This may take several hours to days, depending on your hardware. You need to restart ZclWallet for this to take effect</string>
+          <string>Rebuilds the blockchain from scratch. Can take a long time; restart to apply.</string>
          </property>
          <property name="wordWrap">
           <bool>true</bool>

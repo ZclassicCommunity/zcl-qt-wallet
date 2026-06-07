@@ -152,7 +152,7 @@
       <string notr="true">color: red;</string>
      </property>
      <property name="text">
-      <string>zclassicd doesn't seem to have any peers. You might not be connected to the internet, so this Transaction might not work.</string>
+      <string>No network peers found — check your internet. This send may not go through.</string>
      </property>
      <property name="wordWrap">
       <bool>true</bool>
@@ -165,7 +165,7 @@
       <string notr="true">color: red;</string>
      </property>
      <property name="text">
-      <string>You are sending a transaction while your node is still syncing. This may not work.</string>
+      <string>Still catching up with the network — this send may fail. Best to wait until syncing finishes.</string>
      </property>
      <property name="wordWrap">
       <bool>true</bool>
@@ -188,10 +188,10 @@
    <item>
     <widget class="QLabel" name="warningLabel">
      <property name="styleSheet">
-      <string notr="true">color: red;</string>
+      <string notr="true">color: #d9822b;</string>
      </property>
      <property name="text">
-      <string>You are using a custom fee. Since fees are transparent, you are giving up some privacy. Please use this only if you know what you are doing!</string>
+      <string>Custom fee set. Fees are public, so this gives up some privacy.</string>
      </property>
      <property name="wordWrap">
       <bool>true</bool>

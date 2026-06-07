@@ -4,8 +4,9 @@
 //
 //   * nftValidateTAddrInto(status, addr) — the ONE 4-state transparent-address
 //     validator (empty / not-an-address / valid t-address / valid-but-shielded)
-//     that send + sell both used verbatim. Paints `status` (green/amber/red) and
-//     returns true ONLY for a usable public (transparent) address.
+//     that send + sell both used verbatim. Paints `status` (success-green for a
+//     usable address, red otherwise) and returns true ONLY for a usable public
+//     (transparent) address.
 //
 //   * nftPublicTradeNote() — the verbatim public-settlement honesty sentence that
 //     sell + buy both showed. Single source so the wording can never drift.
@@ -23,8 +24,8 @@
 class QLabel;
 
 // 4-state transparent-address validator shared by the send + sell dialogs.
-// Paints `status` with the matching green/amber/red copy and returns true ONLY
-// when `addr` is a valid PUBLIC (transparent) t-address (the only kind the
+// Paints `status` success-green for a usable address (red otherwise) and returns
+// true ONLY when `addr` is a valid PUBLIC (transparent) t-address (the only kind the
 // public ZSLP transfer/sale path can use). An empty addr clears the status and
 // returns false. `notSupportedHint` lets each caller phrase the valid-but-
 // shielded case in its own voice ("Private gifts…" vs "A sale needs…").

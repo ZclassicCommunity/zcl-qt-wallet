@@ -87,7 +87,7 @@ void MainWindow::setupSendTab() {
     // Network-fee read-only hint (custom fees default OFF): explain the greyed field
     // instead of leaving a mysterious dead control.
     if (!Settings::getInstance()->getAllowCustomFees()) {
-        QString feeHint = tr("Default network fee. Turn on “Allow custom fees” in Settings to change it.");
+        QString feeHint = tr("Default network fee. Change it in Settings > Allow custom fees.");
         ui->minerFeeAmt->setToolTip(feeHint);
         ui->minerFeeLabel->setToolTip(feeHint);
     }
@@ -104,7 +104,7 @@ void MainWindow::setupSendTab() {
             bool custom = Settings::getInstance()->getAllowCustomFees();
             ui->minerFeeAmt->setReadOnly(!custom);
             QString feeHint = custom ? QString()
-                : tr("Default network fee. Turn on “Allow custom fees” in Settings to change it.");
+                : tr("Default network fee. Change it in Settings > Allow custom fees.");
             ui->minerFeeAmt->setToolTip(feeHint);
             ui->minerFeeLabel->setToolTip(feeHint);
         }
@@ -731,10 +731,9 @@ Tx MainWindow::createTxFromSendPage() {
                      && Settings::getInstance()->isSaplingAddress(tx.toAddrs[0].addr)
                      && targetZat == confirmedTotalZat)) {
             QMessageBox::warning(this, tr("Shield your mined funds first"),
-                tr("Part of this address's balance is newly mined (coinbase) coins, which "
-                   "can only be moved by shielding the whole balance to a private address "
-                   "first.\n\nUse \"Shield my public funds\" to move them privately, then "
-                   "send again."),
+                tr("Some of these are mined (coinbase) coins, which must be shielded to a "
+                   "private address before sending.\n\nUse \"Shield my public funds\" first, "
+                   "then send again."),
                 QMessageBox::Ok);
             return Tx();   // invalid: empty fromAddr -> sendButton aborts the send
         }
@@ -936,10 +935,9 @@ bool MainWindow::verifyAutoShieldUnchanged(const Tx& tx) {
     const qint64 liveTotalZat = confirmedSpendableZat(tx.fromAddr, /*includeCoinbase=*/true);
     if (tx.builtTargetZat <= liveTotalZat && tx.builtTargetZat > liveEligibleZat) {
         QMessageBox::warning(this, tr("Shield your mined funds first"),
-            tr("Part of this address's balance is newly mined (coinbase) coins, which can "
-               "only be moved by shielding the whole balance to a private address first. For "
-               "your privacy the transaction was NOT sent.\n\nUse \"Shield my public funds\" "
-               "to move them privately, then send again."),
+            tr("Some of these are mined (coinbase) coins, which must be shielded to a "
+               "private address before sending. For your privacy the transaction was NOT "
+               "sent.\n\nUse \"Shield my public funds\" first, then send again."),
             QMessageBox::Ok);
         return false;
     }
@@ -1499,18 +1497,18 @@ void MainWindow::updateSendPrivacyBadge() {
 
     QString text, tone;
     if (!anyRecipient || tx.fromAddr.isEmpty()) {
-        text = tr("Set who you are paying to see if this send is private");
+        text = tr("Add a recipient to see if this send is private");
         tone = QString();   // neutral
     } else {
         switch (sendCategoryOf(tx)) {
         case SendCategory::ZToZ_private:
-            text = tr("● Private — only you and the recipient can see this"); tone = "private"; break;
+            text = tr("● Private"); tone = "private"; break;
         case SendCategory::TToZ_shielding:
-            text = tr("● Shielding — this becomes private"); tone = "private"; break;
+            text = tr("● Shielding → private"); tone = "private"; break;
         case SendCategory::TToT_public:
-            text = tr("● Public — the amount and recipient are visible to everyone"); tone = "public"; break;
+            text = tr("● Public — visible to everyone"); tone = "public"; break;
         case SendCategory::ZToT_deshield:
-            text = tr("● De-shield — this leaves your private balance and becomes public forever"); tone = "deshield"; break;
+            text = tr("● De-shield — becomes public forever"); tone = "deshield"; break;
         }
     }
     badge->setText(text);

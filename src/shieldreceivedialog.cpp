@@ -45,10 +45,10 @@ ShieldReceiveDialog::ShieldReceiveDialog(RPC* rpc, QWidget* parent)
     outer->addWidget(listTitle);
 
     auto* listNote = new QLabel(
-        tr("This is a temporary list of what this node sent recently — not a full "
-           "history of files you have received. Use the box below to open any file "
-           "by its id or fingerprint."), this);
-    listNote->setStyleSheet("color:#9aa0a6; font-size:11px;");
+        tr("Sent this session only — not a full receive history."), this);
+    listNote->setObjectName("shieldReceiveListNote");
+    listNote->setProperty("hint", true);
+    listNote->setStyleSheet("color:#9aa0a6; font-size:12pt;");
     listNote->setWordWrap(true);
     outer->addWidget(listNote);
 
@@ -235,7 +235,7 @@ void ShieldReceiveDialog::runLookup(const QString& transferId, const QString& fi
                 self->m_lastFilename = r.filename;
                 self->m_stateLine->setText(
                     self->tr("File verified and ready to open."));
-                self->m_stateLine->setStyleSheet("color:#2a9d2a;");
+                self->m_stateLine->setStyleSheet("color:#34c759;");
                 const QString name = r.filename.isEmpty()
                                          ? self->tr("(unnamed)") : r.filename;
                 self->m_metaLine->setText(
@@ -324,5 +324,5 @@ void ShieldReceiveDialog::onSaveDecrypted() {
     f.write(m_plaintext);   // binary-safe write of the verified plaintext bytes
     f.close();
     m_stateLine->setText(tr("Saved."));
-    m_stateLine->setStyleSheet("color:#2a9d2a;");
+    m_stateLine->setStyleSheet("color:#34c759;");
 }

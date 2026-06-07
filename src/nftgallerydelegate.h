@@ -5,9 +5,9 @@
 // Each card draws (top to bottom):
 //   * a rounded card body (card #15171c) with a 1px hairline (#2a2d35);
 //   * a square thumbnail area (inset #1d2027) — the model's QPixmap if ready,
-//     else an animated shimmer placeholder while verifyState == pending;
-//   * a privacy pill (green "Private" / amber "Public") reusing the tinted-SVG
-//     mask technique from PrivacyBadgeDelegate;
+//     else a calm static "image not on this device" placeholder;
+//   * an ownership pill — ALWAYS amber "Public" (#119: ZSLP ownership is always
+//     public; there is no private-ownership state to render);
 //   * a verify badge (green check / red x / amber question) from the bundled
 //     16px SVGs, tinted the same way;
 //   * the name + collection caption.
@@ -44,10 +44,6 @@ private:
     // Verify badge resource + tint color for a verifyState (0/1/2).
     static QString verifyIconResource(int verifyState);
     static QColor  verifyColor(int verifyState);
-
-    // Privacy pill label + color (reuses the green/amber tokens).
-    static QString privacyLabel(bool isPrivate);
-    static QColor  privacyColor(bool isPrivate);
 
     // Tinted, cached SVG icon (alpha-mask -> SourceIn fill), keyed by
     // resource+color+px. Mirrors PrivacyBadgeDelegate::icon().

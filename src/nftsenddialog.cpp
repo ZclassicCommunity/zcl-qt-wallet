@@ -150,7 +150,7 @@ void NFTSendDialog::onSendClicked() {
             self->m_succeeded = true;
             self->m_resultLine->setText(
                 tr("Gift sent. It's on its way — confirming on-chain."));
-            self->m_resultLine->setStyleSheet("color:#2a9d2a;");
+            self->m_resultLine->setStyleSheet("color:#34c759;");
             self->m_recipient->setEnabled(false);
             self->finishPrimaryAsDone(self->m_sendBtn, self->m_cancelBtn);
         },

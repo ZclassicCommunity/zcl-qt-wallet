@@ -93,9 +93,10 @@ NFTDetailDialog::NFTDetailDialog(const NFTItem& item, const QVector<NFTItem>& or
     auto* titleRow = new QHBoxLayout();
     auto* titleBox = new QVBoxLayout();
     m_titleName = new QLabel(this);
-    m_titleName->setStyleSheet("font-size:16px; font-weight:700;");
+    m_titleName->setObjectName("nftDetailTitle");
+    m_titleName->setStyleSheet("font-size:18pt; font-weight:700;");
     m_titleColl = new QLabel(this);
-    m_titleColl->setStyleSheet("font-size:11px; color:#9aa0a6;");
+    m_titleColl->setStyleSheet("font-size:12pt; color:#9aa0a6;");
     titleBox->addWidget(m_titleName);
     titleBox->addWidget(m_titleColl);
     titleRow->addLayout(titleBox, 1);
@@ -166,48 +167,44 @@ NFTDetailDialog::NFTDetailDialog(const NFTItem& item, const QVector<NFTItem>& or
            "ledger. This is the public history of who has held it — ownership is never "
            "private."));
 
-    auto* footnote = new QLabel(
-        tr("This name and image aren't unique — anyone can mint another collectible "
-           "that reuses them. Only the mint id is one of a kind."), this);
-    footnote->setWordWrap(true);
-    footnote->setStyleSheet("color:#9aa0a6; font-size:11px;");
-    info->addWidget(footnote);
+    // The unique-id nuance is folded into the mint-id line below (loadCurrent), and the
+    // "anyone can mint a copy" caveat already lives in the verify badge's What's-This —
+    // no duplicate footnote here.
 
     info->addStretch(1);
 
-    // action bar
+    // ---- PRIMARY action row: the two things you'd actually do with what you own.
+    // Send / Gift is the default (accent); Sell sits beside it. Everything else is
+    // demoted to the quiet utility row below.
     auto* actionRow = new QHBoxLayout();
     m_sendBtn = new QPushButton(tr("Send / Gift"), this);
     m_sendBtn->setObjectName("nftSendGiftButton");
+    // Accent the primary action through the central QSS token (filled private-green
+    // #1f7a1f, hover #2a9d2a) instead of an inline color — same rule the Home quick
+    // actions use — and make it the dialog default so Enter triggers it.
+    m_sendBtn->setProperty("homeaction", "primary");
+    m_sendBtn->setDefault(true);
     m_sellBtn = new QPushButton(tr("Sell"), this);
     m_sellBtn->setObjectName("nftDetailSellButton");
-    m_saveBtn   = new QPushButton(tr("Save image…"), this);
-    auto* copyIdBtn = new QPushButton(tr("Copy id"), this);
-    actionRow->addWidget(m_sendBtn);
-    actionRow->addWidget(m_sellBtn);
-    actionRow->addWidget(m_saveBtn);
-    actionRow->addWidget(copyIdBtn);
+    actionRow->addWidget(m_sendBtn, 1);
+    actionRow->addWidget(m_sellBtn, 1);
     info->addLayout(actionRow);
 
-    auto* moreRow = new QHBoxLayout();
-    auto* copyFpBtn  = new QPushButton(tr("Copy fingerprint"), this);
-    m_recheckBtn     = new QPushButton(tr("Re-check image"), this);
-    m_explorerBtn    = new QPushButton(tr("View in explorer"), this);
-    moreRow->addWidget(copyFpBtn);
-    moreRow->addWidget(m_recheckBtn);
-    moreRow->addWidget(m_explorerBtn);
-    info->addLayout(moreRow);
+    // ---- SHIELD row (its own labelled row): private FILE content — never private
+    // ownership. "Send file privately…" opens the encrypted-send dialog; "Open private
+    // file" looks up the file linked to THIS token's fingerprint (verify-before-decrypt).
+    auto* shieldCaption = new QLabel(tr("Private file"), this);
+    shieldCaption->setObjectName("nftDetailShieldCaption");
+    shieldCaption->setStyleSheet("color:#9aa0a6;");
+    info->addWidget(shieldCaption);
 
-    // SHIELD row (private FILE content — never private ownership). "Send file
-    // privately…" opens the encrypted-send dialog; "Open private file" looks up the
-    // file linked to THIS token's fingerprint (verify-before-decrypt).
     auto* shieldRow = new QHBoxLayout();
     m_sendFileBtn = new QPushButton(tr("Send file privately…"), this);
     m_sendFileBtn->setObjectName("nftDetailSendPrivateButton");
     m_sendFileBtn->setWhatsThis(
-        tr("Encrypt a file so only the person you send it to can read it. This makes "
-           "only the file's CONTENTS private — who owns this collectible is always "
-           "public, and the encrypted file is stored on-chain permanently."));
+        tr("Encrypts the file's CONTENTS so only your recipient can read it. Ownership "
+           "stays public — only the file is private. The encrypted file is stored "
+           "on-chain permanently."));
     m_openFileBtn = new QPushButton(tr("Open private file"), this);
     m_openFileBtn->setObjectName("nftDetailOpenPrivateButton");
     m_openFileBtn->setWhatsThis(
@@ -218,20 +215,30 @@ NFTDetailDialog::NFTDetailDialog(const NFTItem& item, const QVector<NFTItem>& or
     shieldRow->addStretch(1);
     info->addLayout(shieldRow);
 
-    // Item A: attach-the-file affordance. A RECEIVED NFT has cachePath="" by privacy
-    // design (never auto-fetched), so this is the ONLY way its image can reach the
-    // green verify badge — the user explicitly picks the local file they hold.
-    auto* attachRow = new QHBoxLayout();
-    m_attachBtn = new QPushButton(tr("Attach the file you have…"), this);
-    m_attachBtn->setObjectName("nftAttachFileButton");
-    m_attachBtn->setWhatsThis(
-        tr("For your privacy, the wallet never downloads a collectible's image by "
-           "itself. If you already have the file, pick it here — the wallet checks it "
-           "against the on-chain fingerprint, all on your computer. The file is never "
-           "uploaded."));
-    attachRow->addWidget(m_attachBtn);
-    attachRow->addStretch(1);
-    info->addLayout(attachRow);
+    // ---- UTILITY row (quiet): one state-aware verify button + the copy/save tools.
+    // The verify button is the SINGLE entry point — its text becomes "Re-check" when
+    // the bytes are on disk and "Check my file…" when they aren't (set in
+    // requestPoster). It NEVER says "Attach…" ("attach" wrongly implies an upload). A
+    // received NFT has cachePath="" by privacy design (never auto-fetched), so this is
+    // the only way its image can reach the green verify badge — the user picks the
+    // local file they already hold; nothing is uploaded.
+    auto* moreRow = new QHBoxLayout();
+    m_recheckBtn = new QPushButton(tr("Re-check"), this);
+    m_recheckBtn->setObjectName("nftVerifyFileButton");
+    m_recheckBtn->setWhatsThis(
+        tr("Checks your copy of the file against the on-chain fingerprint, all on your "
+           "computer. Nothing is uploaded."));
+    m_saveBtn        = new QPushButton(tr("Save image…"), this);
+    auto* copyIdBtn  = new QPushButton(tr("Copy id"), this);
+    auto* copyFpBtn  = new QPushButton(tr("Copy fingerprint"), this);
+    m_explorerBtn    = new QPushButton(tr("View in explorer"), this);
+    moreRow->addWidget(m_recheckBtn);
+    moreRow->addWidget(m_saveBtn);
+    moreRow->addWidget(copyIdBtn);
+    moreRow->addWidget(copyFpBtn);
+    moreRow->addWidget(m_explorerBtn);
+    moreRow->addStretch(1);
+    info->addLayout(moreRow);
 
     m_attachStatus = new QLabel(this);
     m_attachStatus->setObjectName("nftAttachStatus");
@@ -250,9 +257,8 @@ NFTDetailDialog::NFTDetailDialog(const NFTItem& item, const QVector<NFTItem>& or
     connect(m_saveBtn,     &QPushButton::clicked, this, &NFTDetailDialog::onSaveImage);
     connect(copyIdBtn,   &QPushButton::clicked, this, &NFTDetailDialog::onCopyId);
     connect(copyFpBtn,   &QPushButton::clicked, this, &NFTDetailDialog::onCopyFingerprint);
-    connect(m_recheckBtn,  &QPushButton::clicked, this, &NFTDetailDialog::onRecheck);
+    connect(m_recheckBtn,  &QPushButton::clicked, this, &NFTDetailDialog::onVerifyFile);
     connect(m_explorerBtn, &QPushButton::clicked, this, &NFTDetailDialog::onViewInExplorer);
-    connect(m_attachBtn,   &QPushButton::clicked, this, &NFTDetailDialog::onAttachFile);
     connect(m_sendFileBtn, &QPushButton::clicked, this, &NFTDetailDialog::onSendPrivateFile);
     connect(m_openFileBtn, &QPushButton::clicked, this, &NFTDetailDialog::onOpenPrivateFile);
 
@@ -283,7 +289,7 @@ void NFTDetailDialog::loadCurrent() {
     const NFTItem& it = cur();
 
     m_titleName->setText(it.name.isEmpty() ? tr("Untitled") : it.name);
-    m_titleColl->setText(it.collection.isEmpty() ? tr("Not part of a set") : it.collection);
+    m_titleColl->setText(it.collection.isEmpty() ? tr("No collection") : it.collection);
 
     m_prevBtn->setEnabled(m_index > 0);
     m_nextBtn->setEnabled(m_index < m_ordered.size() - 1);
@@ -302,17 +308,16 @@ void NFTDetailDialog::loadCurrent() {
         tr("● Public — anyone can verify this on the public ledger."));
 
     // Details card.
-    m_mintId->setText(tr("Mint id: %1").arg(shortId(it.txid)));
+    m_mintId->setText(tr("Mint id: %1 (the one unique part)").arg(shortId(it.txid)));
     m_setLine->setText(it.collection.isEmpty()
-                           ? tr("Set: Not part of a set")
-                           : tr("Set: %1").arg(it.collection));
+                           ? tr("Collection: none")
+                           : tr("Collection: %1").arg(it.collection));
     m_fingerprint->setText(it.docHashHex.isEmpty()
                                ? tr("Image fingerprint: none recorded on-chain")
                                : tr("Image fingerprint: %1").arg(shortId(it.docHashHex)));
     m_fingerprint->setWhatsThis(
-        tr("The fingerprint is a one-way SHA-256 of the original file, written to the "
-           "ledger when the collectible was made. The wallet recomputes it from the "
-           "file you hold to confirm the image is exactly the one that was recorded."));
+        tr("A unique fingerprint of the original file, recorded on-chain — the wallet "
+           "recomputes it from your copy to confirm it's the same file."));
     m_received->setText(it.receivedHeight > 0
                             ? tr("Received: block %1").arg(it.receivedHeight)
                             : tr("Received: confirming…"));
@@ -368,15 +373,14 @@ void NFTDetailDialog::requestPoster() {
         m_posterInFlight = false;
         m_stage->setText(tr("This collectible's image isn't on this computer."));
         applyNoBytesBadge();
-        if (m_recheckBtn)
-            m_recheckBtn->setEnabled(false);   // nothing to re-check -> not a dead click
-        // Item A: the attach affordance is exactly useful HERE (no bytes). For a
-        // hash-less NFT (no on-chain fingerprint) keep the button disabled with an
-        // honest explanation — its image can never be verified, so never imply it can.
-        if (m_attachBtn) {
+        // State-aware verify button: no bytes -> "Check my file…" (the user picks the
+        // local file they hold; nothing is uploaded). It is the ONLY path to a green
+        // badge for a received NFT. A hash-less NFT (no on-chain fingerprint) can never
+        // be verified, so disable it and say so plainly — never imply it can.
+        if (m_recheckBtn) {
             const bool hasFingerprint = !it.docHashHex.isEmpty();
-            m_attachBtn->setVisible(true);
-            m_attachBtn->setEnabled(hasFingerprint);
+            m_recheckBtn->setText(tr("Check my file…"));
+            m_recheckBtn->setEnabled(hasFingerprint);
             if (!hasFingerprint)
                 showAttachStatus(
                     tr("This collectible has no on-chain fingerprint, so its image "
@@ -388,11 +392,11 @@ void NFTDetailDialog::requestPoster() {
     m_posterInFlight = true;
     m_stage->setText(tr("Checking this image…"));
     applyVerifyBadge(it.verifyState);
-    if (m_recheckBtn)
+    // State-aware verify button: bytes on disk -> "Re-check".
+    if (m_recheckBtn) {
+        m_recheckBtn->setText(tr("Re-check"));
         m_recheckBtn->setEnabled(true);
-    // Item A: bytes are present -> the attach affordance isn't needed; hide it.
-    if (m_attachBtn)
-        m_attachBtn->setVisible(false);
+    }
     m_engine->posterForToken(localPath, it.docHashHex, it.docHashHex,
                              kPosterPx, m_posterToken);
 }
@@ -428,10 +432,11 @@ void NFTDetailDialog::applyVerifyBadge(int verifyState) {
     QString verdict, color, glyph, tip;
     if (verifyState == 1) {
         verdict = tr("This image matches its on-chain fingerprint.");
-        color   = "#2a9d2a"; glyph = "✓";
+        color   = "#34c759"; glyph = "✓";
         tip     = verdict;
     } else if (verifyState == 2) {
-        verdict = tr("This image does NOT match what was recorded on-chain. Don't trust it.");
+        verdict = tr("This image does NOT match the on-chain fingerprint — it's not the "
+                     "recorded file.");
         color   = "#c0392b"; glyph = "✗";
         tip     = verdict;
     } else {
@@ -441,7 +446,7 @@ void NFTDetailDialog::applyVerifyBadge(int verifyState) {
     }
     m_badge->setText(glyph);
     m_badge->setToolTip(tip);
-    m_badge->setStyleSheet(QString("color:%1; font-weight:700; font-size:16px;").arg(color));
+    m_badge->setStyleSheet(QString("color:%1; font-weight:700; font-size:16pt;").arg(color));
     m_verifyLine->setText(verdict);
     m_verifyLine->setStyleSheet(QString("color:%1;").arg(color));
     // Item B (honesty): keep the "what ✓ does NOT mean" disambiguation on the line in
@@ -459,16 +464,14 @@ void NFTDetailDialog::applyNoBytesBadge() {
     const QString color = "#9aa0a6";   // neutral dim, not amber/green/red
     m_badge->setText(QStringLiteral("–"));
     m_badge->setToolTip(verdict);
-    m_badge->setStyleSheet(QString("color:%1; font-weight:700; font-size:16px;").arg(color));
+    m_badge->setStyleSheet(QString("color:%1; font-weight:700; font-size:16pt;").arg(color));
     m_verifyLine->setText(verdict);
     m_verifyLine->setStyleSheet(QString("color:%1;").arg(color));
     // Item B (honesty): explain the no-bytes state — this is normal and private, not
-    // an error, and point at the attach affordance that fixes it.
+    // an error, and point at the verify affordance that fixes it.
     m_verifyLine->setWhatsThis(
-        tr("For your privacy, the wallet never downloads a collectible's image on its "
-           "own. If you already have the original file, use “Attach the file you "
-           "have” below to check it against the on-chain fingerprint — all on your "
-           "computer."));
+        tr("Use Check my file to verify it against the on-chain fingerprint — nothing "
+           "is uploaded."));
 }
 
 void NFTDetailDialog::backfillProvenance() {
@@ -620,17 +623,24 @@ void NFTDetailDialog::onCopyFingerprint() {
     QApplication::clipboard()->setText(cur().docHashHex);
 }
 
-void NFTDetailDialog::onRecheck() {
-    requestPoster();
-}
-
 // ---------------------------------------------------------------------------
-// Item A — attach the file you have. The user explicitly picks a LOCAL file
-// (privacy: we NEVER auto-fetch). onAttachFile runs the picker; beginAttach()
-// holds the reject->hash->match-gate logic so a test can drive it without a
-// QFileDialog (testAttachFile seam).
+// The ONE state-aware verify action. When the bytes are already on disk the
+// button reads "Re-check" and simply re-runs the poster; when they aren't it
+// reads "Check my file…" and the user explicitly picks a LOCAL file (privacy:
+// we NEVER auto-fetch, NEVER upload). beginAttach() holds the
+// reject->hash->match-gate logic so a test can drive it without a QFileDialog
+// (testAttachFile seam).
 // ---------------------------------------------------------------------------
-void NFTDetailDialog::onAttachFile() {
+void NFTDetailDialog::onVerifyFile() {
+    const NFTItem& it = cur();
+    QString localPath = it.cachePath;
+    if (localPath.isEmpty() && !it.docHashHex.isEmpty())
+        localPath = ContentEngine::cacheGet(it.docHashHex);
+    if (m_engine != nullptr && !localPath.isEmpty()) {
+        requestPoster();   // bytes on disk -> "Re-check"
+        return;
+    }
+    // No bytes -> "Check my file…": pick the local file the user holds.
     const QString path = QFileDialog::getOpenFileName(
         this, tr("Choose the file you have for this collectible"));
     if (path.isEmpty())
@@ -694,7 +704,7 @@ void NFTDetailDialog::onAttachDescriptor(quint64 token, ContentDescriptor d) {
         // poster so the badge resolves VERIFIED from the now-cached file.
         ContentEngine::cachePut(docHash, m_attachPath);
         showAttachStatus(
-            tr("This file matches the on-chain fingerprint."), "#2a9d2a");
+            tr("This file matches the on-chain fingerprint."), "#34c759");
         requestPoster();   // local bytes now resolve via cacheGet -> green badge
     } else {
         // NON-MATCH: honest red, and DO NOT cache (the badge stays unverified).

@@ -52,13 +52,13 @@ private slots:
     void onSaveImage();
     void onCopyId();
     void onCopyFingerprint();
-    void onRecheck();
+    // The ONE state-aware verify action. Bytes on disk -> "Re-check" (re-run the
+    // poster); no bytes -> "Check my file…" (the user picks the LOCAL file they hold;
+    // privacy: never auto-fetched, never uploaded). The reject->hash->match-gate logic
+    // lives in beginAttach(path) so a test can drive it without the file dialog
+    // (testAttachFile seam).
+    void onVerifyFile();
     void onViewInExplorer();
-    // Item A: the user explicitly picks a LOCAL file to verify against the on-chain
-    // fingerprint (privacy: never auto-fetched). The picker runs in onAttachFile;
-    // the reject->hash->match-gate logic lives in beginAttach(path) so a test can
-    // drive it without the file dialog (testAttachFile seam).
-    void onAttachFile();
     void onAttachDescriptor(quint64 token, ContentDescriptor d);
     void goPrev();
     void goNext();
@@ -66,8 +66,8 @@ private slots:
 public:
 #ifdef ZCL_WIDGET_TEST
     // TEST-ONLY SEAM (item A / E): run the SAME reject->hash->match-gate path as
-    // onAttachFile() but with a caller-supplied path (no QFileDialog, which is
-    // un-drivable under offscreen QPA). Never compiled into the shipped app.
+    // onVerifyFile()'s "Check my file…" branch but with a caller-supplied path (no
+    // QFileDialog, which is un-drivable under offscreen QPA). Never in the shipped app.
     void testAttachFile(const QString& path) { beginAttach(path); }
 #endif
 
@@ -128,8 +128,7 @@ private:
     QPushButton* m_sellBtn     = nullptr;   // "Sell" (opens NFTSellDialog)
     QPushButton* m_sendFileBtn = nullptr;   // SHIELD: "Send file privately…"
     QPushButton* m_openFileBtn = nullptr;   // SHIELD: "Open private file"
-    QPushButton* m_recheckBtn  = nullptr;   // disabled when there are no local bytes
-    QPushButton* m_attachBtn   = nullptr;   // item A: "Attach the file you have…"
+    QPushButton* m_recheckBtn  = nullptr;   // ONE state-aware verify: "Re-check" / "Check my file…"
     QPushButton* m_saveBtn     = nullptr;   // disabled until a real image is loaded
     QPushButton* m_prevBtn     = nullptr;
     QPushButton* m_nextBtn     = nullptr;

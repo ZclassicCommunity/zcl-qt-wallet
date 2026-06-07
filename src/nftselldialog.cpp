@@ -11,7 +11,6 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QPlainTextEdit>
-#include <QComboBox>
 #include <QPushButton>
 #include <QFrame>
 #include <QFileDialog>
@@ -76,18 +75,16 @@ NFTSellDialog::NFTSellDialog(const NFTItem& item, RPC* rpc, QWidget* parent)
     outer->addWidget(m_priceStatus);
 
     // --- expiry -------------------------------------------------------------
+    // v1: the daemon's ~7-day default is the ONLY expiry (we pass expiryHeight=0).
+    // A 1-choice picker implies choices that don't exist, so show a read-only line.
+    // Reintroduce a combo only when real custom-expiry (needs the chain tip) lands.
     auto* expiryLbl = new QLabel(tr("Expires in"), this);
     expiryLbl->setStyleSheet("font-weight:600;");
     outer->addWidget(expiryLbl);
 
-    m_expiryCombo = new QComboBox(this);
-    m_expiryCombo->setObjectName("nftSellExpiryCombo");
-    // v1: only the daemon's ~7-day default is wired (we pass expiryHeight=0). The
-    // other rows are shown disabled-but-honest so the intent reads, and an arbitrary
-    // expiry (needs the chain tip height) is a documented follow-up.
-    m_expiryCombo->addItem(tr("~7 days (recommended)"), 7);
-    m_expiryCombo->setCurrentIndex(0);
-    outer->addWidget(m_expiryCombo);
+    m_expiryValue = new QLabel(tr("About 7 days."), this);
+    m_expiryValue->setObjectName("nftSellExpiryValue");
+    outer->addWidget(m_expiryValue);
 
     // --- buyer's public address (REQUIRED by the daemon) --------------------
     auto* buyerLbl = new QLabel(tr("Buyer's public address"), this);
@@ -192,7 +189,7 @@ void NFTSellDialog::onListClicked() {
     m_resultLine->clear();
 
     // v1: payoutAddr "" (daemon picks a fresh own address); expiryHeight 0 (daemon
-    // default ~7d) — the combo's only enabled choice. QPointer guards the reply.
+    // default ~7d) — the only expiry in v1. QPointer guards the reply.
     QPointer<NFTSellDialog> self(this);
     m_rpc->nftMakeOffer(m_item.txid, price, buyer, /*payoutAddr=*/QString(),
         /*expiryHeight=*/0,
@@ -223,14 +220,13 @@ void NFTSellDialog::enterListedState() {
     // Lock down the compose inputs (they describe the now-immutable offer).
     if (m_priceEdit)   m_priceEdit->setEnabled(false);
     if (m_buyerEdit)   m_buyerEdit->setEnabled(false);
-    if (m_expiryCombo) m_expiryCombo->setEnabled(false);
     if (m_listBtn)     m_listBtn->hide();
 
     auto* outer = qobject_cast<QVBoxLayout*>(layout());
 
     m_listedBadge = new QLabel(tr("● Listed — expires in ~7 days."), this);
     m_listedBadge->setObjectName("nftSellListedBadge");
-    m_listedBadge->setStyleSheet("color:#2a9d2a; font-weight:600;");
+    m_listedBadge->setStyleSheet("color:#34c759; font-weight:600;");
 
     auto* blobLbl = new QLabel(tr("Share this offer with your buyer:"), this);
     blobLbl->setWordWrap(true);
@@ -270,14 +266,14 @@ void NFTSellDialog::enterListedState() {
 
     m_resultLine->setText(tr("Offer ready. Send the buyer this code — they verify it "
                              "before paying."));
-    m_resultLine->setStyleSheet("color:#2a9d2a;");
+    m_resultLine->setStyleSheet("color:#34c759;");
 }
 
 void NFTSellDialog::onCopyClicked() {
     QApplication::clipboard()->setText(m_offerBlob);
     if (m_resultLine) {
         m_resultLine->setText(tr("Copied. Paste it to your buyer."));
-        m_resultLine->setStyleSheet("color:#2a9d2a;");
+        m_resultLine->setStyleSheet("color:#34c759;");
     }
 }
 
@@ -285,7 +281,7 @@ void NFTSellDialog::onSaveClicked() {
     const QString base = m_item.name.isEmpty() ? QStringLiteral("offer") : m_item.name;
     const QString suggested = base + QStringLiteral(".znftoffer");
     const QString path = QFileDialog::getSaveFileName(
-        this, tr("Save offer"), suggested, tr("NFT offer (*.znftoffer)"));
+        this, tr("Save offer"), suggested, tr("Offer file (*.znftoffer)"));
     if (path.isEmpty())
         return;
     QFile f(path);
@@ -301,7 +297,7 @@ void NFTSellDialog::onSaveClicked() {
     f.close();
     if (m_resultLine) {
         m_resultLine->setText(tr("Saved. Send the file to your buyer."));
-        m_resultLine->setStyleSheet("color:#2a9d2a;");
+        m_resultLine->setStyleSheet("color:#34c759;");
     }
 }
 
@@ -333,7 +329,7 @@ void NFTSellDialog::onCancelListingClicked() {
             if (self->m_saveBtn) self->m_saveBtn->setEnabled(false);
             if (self->m_resultLine) {
                 self->m_resultLine->setText(tr("Listing cancelled."));
-                self->m_resultLine->setStyleSheet("color:#2a9d2a;");
+                self->m_resultLine->setStyleSheet("color:#34c759;");
             }
         },
         [self](QString errStr) {

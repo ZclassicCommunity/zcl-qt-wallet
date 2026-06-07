@@ -875,9 +875,8 @@ void MainWindow::setupHomeDashboard() {
     backupV->setSpacing(8);
 
     homeBackupText = new QLabel(
-        tr("Back up your wallet. This wallet has no recovery phrase — if this "
-           "computer is lost or its disk fails and you have no backup, your coins "
-           "are gone forever."),
+        tr("Back up your wallet. There's no recovery phrase — lose this computer "
+           "with no backup and your coins are gone forever."),
         homeBackupCard);
     homeBackupText->setObjectName("homeFixItText");   // reuse the amber-body qss rule
     homeBackupText->setWordWrap(true);
@@ -923,9 +922,8 @@ void MainWindow::setupHomeDashboard() {
     importV->setSpacing(8);
 
     auto* importText = new QLabel(
-        tr("Importing your keys and rescanning the blockchain. This usually takes "
-           "10-20 minutes — your balance will update when it finishes. You can keep "
-           "using ZClassic; please leave it open."),
+        tr("Importing your keys and rescanning (about 10–20 min). Your balance "
+           "updates when it's done — keep the app open."),
         homeImportCard);
     importText->setObjectName("homeFixItText");       // reuse amber-body qss rule
     importText->setWordWrap(true);
@@ -1552,8 +1550,7 @@ void MainWindow::setSyncStatusWaitingForPeers(bool longStretch) {
     syncProgressBar->setVisible(false);
     syncProgressBar->setRange(0, 100);   // reset in case it was indeterminate
     if (longStretch)
-        syncStatusLabel->setText(tr("Still waiting for peers… please check your internet "
-            "connection and try again later"));
+        syncStatusLabel->setText(tr("Still no peers — please check your internet connection."));
     else
         syncStatusLabel->setText(tr("Waiting for peers… check your internet connection"));
     applyBannerStyle("QWidget { background-color: #d9822b; } QLabel { color: white; }");
@@ -1923,7 +1920,7 @@ void MainWindow::setupSettingsModal() {
             // the window-X all deleted the saved history with no way to back out. Capture the
             // result and gate on equality so ONLY "Yes" deletes.
             auto ans = QMessageBox::warning(this, tr("Clear saved history?"),
-                tr("Shielded z-Address transactions are stored locally in your wallet, outside zclassicd. You may delete this saved information safely any time for your privacy.\nDo you want to delete the saved shielded transactions now?"),
+                tr("Your private (shielded) transaction history is saved on this computer only. Delete it now?"),
                 QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
             if (ans == QMessageBox::Yes) {
                     SentTxStore::deleteHistory();
@@ -2156,7 +2153,7 @@ void MainWindow::setupSettingsModal() {
             }
 
             if (showRestartInfo) {
-                auto desc = tr("ZclWallet needs to restart to rescan/reindex. ZclWallet will now close, please restart ZclWallet to continue");
+                auto desc = tr("ZClassic will close now. Reopen it to finish the rescan.");
 
                 QMessageBox::information(this, tr("Restart ZclWallet"), desc, QMessageBox::Ok);
                 // NO-OP-IN-TRAY FIX: in the default tray-resident/embedded config (the only
@@ -2423,7 +2420,7 @@ void MainWindow::payZClassicURI(QString uri) {
     if (!memo.isEmpty() && !Settings::isZAddress(addr)) {
         ui->MemoTxt1->clear();
         QMessageBox::information(this, tr("Memo not sent"),
-            tr("The memo in this payment link was not added: memos are only delivered to shielded z-addresses, not transparent t-addresses."));
+            tr("No memo added — memos only work with shielded (z) addresses, not public (t) ones."));
     } else {
         ui->MemoTxt1->setText(memo);
     }
@@ -3096,46 +3093,73 @@ void MainWindow::setupNFTTab() {
     // private FILE content only — never private ownership.
     auto* actionRow = new FlowLayout(/*margin=*/0, /*hSpacing=*/8, /*vSpacing=*/8);
     actionRow->setObjectName("nftActionRow");
-    nftSendFileBtn = new QPushButton(tr("Send a private file"), nftTab);
+    nftSendFileBtn = new QPushButton(tr("Send file"), nftTab);
     nftSendFileBtn->setObjectName("nftSendPrivateFileButton");
+    // Honesty in the tooltip: only the file's CONTENTS are encrypted; ownership stays
+    // public, and the encrypted file is stored on every node permanently.
+    nftSendFileBtn->setToolTip(tr(
+        "Send a file whose contents are private (encrypted) to one recipient. "
+        "Ownership stays public — only the file is private. The encrypted file is "
+        "stored on every node permanently and can never be deleted."));
     actionRow->addWidget(nftSendFileBtn);
-    nftRecvFileBtn = new QPushButton(tr("Receive a private file"), nftTab);
+    nftRecvFileBtn = new QPushButton(tr("Receive file"), nftTab);
     nftRecvFileBtn->setObjectName("nftReceivePrivateFileButton");
+    nftRecvFileBtn->setToolTip(tr(
+        "Receive a file whose contents are private (encrypted), addressed to you. "
+        "Ownership stays public — only the file is private."));
     actionRow->addWidget(nftRecvFileBtn);
-    nftBuyBtn = new QPushButton(tr("Buy an NFT"), nftTab);
+    nftBuyBtn = new QPushButton(tr("Buy"), nftTab);
     nftBuyBtn->setObjectName("nftBuyAnNftButton");
+    nftBuyBtn->setToolTip(tr("Buy a collectible from an offer."));
     actionRow->addWidget(nftBuyBtn);
-    nftMintBtn = new QPushButton(tr("Make a collectible"), nftTab);
+    nftMintBtn = new QPushButton(tr("Make"), nftTab);
     nftMintBtn->setObjectName("nftMakeButton");
+    nftMintBtn->setToolTip(tr("Make a new collectible."));
     actionRow->addWidget(nftMintBtn);
     outer->addLayout(actionRow);
 
+    // Stash each entry button's honesty tooltip so applyNFTSupportGating() can RESTORE
+    // it when the node supports NFTs (the gating swaps to the unsupported guidance while
+    // disabled). Without this the per-button content-only-privacy honesty would be
+    // cleared the moment the page re-enables.
+    for (QPushButton* b : { nftSendFileBtn, nftRecvFileBtn, nftBuyBtn, nftMintBtn }) {
+        if (b) b->setProperty("honestTooltip", b->toolTip());
+    }
+
     auto* sub = new QLabel(
-        tr("Your NFTs. The image on each card is checked against its on-chain fingerprint."),
+        tr("Each card's image is checked against its on-chain fingerprint."),
         nftTab);
     sub->setObjectName("nftGallerySubhead");
     sub->setWordWrap(true);
-    // Item B (honesty): the verify-badge disambiguation, available on the subhead so a
-    // user can learn what the green check does — and does NOT — mean.
+    // Item B (honesty): the verify-badge disambiguation PLUS the file-stays-local /
+    // fingerprint-on-chain / new-optional-feature honesty (folded in from the old intro
+    // panel when the empty view was collapsed to one line). Available on the subhead via
+    // WhatsThis so a user can learn what the green check does — and does NOT — mean.
     sub->setWhatsThis(
         tr("A green check (✓) on a card means the image matches the fingerprint "
            "recorded on-chain. It does NOT mean the collectible is genuine, official, "
-           "or authorized — anyone can mint a copy that reuses the same picture."));
+           "or authorized — anyone can mint a copy that reuses the same picture.\n\n"
+           "Owning a collectible is always public: who holds a token is recorded on the "
+           "ZClassic ledger for everyone to see. The image itself stays on your computer "
+           "— only its fingerprint goes on-chain, so the wallet can confirm the picture "
+           "you hold is the one that was recorded.\n\n"
+           "Collectibles are a new, optional feature layered on top of ZCL — please use "
+           "small amounts while we harden it."));
+    // Hidden while the grid is empty (the one-line empty state speaks for itself);
+    // shown once real cards arrive. setNFTItems() toggles it via findChild on the
+    // objectName (no header member needed — mainwindow.h is owned elsewhere).
+    sub->hide();
     outer->addWidget(sub);
 
-    // Item B: first-run Collections intro — what a collectible is + the calm
-    // non-consensus honesty, in one short panel. Shown only while the grid is empty
-    // (setNFTItems hides it once real rows arrive).
+    // Collapsed empty view (punchlist item 5): the verbose first-run intro is GONE — the
+    // empty state is now the single one-line nftStateLabel below, and the full honesty
+    // (collectible = public ownership, file stays local, fingerprint on-chain, new
+    // optional feature) lives in the subhead WhatsThis above + the Mint dialog. This
+    // label is retained only as a hidden no-op so the existing header member / toggles
+    // stay valid without editing mainwindow.h (owned elsewhere); it shows no second line.
     nftIntroLabel = new QLabel(nftTab);
     nftIntroLabel->setObjectName("nftGalleryIntro");
     nftIntroLabel->setWordWrap(true);
-    nftIntroLabel->setText(tr(
-        "A collectible is a one-of-a-kind item recorded on the ZClassic ledger. The "
-        "image stays on your computer — only its fingerprint goes on-chain, so the "
-        "wallet can confirm the picture you hold is the one that was recorded. "
-        "Collectibles are a new, optional feature layered on top of ZCL — please use "
-        "small amounts while we harden it."));
-    nftIntroLabel->setStyleSheet("color:#9aa0a6; font-size:11px;");
     nftIntroLabel->hide();
     outer->addWidget(nftIntroLabel);
 
@@ -3144,7 +3168,11 @@ void MainWindow::setupNFTTab() {
     nftStateLabel = new QLabel(nftTab);
     nftStateLabel->setObjectName("nftGalleryStateLine");
     nftStateLabel->setWordWrap(true);
-    nftStateLabel->setStyleSheet("color:#9aa0a6;");
+    // hint="true": QSS hook for the shared fine-print rule (dim #9aa0a6, 12pt). The
+    // inline color+pt is the immediate, in-file guarantee that this honesty line is at
+    // least 12pt (pt, never px) until the central QSS rule is wired by the styles owner.
+    nftStateLabel->setProperty("hint", "true");
+    nftStateLabel->setStyleSheet("color:#9aa0a6; font-size:12pt;");
     nftStateLabel->hide();
     outer->addWidget(nftStateLabel);
 
@@ -3266,12 +3294,13 @@ void MainWindow::applyNFTSupportGating(bool resolvedUnsupported) {
     const QString guidance = RPC::nftUnsupportedGuidance();
     const bool    enable   = !resolvedUnsupported;
 
-    // The entry points: disabled + the honest tooltip when unsupported; restored
-    // (no tooltip) when supported. Mint is where the user hit the original bug.
+    // The entry points: disabled + the honest "this node can't do collectibles"
+    // guidance when unsupported; restored to each button's own honesty tooltip when
+    // supported. Mint is where the user hit the original bug.
     for (QPushButton* b : { nftMintBtn, nftBuyBtn, nftSendFileBtn, nftRecvFileBtn }) {
         if (!b) continue;
         b->setEnabled(enable);
-        b->setToolTip(enable ? QString() : guidance);
+        b->setToolTip(enable ? b->property("honestTooltip").toString() : guidance);
     }
 
     // The grid hides and the guidance panel shows ONLY in the resolved-unsupported
@@ -3398,20 +3427,20 @@ void MainWindow::setNFTItems(const QVector<NFTItem>& items, bool indexOff) {
     }
 
     // Honor indexOff with a distinct, honest state line (NATIVE_NFT_GUIDE §2.3):
-    //   index off            -> "Collectibles tracking is turned off…"
-    //   index on, no rows     -> "No collectibles yet…"
+    //   index off            -> "Collectibles tracking is off…" (+ copyable config hint below)
+    //   index on, no rows     -> the single one-line empty state
     //   index on, has rows    -> hide the line (the grid speaks for itself)
     if (nftStateLabel) {
         if (indexOff) {
             nftStateLabel->setText(tr(
-                "Collectibles tracking is turned off on your node. Turn on the "
-                "collectibles index and the wallet will start finding your "
-                "collectibles after a one-time catch-up scan."));
+                "Collectibles tracking is off. Add the line below to your node config, "
+                "then restart — the wallet catches up once."));
             nftStateLabel->show();
         } else if (items.isEmpty()) {
+            // Collapsed empty view (punchlist item 5): ONE line; the honesty lives in
+            // the subhead WhatsThis.
             nftStateLabel->setText(tr(
-                "No collectibles yet. When someone sends you one, or you make one, "
-                "it shows up here."));
+                "No collectibles yet. Make one or buy one to get started."));
             nftStateLabel->show();
         } else {
             nftStateLabel->hide();
@@ -3419,12 +3448,17 @@ void MainWindow::setNFTItems(const QVector<NFTItem>& items, bool indexOff) {
     }
     // Item B: the COPYABLE zslpindex=1 hint is shown ONLY in the index-off state, so
     // a foreign/old daemon's owner can paste the exact config line (not a prose
-    // dead-end). The first-run intro shows while the grid is empty (index on), and is
-    // hidden once real rows arrive.
+    // dead-end). The verbose intro panel is gone (collapsed empty view); keep it hidden.
     if (nftIndexHint)
         nftIndexHint->setVisible(indexOff);
     if (nftIntroLabel)
-        nftIntroLabel->setVisible(!indexOff && items.isEmpty());
+        nftIntroLabel->hide();
+
+    // The subhead ("Each card's image is checked against its on-chain fingerprint.")
+    // is meaningful only when there ARE cards; hide it while the grid is empty so the
+    // single empty-state line stands alone. Toggled via objectName (no header member).
+    if (QLabel* sub = nftTab ? nftTab->findChild<QLabel*>(QStringLiteral("nftGallerySubhead")) : nullptr)
+        sub->setVisible(!items.isEmpty());
 
     // Real data now owns the gallery; never let a (dev) fixture feed clobber it.
     nftFixturesLoaded = true;
@@ -3954,10 +3988,8 @@ void MainWindow::setupReceivePrivacyDisclosure() {
     advCaption->setObjectName("lblReceiveAdvancedCaption");
     advCaption->setWordWrap(true);
     advCaption->setText(tr(
-        "⚠  Transparent (t) addresses are PUBLIC: the address and any balance it "
-        "holds are permanently visible to everyone on the blockchain. For privacy, "
-        "receive to a shielded (z) address instead. Legacy Sprout is shown only for "
-        "funds you already hold."));
+        "⚠  Transparent (t) addresses are PUBLIC — anyone can see the balance. "
+        "Use a shielded (z) address for privacy."));
 
     auto* radiosRow = new QHBoxLayout();
     radiosRow->setContentsMargins(0, 0, 0, 0);

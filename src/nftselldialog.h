@@ -15,9 +15,9 @@
 //
 // LIFETIME: while an RPC is in flight the window [X] is swallowed (closeEvent),
 // mirroring NFTSendDialog's UAF guard; the reply lambdas use a QPointer. C++14
-// only (empty-QString sentinels, no std::optional). The expiry combo ships a
-// fixed ~7-day daemon default in v1 (we pass expiryHeight=0); a tip-height-based
-// arbitrary expiry is a documented follow-up.
+// only (empty-QString sentinels, no std::optional). Expiry is the fixed ~7-day
+// daemon default in v1 (we pass expiryHeight=0), shown as a read-only line; a
+// tip-height-based custom expiry (with a real picker) is a documented follow-up.
 // ============================================================================
 #ifndef NFTSELLDIALOG_H
 #define NFTSELLDIALOG_H
@@ -31,7 +31,6 @@
 class QLabel;
 class QLineEdit;
 class QPlainTextEdit;
-class QComboBox;
 class QPushButton;
 class RPC;
 
@@ -70,7 +69,7 @@ private:
     // ---- compose-phase widgets ----
     QLineEdit*   m_priceEdit     = nullptr;
     QLabel*      m_priceStatus   = nullptr;
-    QComboBox*   m_expiryCombo   = nullptr;
+    QLabel*      m_expiryValue   = nullptr;   // read-only "About 7 days." (v1: no picker)
     QLineEdit*   m_buyerEdit     = nullptr;
     QLabel*      m_buyerStatus   = nullptr;
     QLabel*      m_mismatchWarn  = nullptr;   // shown only for verifyState==2

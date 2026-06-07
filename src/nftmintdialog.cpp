@@ -75,40 +75,29 @@ NftMintDialog::NftMintDialog(ContentEngine* engine, RPC* rpc, QWidget* parent)
     m_tickerEdit = new QLineEdit(this);
     outer->addWidget(m_tickerEdit);
 
-    outer->addWidget(new QLabel(tr("Link (optional — never opened for you)"), this));
+    outer->addWidget(new QLabel(tr("Link (optional)"), this));
     m_urlEdit = new QLineEdit(this);
-    m_urlEdit->setPlaceholderText(tr("https://… (stored as a hint only)"));
+    m_urlEdit->setPlaceholderText(tr("https://… (a hint — we never open it)"));
     outer->addWidget(m_urlEdit);
 
-    // ---- visibility tiles (Public wired; Private coming soon) ----
-    m_visLabel = new QLabel(this);
+    // ---- honesty block (load-bearing): ONE amber public/permanence line + ONE grey
+    // "file never uploaded" line. ZSLP genesis is PUBLIC; ownership is always public —
+    // only the file CONTENT stays on your computer. (Collapsed from 3 stacked labels.)
+    m_visLabel = new QLabel(
+        tr("Public — name, collection and fingerprint go on the public ledger "
+           "permanently and can't be removed."), this);
+    m_visLabel->setObjectName("nftMintPermanenceLabel");
     m_visLabel->setWordWrap(true);
-    if (RPC::isPrivateMintWired()) {
-        m_visLabel->setText(tr("Visibility: Public."));
-    } else {
-        m_visLabel->setText(
-            tr("Visibility: Public. (Private collectibles are coming in this release.)"));
-    }
-    m_visLabel->setStyleSheet("color:#d9822b;");
+    m_visLabel->setStyleSheet("color:#d9822b; font-size:12pt;");
     outer->addWidget(m_visLabel);
 
     auto* honest = new QLabel(
-        tr("Making a collectible does NOT upload your file anywhere. Only its "
-           "fingerprint goes on-chain — the file stays on your computer."), this);
+        tr("Your file is never uploaded — only its fingerprint is recorded."), this);
+    honest->setObjectName("nftMintFileNeverUploadedLabel");
+    honest->setProperty("hint", true);
     honest->setWordWrap(true);
-    honest->setStyleSheet("color:#9aa0a6; font-size:11px;");
+    honest->setStyleSheet("color:#9aa0a6; font-size:12pt;");
     outer->addWidget(honest);
-
-    // Item B (honesty): the permanence / public-ledger reality, surfaced visibly (not
-    // only in What's-This) right above Create. The name + collection + fingerprint are
-    // written to a permanent, PUBLIC ledger and can't be edited or removed later.
-    auto* permanence = new QLabel(
-        tr("The name, collection and fingerprint go on the public ledger permanently "
-           "— they can't be edited or removed later."), this);
-    permanence->setObjectName("nftMintPermanenceLabel");
-    permanence->setWordWrap(true);
-    permanence->setStyleSheet("color:#9aa0a6; font-size:11px;");
-    outer->addWidget(permanence);
 
     // ---- result + action bar ----
     m_resultLine = new QLabel(this);
@@ -211,7 +200,7 @@ void NftMintDialog::onDescriptorReady(quint64 token, ContentDescriptor d) {
         m_fpLabel->setText(tr("Fingerprint ready — %1 · %2")
                                .arg(m_anchorHex.left(8) + QStringLiteral("…"),
                                     ContentEngine::humanSize(d.fileSize)));
-        m_fpLabel->setStyleSheet("color:#2a9d2a;");
+        m_fpLabel->setStyleSheet("color:#34c759;");
     }
     refreshCreateEnabled();
 }
@@ -262,8 +251,8 @@ void NftMintDialog::onCreate() {
             // line, then retire Create -> terminal "Done" (shared scaffold).
             self->m_succeeded = true;
             self->m_resultLine->setText(
-                tr("Collectible created — it'll appear once it confirms on-chain."));
-            self->m_resultLine->setStyleSheet("color:#2a9d2a;");
+                tr("Created — it'll appear once confirmed."));
+            self->m_resultLine->setStyleSheet("color:#34c759;");
             self->finishPrimaryAsDone(self->m_createBtn, self->m_cancelBtn);
         },
         [self](QString errStr) {

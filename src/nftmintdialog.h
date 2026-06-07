@@ -8,11 +8,11 @@
 //   hex) + classifyKind for the glyph -> name (required), ticker (optional),
 //   document_url (optional, NEVER auto-fetched) -> Create.
 //
-// VISIBILITY POLARITY (load-bearing, §2.5): the building-now write path is the
-// PUBLIC zslp_genesis; the PRIVATE (ZDC1) path is not built. So the Public tile
-// is wired + default-selected and the Private tile is an honest disabled
-// "Coming in this release" gated by RPC::isPrivateMintWired()==false — never a
-// dead Create button.
+// VISIBILITY POLARITY (load-bearing, §2.5): the write path is the PUBLIC
+// zslp_genesis — name, collection and fingerprint go on the public ledger
+// permanently. This is stated up front in ONE amber line; a second grey line
+// makes the file-stays-local truth plain ("never uploaded — only its fingerprint
+// is recorded"). There is no private-mint tile (the ZDC1 path is not built).
 //
 // It is handed the EXISTING ContentEngine (nftImgCache) — it NEVER constructs a
 // second engine. On success the source bytes are cached (cachePut) so the new
@@ -86,7 +86,7 @@ private:
     QLineEdit*   m_nameEdit   = nullptr;
     QLineEdit*   m_tickerEdit = nullptr;
     QLineEdit*   m_urlEdit    = nullptr;
-    QLabel*      m_visLabel   = nullptr;   // Public/Private tiles status
+    QLabel*      m_visLabel   = nullptr;   // amber public/permanence honesty line
     QLabel*      m_resultLine = nullptr;
     QPushButton* m_createBtn  = nullptr;
     QPushButton* m_cancelBtn  = nullptr;   // disabled while in flight; "Done" after success
