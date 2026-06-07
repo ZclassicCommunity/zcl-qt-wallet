@@ -20,6 +20,7 @@
 #include "nftbuydialog.h"
 #include "shieldsenddialog.h"
 #include "shieldreceivedialog.h"
+#include "flowlayout.h"
 #include "settings.h"
 #include "version.h"
 #include "turnstile.h"
@@ -3080,27 +3081,34 @@ void MainWindow::setupNFTTab() {
     outer->setContentsMargins(12, 12, 12, 12);
     outer->setSpacing(8);
 
-    // Heading row: title (left) + a green "Make a collectible" button (right) that
-    // opens the mint wizard.
-    auto* headingRow = new QHBoxLayout();
+    // Heading: the title on its OWN line, then the action buttons in a FlowLayout
+    // below it. The buttons used to live in a non-wrapping QHBoxLayout, so on a narrow
+    // window (e.g. 1024x600) the 4 entry buttons overflowed / clipped off the right
+    // edge — the real "buttons too big / don't fit my screen" cause. FlowLayout wraps
+    // them onto the next line instead, so the row fits ANY width.
     auto* heading = new QLabel(tr("Collections"), nftTab);
     heading->setObjectName("nftGalleryHeading");
-    headingRow->addWidget(heading);
-    headingRow->addStretch(1);
-    // SHIELD entry points (private FILE content only — never private ownership).
-    auto* sendFileBtn = new QPushButton(tr("Send a private file"), nftTab);
-    sendFileBtn->setObjectName("nftSendPrivateFileButton");
-    headingRow->addWidget(sendFileBtn);
-    auto* recvFileBtn = new QPushButton(tr("Receive a private file"), nftTab);
-    recvFileBtn->setObjectName("nftReceivePrivateFileButton");
-    headingRow->addWidget(recvFileBtn);
-    auto* buyBtn = new QPushButton(tr("Buy an NFT"), nftTab);
-    buyBtn->setObjectName("nftBuyAnNftButton");
-    headingRow->addWidget(buyBtn);
-    auto* mintBtn = new QPushButton(tr("Make a collectible"), nftTab);
-    mintBtn->setObjectName("nftMakeButton");
-    headingRow->addWidget(mintBtn);
-    outer->addLayout(headingRow);
+    outer->addWidget(heading);
+
+    // The 4 entry points live in a wrap-to-next-line FlowLayout. They stay the SAME
+    // member pointers (nftSendFileBtn/nftRecvFileBtn/nftBuyBtn/nftMintBtn) so
+    // applyNFTSupportGating() can still disable them. SHIELD entry points carry
+    // private FILE content only — never private ownership.
+    auto* actionRow = new FlowLayout(/*margin=*/0, /*hSpacing=*/8, /*vSpacing=*/8);
+    actionRow->setObjectName("nftActionRow");
+    nftSendFileBtn = new QPushButton(tr("Send a private file"), nftTab);
+    nftSendFileBtn->setObjectName("nftSendPrivateFileButton");
+    actionRow->addWidget(nftSendFileBtn);
+    nftRecvFileBtn = new QPushButton(tr("Receive a private file"), nftTab);
+    nftRecvFileBtn->setObjectName("nftReceivePrivateFileButton");
+    actionRow->addWidget(nftRecvFileBtn);
+    nftBuyBtn = new QPushButton(tr("Buy an NFT"), nftTab);
+    nftBuyBtn->setObjectName("nftBuyAnNftButton");
+    actionRow->addWidget(nftBuyBtn);
+    nftMintBtn = new QPushButton(tr("Make a collectible"), nftTab);
+    nftMintBtn->setObjectName("nftMakeButton");
+    actionRow->addWidget(nftMintBtn);
+    outer->addLayout(actionRow);
 
     auto* sub = new QLabel(
         tr("Your NFTs. The image on each card is checked against its on-chain fingerprint."),
@@ -3166,10 +3174,27 @@ void MainWindow::setupNFTTab() {
     nftIndexHint->hide();
     outer->addWidget(nftIndexHint);
 
-    QObject::connect(mintBtn, &QPushButton::clicked, this, &MainWindow::openMintDialog);
-    QObject::connect(buyBtn,  &QPushButton::clicked, this, &MainWindow::openBuyDialog);
-    QObject::connect(sendFileBtn, &QPushButton::clicked, this, &MainWindow::openShieldSendDialog);
-    QObject::connect(recvFileBtn, &QPushButton::clicked, this, &MainWindow::openShieldReceiveDialog);
+    // BUG #1: the honest "this node can't do collectibles" guidance panel, shown
+    // INSTEAD of the empty gallery when the attached node lacks the NFT RPCs (an older
+    // foreign node). Word-wrapped so it fits any width; hidden until the probe resolves
+    // unsupported (fail-open). applyNFTSupportGating() toggles it + the grid.
+    nftUnsupportedPanel = new QWidget(nftTab);
+    nftUnsupportedPanel->setObjectName("nftUnsupportedPanel");
+    auto* unsupLayout = new QVBoxLayout(nftUnsupportedPanel);
+    unsupLayout->setContentsMargins(0, 8, 0, 0);
+    auto* unsupLabel = new QLabel(RPC::nftUnsupportedGuidance(), nftUnsupportedPanel);
+    unsupLabel->setObjectName("nftUnsupportedLabel");
+    unsupLabel->setWordWrap(true);
+    unsupLabel->setStyleSheet("color:#d9822b;");
+    unsupLayout->addWidget(unsupLabel);
+    unsupLayout->addStretch(1);
+    nftUnsupportedPanel->hide();
+    outer->addWidget(nftUnsupportedPanel);
+
+    QObject::connect(nftMintBtn, &QPushButton::clicked, this, &MainWindow::openMintDialog);
+    QObject::connect(nftBuyBtn,  &QPushButton::clicked, this, &MainWindow::openBuyDialog);
+    QObject::connect(nftSendFileBtn, &QPushButton::clicked, this, &MainWindow::openShieldSendDialog);
+    QObject::connect(nftRecvFileBtn, &QPushButton::clicked, this, &MainWindow::openShieldReceiveDialog);
 
     // --- the gallery view --------------------------------------------------
     auto* view = new QListView(nftTab);
@@ -3196,11 +3221,17 @@ void MainWindow::setupNFTTab() {
     QObject::connect(view, &QListView::activated, this, &MainWindow::openNFTDetail);
 
     outer->addWidget(view, 1);
+    nftGalleryView = view;   // BUG #1: hidden by applyNFTSupportGating when unsupported
 
     // --- add as a NEW tab right AFTER Transactions (index 3 -> NFT at 4) ----
     int activityIdx = ui->tabWidget->indexOf(ui->transactionsTable->parentWidget());
     int insertAt    = (activityIdx >= 0) ? activityIdx + 1 : ui->tabWidget->count();
     ui->tabWidget->insertTab(insertAt, nftTab, tr("Collections"));
+
+    // BUG #1: set the initial gating. Fail OPEN until the probe resolves (it has not
+    // run yet at construction), so the page behaves normally; onNFTCapabilityResolved()
+    // re-applies it once the probe lands.
+    applyNFTSupportGating(/*resolvedUnsupported=*/false);
 
     // Phase C1: the SHIPPED build feeds this gallery from the wallet's REAL on-chain
     // ZSLP NFTs — RPC::refreshNFTs() polls zslp_listmytokens + zslp_gettoken on the
@@ -3217,6 +3248,55 @@ void MainWindow::setupNFTTab() {
         loadNFTFixtures();
     });
 #endif
+}
+
+// ----------------------------------------------------------------------------
+// BUG #1: apply the NFT-capability gating to the Collections page. `resolvedUnsupported`
+// is true ONLY when the probe RESOLVED to "this node has no NFT RPCs" (an older foreign
+// node). In that state we show the honest guidance panel INSTEAD of an empty gallery,
+// hide the grid, and disable the Mint / Buy / Send-private / Receive-private entry
+// points with a matching tooltip — so an action can never dead-end on a raw "method not
+// found". When supported (or still unknown), the page behaves normally (fail-open).
+// Idempotent; safe no-op when the gallery tab was never built.
+// ----------------------------------------------------------------------------
+void MainWindow::applyNFTSupportGating(bool resolvedUnsupported) {
+    if (!nftTab)
+        return;   // gallery disabled -> nothing to gate
+
+    const QString guidance = RPC::nftUnsupportedGuidance();
+    const bool    enable   = !resolvedUnsupported;
+
+    // The entry points: disabled + the honest tooltip when unsupported; restored
+    // (no tooltip) when supported. Mint is where the user hit the original bug.
+    for (QPushButton* b : { nftMintBtn, nftBuyBtn, nftSendFileBtn, nftRecvFileBtn }) {
+        if (!b) continue;
+        b->setEnabled(enable);
+        b->setToolTip(enable ? QString() : guidance);
+    }
+
+    // The grid hides and the guidance panel shows ONLY in the resolved-unsupported
+    // state; otherwise the grid is the page and the panel stays hidden.
+    if (nftUnsupportedPanel)
+        nftUnsupportedPanel->setVisible(resolvedUnsupported);
+    if (nftGalleryView)
+        nftGalleryView->setVisible(!resolvedUnsupported);
+    // The empty/index-off/intro state lines belong to the supported flow; never show
+    // them stacked under the unsupported panel.
+    if (resolvedUnsupported) {
+        if (nftStateLabel) nftStateLabel->hide();
+        if (nftIndexHint)  nftIndexHint->hide();
+        if (nftIntroLabel) nftIntroLabel->hide();
+    }
+}
+
+// BUG #1: the NFT-capability probe resolved (RPC::probeNFTCapability). Re-apply the
+// gating. We treat ONLY a confirmed "unsupported" as unsupported; an unresolved or
+// supported probe leaves the page live (fail-open).
+void MainWindow::onNFTCapabilityResolved() {
+    if (!rpc)
+        return;
+    const bool resolvedUnsupported = rpc->nodeNFTProbeResolved() && !rpc->nodeSupportsNFT();
+    applyNFTSupportGating(resolvedUnsupported);
 }
 
 // ----------------------------------------------------------------------------
@@ -3308,6 +3388,14 @@ void MainWindow::openShieldReceiveDialog() {
 void MainWindow::setNFTItems(const QVector<NFTItem>& items, bool indexOff) {
     if (!nftModel)
         return;   // gallery disabled (no tab created) -> nothing to do
+
+    // BUG #1: if the attached node has CONFIRMED no NFT support, the honest guidance
+    // panel owns the page — never paint an empty/"index off" state line under it (that
+    // would imply NFTs work when they don't). Re-assert the gating and bail.
+    if (rpc && rpc->nodeNFTProbeResolved() && !rpc->nodeSupportsNFT()) {
+        applyNFTSupportGating(/*resolvedUnsupported=*/true);
+        return;
+    }
 
     // Honor indexOff with a distinct, honest state line (NATIVE_NFT_GUIDE §2.3):
     //   index off            -> "Collectibles tracking is turned off…"

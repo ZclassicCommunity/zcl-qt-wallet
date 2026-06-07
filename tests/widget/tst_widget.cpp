@@ -42,6 +42,7 @@
 #include <QLineEdit>
 #include <QProgressBar>
 #include <QVBoxLayout>
+#include <QScrollArea>
 #include <QFontMetrics>
 #include <QWidget>
 #include <QDialog>
@@ -3231,6 +3232,227 @@ private slots:
                  qPrintable("forcing Save with no verified file must refuse: " + state->text()));
 
         dlg->close();
+        w->deleteLater();
+    }
+
+    // ======================================================================
+    // BUG #1 — NFT-CAPABILITY gating (the user attached to an OLDER node that
+    // lacks the NFT RPCs, so minting 404'd with a cryptic "method not found").
+    // ======================================================================
+
+    // (a) nodeSupportsNFT=false => Collections shows the guidance panel AND the
+    //     Mint/Buy/Send-private/Receive-private entry points are DISABLED with the
+    //     honest tooltip. (Sell lives on the per-item detail dialog; the gallery
+    //     entry points are Mint/Buy/Send-private/Receive-private.)
+    void nftCapability_unsupportedShowsGuidanceAndDisablesEntries() {
+        Settings::getInstance()->setShowNFTGallery(true);
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+        QVERIFY2(w->isNFTGalleryActive(), "gallery tab must be built for this test");
+
+        // Force the probe result OFF (no daemon) and re-render the gating.
+        rpc->testSetNodeSupportsNFT(false);
+        w->onNFTCapabilityResolved();
+
+        auto* panel = w->findChild<QWidget*>("nftUnsupportedPanel");
+        auto* label = w->findChild<QLabel*>("nftUnsupportedLabel");
+        auto* view  = w->findChild<QWidget*>("nftGalleryView");
+        QVERIFY2(panel && label && view, "gallery must expose the unsupported panel + view");
+
+        // Assert the EXPLICIT show/hide flag (isHidden): the Collections tab is not the
+        // current QTabWidget page in this isolated test, so isVisibleTo(w) is false for
+        // everything on it — isHidden() reflects the gating decision regardless.
+        QVERIFY2(!panel->isHidden(), "unsupported node => guidance panel must be shown");
+        QVERIFY2(view->isHidden(),   "unsupported node => the empty grid must be hidden");
+        // The guidance is HONEST + actionable (and ZCL, never ZEC) — and never the
+        // raw RPC error.
+        QVERIFY2(label->text().contains("built-in node", Qt::CaseInsensitive),
+                 qPrintable("guidance must point at the built-in node: " + label->text()));
+        QVERIFY2(label->text().contains("beta7", Qt::CaseInsensitive),
+                 qPrintable("guidance must name the version that works: " + label->text()));
+        QVERIFY2(!label->text().contains("method not found", Qt::CaseInsensitive),
+                 "guidance must NEVER surface the raw 'method not found'");
+
+        // Every gallery entry point disabled with the matching tooltip.
+        for (const char* name : { "nftMakeButton", "nftBuyAnNftButton",
+                                  "nftSendPrivateFileButton", "nftReceivePrivateFileButton" }) {
+            auto* b = w->findChild<QPushButton*>(name);
+            QVERIFY2(b, qPrintable(QString("missing entry button ") + name));
+            QVERIFY2(!b->isEnabled(),
+                     qPrintable(QString("entry button must be disabled when unsupported: ") + name));
+            QVERIFY2(b->toolTip().contains("built-in node", Qt::CaseInsensitive),
+                     qPrintable(QString("entry button needs the honest tooltip: ") + name));
+        }
+
+        // And the inverse: a SUPPORTED node restores the page (no panel, entries on).
+        rpc->testSetNodeSupportsNFT(true);
+        w->onNFTCapabilityResolved();
+        QVERIFY2(panel->isHidden(), "supported node => guidance panel hidden");
+        QVERIFY2(!view->isHidden(), "supported node => the grid is shown");
+        auto* mint = w->findChild<QPushButton*>("nftMakeButton");
+        QVERIFY2(mint && mint->isEnabled(), "supported node => Mint re-enabled");
+        QVERIFY2(mint->toolTip().isEmpty(), "supported node => no leftover tooltip");
+
+        w->deleteLater();
+    }
+
+    // (b) An NFT RPC returning -32601 yields the calm guidance string (NOT "method
+    //     not found"). nftUnsupportedGuidance() is the single string the -32601 path
+    //     in zslpCalmError()/datachannelCalmError() returns, so asserting it locks
+    //     the honest message that backs EVERY NFT/zslp wrapper's -32601 mapping.
+    void nftCapability_minusThirtyTwoSixOhOneIsCalmGuidance() {
+        const QString g = RPC::nftUnsupportedGuidance();
+        QVERIFY2(!g.contains("method not found", Qt::CaseInsensitive),
+                 qPrintable("the -32601 guidance must never say 'method not found': " + g));
+        QVERIFY2(!g.contains("-32601"),
+                 qPrintable("the -32601 guidance must not leak the raw code: " + g));
+        // It must be ACTIONABLE: name the fix (quit the other node + restart, or upgrade).
+        QVERIFY2(g.contains("Quit", Qt::CaseInsensitive)
+                     && g.contains("restart", Qt::CaseInsensitive),
+                 qPrintable("guidance must tell the user to quit + restart: " + g));
+        QVERIFY2(g.contains("upgrade", Qt::CaseInsensitive),
+                 qPrintable("guidance must offer the upgrade path: " + g));
+        // Coin is ZCL, never ZEC/Zcash in user copy.
+        QVERIFY2(!g.contains("ZEC") && !g.contains("Zcash"),
+                 qPrintable("user copy must say ZClassic/ZCL, never ZEC/Zcash: " + g));
+
+        // End-to-end: the dialog seam routes the SAME calm guidance to the result line
+        // (never a raw error), exactly as the production -32601 mapping would.
+        Settings::getInstance()->setShowNFTGallery(true);
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+        ContentEngine engine(nullptr);
+        NftMintDialog* dlg = new NftMintDialog(&engine, rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+        auto* create = dlg->findChild<QPushButton*>("nftMintCreateButton");
+        auto* name   = dlg->findChild<QLineEdit*>("nftMintNameEdit");
+        auto* result = dlg->findChild<QLabel*>("nftMintResultLine");
+        QVERIFY(create && name && result);
+        name->setText("OldNode");
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        QString hashHex;
+        const QString png = writePngWithHash(tmp.path(), "d.png", Qt::cyan, hashHex);
+        dlg->testPickFile(png);
+        QVERIFY(pumpUntil([&]{ return create->isEnabled(); }));
+        // The seam injects what the real -32601 mapping produces.
+        rpc->testSetNextNftError(g);
+        create->click();
+        QVERIFY2(pumpUntil([&]{ return result->text().contains("built-in node", Qt::CaseInsensitive); }),
+                 qPrintable("mint -32601 must surface the calm guidance: " + result->text()));
+        QVERIFY2(!result->text().contains("method not found", Qt::CaseInsensitive),
+                 "mint must never dead-end on a raw 'method not found'");
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // (c) DIRECT mapping assertion: the shared zslpCalmError() mapper, given a JSON-RPC
+    //     body with error.code == -32601 and a null reply (exactly what every NFT/zslp
+    //     wrapper passes on a daemon error), must return nftUnsupportedGuidance()
+    //     VERBATIM — never the raw "method not found", never ZEC/Zcash. This locks the
+    //     -32601 -> calm-guidance mapping at the source, not just through a dialog.
+    void nftCalmError_minus32601MapsToGuidanceDirect() {
+        const QString mapped   = RPC::testCalmErrorForCode(-32601);
+        const QString guidance = RPC::nftUnsupportedGuidance();
+        QCOMPARE(mapped, guidance);
+        QVERIFY2(!mapped.contains("method not found", Qt::CaseInsensitive),
+                 qPrintable("the -32601 mapping must never surface 'method not found': " + mapped));
+        QVERIFY2(!mapped.contains("-32601"),
+                 qPrintable("the -32601 mapping must not leak the raw code: " + mapped));
+        QVERIFY2(!mapped.contains("ZEC") && !mapped.contains("Zcash"),
+                 qPrintable("user copy must say ZClassic/ZCL, never ZEC/Zcash: " + mapped));
+
+        // Sanity: a DIFFERENT code must NOT map to the unsupported guidance (proves the
+        // -32601 branch is doing real work, not a constant return).
+        QVERIFY2(RPC::testCalmErrorForCode(-13) != guidance,
+                 "only -32601 (method-not-found) maps to the unsupported guidance");
+    }
+
+    // ======================================================================
+    // BUG #2 — responsive sizing. The mint + detail dialogs must fit a SMALL
+    // screen (1280x720 with chrome, and the height stays <= ~640 so it fits
+    // 1024x600 after the user shrinks it). We assert minimumSizeHint() — the
+    // smallest the dialog can become — plus the detail dialog's chosen open size.
+    // ======================================================================
+    void nftDialogs_fitSmallScreen() {
+        const int kMaxW = 1280;
+        const int kMaxH = 640;
+
+        ContentEngine engine(nullptr);
+        MainWindow* w = makeWindow();
+
+        // MINT (where the user hit the bug): its smallest size must fit.
+        {
+            NftMintDialog* dlg = new NftMintDialog(&engine, w->getRPC(), w);
+            dlg->setAttribute(Qt::WA_DeleteOnClose);
+            dlg->show();
+            const QSize ms = dlg->minimumSizeHint();
+            QVERIFY2(ms.width()  <= kMaxW,
+                     qPrintable(QString("mint min width %1 must be <= %2").arg(ms.width()).arg(kMaxW)));
+            QVERIFY2(ms.height() <= kMaxH,
+                     qPrintable(QString("mint min height %1 must be <= %2").arg(ms.height()).arg(kMaxH)));
+            dlg->close();
+        }
+
+        // DETAIL: the tallest dialog. The OLD broken dialog used a hard
+        // setMinimumSize(760,560) with no scroll area, so its content min width was
+        // ~878 and it could not shrink onto a small screen — yet a loose `<= kMaxW`
+        // (1280) bound passed anyway (tautological). We now assert the REAL contract:
+        //   (a) minimumSizeHint().width() <= 700  -> catches the old ~878 content-min,
+        //   (b) the body lives in a QScrollArea named "nftDetailScroll" (so a tall
+        //       layout scrolls instead of forcing the window off-screen), and
+        //   (c) after shrinking to 600x420 the dialog actually shrinks to that size
+        //       (its required minimum fits within the given size — nothing clips).
+        {
+            NFTItem it; it.name = "Fits"; it.txid = "tokfit";
+            it.docHashHex = "ab"; it.cachePath = ""; it.isPrivate = false; it.verifyState = 1;
+            QVector<NFTItem> ordered; ordered.push_back(it);
+            NFTDetailDialog* dlg = new NFTDetailDialog(it, ordered, 0, &engine, nullptr, w);
+            dlg->setAttribute(Qt::WA_DeleteOnClose);
+            dlg->show();
+
+            // (a) the smallest the dialog can become must be genuinely small.
+            const QSize ms = dlg->minimumSizeHint();
+            QVERIFY2(ms.width()  <= 700,
+                     qPrintable(QString("detail minimumSizeHint width %1 must be <= 700 "
+                                        "(the old un-scrolled dialog was ~878)").arg(ms.width())));
+            QVERIFY2(ms.height() <= kMaxH,
+                     qPrintable(QString("detail min height %1 must be <= %2").arg(ms.height()).arg(kMaxH)));
+
+            // (b) the body must be in the scroll area, so a tall layout scrolls.
+            QScrollArea* scroll = dlg->findChild<QScrollArea*>("nftDetailScroll");
+            QVERIFY2(scroll != nullptr,
+                     "detail dialog body must live in a QScrollArea named 'nftDetailScroll'");
+
+            // The CHOSEN open size must also fit (the constructor clamps to the screen).
+            QVERIFY2(dlg->size().width()  <= kMaxW,
+                     qPrintable(QString("detail open width %1 must be <= %2").arg(dlg->size().width()).arg(kMaxW)));
+            QVERIFY2(dlg->size().height() <= kMaxH,
+                     qPrintable(QString("detail open height %1 must be <= %2").arg(dlg->size().height()).arg(kMaxH)));
+
+            // (c) shrink it to a tiny window: the layout must NOT require more than the
+            // given size. After resize+activate the actual size must match the request,
+            // which proves the layout's minimum fits inside it (no clipped controls).
+            dlg->resize(600, 420);
+            QVERIFY(QTest::qWaitForWindowExposed(dlg));
+            qApp->processEvents();
+            QVERIFY2(dlg->size().width()  <= 600,
+                     qPrintable(QString("detail must shrink to width 600, got %1 "
+                                        "(layout requires more than given size)").arg(dlg->size().width())));
+            QVERIFY2(dlg->size().height() <= 420,
+                     qPrintable(QString("detail must shrink to height 420, got %1 "
+                                        "(layout requires more than given size)").arg(dlg->size().height())));
+            if (QLayout* lay = dlg->layout()) {
+                QVERIFY2(lay->minimumSize().width()  <= 600,
+                         qPrintable(QString("detail layout minimum width %1 must fit 600")
+                                        .arg(lay->minimumSize().width())));
+                QVERIFY2(lay->minimumSize().height() <= 420,
+                         qPrintable(QString("detail layout minimum height %1 must fit 420")
+                                        .arg(lay->minimumSize().height())));
+            }
+            dlg->close();
+        }
+
         w->deleteLater();
     }
 

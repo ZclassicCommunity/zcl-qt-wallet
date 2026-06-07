@@ -2385,13 +2385,18 @@ void ConnectionLoader::classifyForeignDaemon(Connection* connection) {
     connection->doRPC(biPayload,
         [=] (json) {
             if (!alive || !*alive) return;   // W2: loader gone — do not touch members
-            // Foreign node WITH the bundled feature set (advisory only). Refresh the
+            // Foreign node that answers getbootstrapinfo (advisory only). Refresh the
             // flag for richer warmup progress, then ATTACH (avoids launching a second
-            // daemon onto the held ports).
+            // daemon onto the held ports). HONESTY (BUG #1): getbootstrapinfo presence
+            // is NOT a guarantee of the NFT feature set — an older node can answer it
+            // yet lack the zslp_*/nft_* RPCs. The REAL NFT capability is PROBED at
+            // runtime in RPC::probeNFTCapability() (fired from setConnection), which
+            // gates the NFT surfaces honestly. So we no longer claim a "bundled feature
+            // set" here.
             ezBootstrapRpcProbed = 1;
             QSettings().setValue("heal/daemonHasBootstrapRpc", 1);
             d->hide();
-            main->logger->write("Attached to a ZClassic node already running (bundled feature set).");
+            main->logger->write("Attached to a ZClassic node already running (probing NFT support).");
             this->doRPCSetConnection(connection);
         },
         [=] (auto, auto) {

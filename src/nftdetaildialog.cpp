@@ -15,6 +15,7 @@
 #include <QLabel>
 #include <QPushButton>
 #include <QFrame>
+#include <QScrollArea>
 #include <QFileDialog>
 #include <QClipboard>
 #include <QApplication>
@@ -24,12 +25,18 @@
 #include <QDateTime>
 #include <QFileInfo>
 #include <QPointer>
+#include <QGuiApplication>
+#include <QScreen>
 
 namespace {
     // Ownership is PENDING until ~10 confirmations (DEFAULT_MAX_REORG_DEPTH) — a
     // single named constant, honest everywhere (NATIVE_NFT_GUIDE §4.3).
     const qint64 kFinalConfs = 10;
-    const int    kStagePx    = 380;     // square image stage min edge
+    // Responsive sizing (BUG #2): the image stage was a hard 380px square that, with
+    // the info column, pinned the dialog wide AND tall. Drop the MIN edge to 240 (the
+    // stage still GROWS to fill the column on a roomy window via the layout stretch)
+    // so the dialog fits a small screen; keep the poster source high-res.
+    const int    kStagePx    = 240;     // square image stage MIN edge (grows with room)
     const int    kPosterPx   = 512;     // requested poster source size
 }
 
@@ -50,7 +57,13 @@ NFTDetailDialog::NFTDetailDialog(const NFTItem& item, const QVector<NFTItem>& or
                                  QWidget* parent)
     : QDialog(parent), m_ordered(ordered), m_engine(engine), m_rpc(rpc) {
     setWindowTitle(tr("Collectible"));
-    setMinimumSize(760, 560);
+    // Responsive sizing (BUG #2): the dialog used a HARD setMinimumSize(760, 560) that
+    // could not shrink onto a small screen and pushed buttons off-screen. We now (a)
+    // give a small, fits-everywhere minimum, (b) put the whole body in a QScrollArea so
+    // a genuinely tall layout scrolls instead of forcing the window taller than the
+    // screen, and (c) cap the initial size so it never opens larger than ~1100x640
+    // (fits 1280x720 with chrome, and 1024x600 after the user shrinks it).
+    setMinimumSize(560, 360);
 
     // Resolve the start index; fall back to a single-item list if the ordered set
     // is empty (defensive — the caller always passes a valid index).
@@ -58,8 +71,22 @@ NFTDetailDialog::NFTDetailDialog(const NFTItem& item, const QVector<NFTItem>& or
         m_ordered.push_back(item);
     m_index = (startIndex >= 0 && startIndex < m_ordered.size()) ? startIndex : 0;
 
-    // ---- title bar ----
-    auto* outer = new QVBoxLayout(this);
+    // ---- scrollable content host (BUG #2) ----
+    // `this` holds ONLY a QScrollArea; all the rich content lives in `content` so a
+    // short screen scrolls the body instead of clipping the action buttons.
+    auto* dlgLayout = new QVBoxLayout(this);
+    dlgLayout->setContentsMargins(0, 0, 0, 0);
+    auto* scroll = new QScrollArea(this);
+    scroll->setObjectName("nftDetailScroll");
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    auto* content = new QWidget(scroll);
+    scroll->setWidget(content);
+    dlgLayout->addWidget(scroll);
+
+    // ---- title bar (all content goes under `content`, not `this`) ----
+    auto* outer = new QVBoxLayout(content);
     outer->setContentsMargins(16, 12, 16, 12);
     outer->setSpacing(10);
 
@@ -239,6 +266,17 @@ NFTDetailDialog::NFTDetailDialog(const NFTItem& item, const QVector<NFTItem>& or
     }
 
     loadCurrent();
+
+    // Responsive initial size (BUG #2): open at a comfortable size but NEVER larger
+    // than the available screen (minus chrome). Caps to ~1040x620 and clamps to the
+    // current screen so it always fits 1280x720 and remains shrinkable on 1024x600.
+    int wantW = 1040, wantH = 620;
+    if (QScreen* scr = QGuiApplication::primaryScreen()) {
+        const QRect avail = scr->availableGeometry();
+        wantW = qMin(wantW, avail.width()  - 40);
+        wantH = qMin(wantH, avail.height() - 40);
+    }
+    resize(qMax(wantW, minimumWidth()), qMax(wantH, minimumHeight()));
 }
 
 void NFTDetailDialog::loadCurrent() {

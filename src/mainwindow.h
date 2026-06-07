@@ -127,6 +127,13 @@ public:
     // was actually created). RPC checks this before issuing any zslp_* read.
     bool isNFTGalleryActive() const { return nftModel != nullptr; }
 
+    // BUG #1: the NFT-capability probe (RPC::probeNFTCapability) resolved. Re-render
+    // the Collections page: when the attached node lacks NFT support, show the honest
+    // guidance panel INSTEAD of an empty gallery and disable the Mint/Sell/Send-private
+    // entry points (with a matching tooltip); when supported, restore them. Safe no-op
+    // when the gallery tab was never built. Idempotent (called on every (re)connect).
+    void onNFTCapabilityResolved();
+
     // PERF (warm-latency harness, t1 marker). Emitted at the END of
     // updateHomeFixIt() once the privacy-forward HERO labels have been (re)set, i.e.
     // the exact instant the user-visible balance is painted. Production-trivial: a
@@ -370,6 +377,25 @@ private:
     // honesty), shown above the grid only while the gallery has no rows.
     QLabel*          nftIntroLabel = nullptr;
     bool             nftFixturesLoaded = false;
+
+    // BUG #1: the honest "this node doesn't support collectibles" guidance panel, shown
+    // INSTEAD of the empty gallery when the attached node lacks the NFT RPCs (the probe
+    // resolved unsupported). Hidden when supported. Built in setupNFTTab, toggled by
+    // onNFTCapabilityResolved()/setNFTItems via applyNFTSupportGating().
+    QWidget*         nftUnsupportedPanel = nullptr;
+    // The gallery view + heading entry buttons, promoted to members so the capability
+    // gating can hide the grid + disable the Mint/Sell/Send-private entry points (with
+    // a matching tooltip) when the node is NFT-unsupported.
+    QWidget*         nftGalleryView      = nullptr;   // the QListView (cast to QWidget)
+    QPushButton*     nftMintBtn          = nullptr;
+    QPushButton*     nftBuyBtn           = nullptr;
+    QPushButton*     nftSendFileBtn      = nullptr;
+    QPushButton*     nftRecvFileBtn      = nullptr;
+    // Apply the current capability gating to the Collections page. resolvedUnsupported
+    // is true ONLY when the probe RESOLVED to "no NFT support" — while unknown/supported
+    // the page behaves normally (fail-open). Centralizes the show/hide + enable/tooltip
+    // so onNFTCapabilityResolved() and setNFTItems() share one path.
+    void applyNFTSupportGating(bool resolvedUnsupported);
     // Phase C1: the inner thumbnail width the delegate paints (card 168 - 2*8 pad).
     // Used by both the (dev) fixture feed and the real feed when queuing decodes.
     static const int nftThumbPx = 152;

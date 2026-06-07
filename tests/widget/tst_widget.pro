@@ -48,6 +48,7 @@ DEPENDPATH  += $$PWD/../../res
 # qrcode 3rdparty + singleapplication + the test itself.
 SOURCES += \
     ../../src/mainwindow.cpp \
+    ../../src/flowlayout.cpp \
     ../../src/rpc.cpp \
     ../../src/balancestablemodel.cpp \
     ../../src/privacybadgedelegate.cpp \

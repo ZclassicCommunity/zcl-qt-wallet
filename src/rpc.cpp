@@ -312,6 +312,12 @@ void RPC::setConnection(Connection* c) {
     Settings::removeFromZClassicConf(zclassicConfLocation, "rescan");
     Settings::removeFromZClassicConf(zclassicConfLocation, "reindex");
 
+    // BUG #1: probe whether THIS node actually has the NFT RPCs (it may be an older
+    // foreign node we attached to). Resets the flag to Unknown and resolves it async;
+    // until it resolves the UI fails open (NFT surfaces stay live), then re-gates via
+    // MainWindow::onNFTCapabilityResolved(). We PROBE — never parse the version.
+    probeNFTCapability();
+
     // W1-3: get the wallet UI onto the screen FIRST. The forced refresh (balances/
     // transactions) is the critical path the user is waiting on after connect; do it
     // immediately. This might also be coming from a settings update where we need to
@@ -868,6 +874,71 @@ static bool nftJsonBool(const json& o, const char* key, bool dflt = false) {
     return it->get<bool>();
 }
 
+// ===========================================================================
+// NFT-CAPABILITY probe (BUG #1 fix). The user can attach this wallet to an OLDER
+// foreign ZClassic node (e.g. a running beta6 release daemon) that lacks every
+// zslp_*/nft_*/z_*datafile RPC even though the wallet's embedded node has them.
+// We DETECT that by PROBING an actual NFT RPC and classifying -32601 ("Method not
+// found" / "unknown command") as NOT-supported — never by parsing the version
+// string (the embedded node mis-reports its version as a beta6-...-dirty string
+// even though it HAS the NFT RPCs). The result gates the Collections panel + the
+// Mint/Sell/Send-private entry points, and the SAME message backs every NFT RPC
+// wrapper's -32601 mapping so no action can dead-end on a raw "method not found".
+// ===========================================================================
+
+// Pull the JSON-RPC error code out of a (possibly bare-string / non-object) reply
+// body; returns 0 when absent. find()-only — operator[] on a non-object THROWS.
+static qint64 jsonRpcErrorCode(const json& parsed) {
+    if (!parsed.is_object()) return 0;
+    auto e = parsed.find("error");
+    if (e == parsed.end() || !e->is_object()) return 0;
+    auto c = e->find("code");
+    if (c == e->end() || !c->is_number()) return 0;
+    return (qint64) c->get<json::number_integer_t>();
+}
+
+// The ONE honest, actionable guidance shown wherever the attached node lacks NFT
+// support. HONESTY: name the exact cause + the exact fix. Coin is ZCL, never ZEC.
+QString RPC::nftUnsupportedGuidance() {
+    return QObject::tr(
+        "Collectibles need this wallet's built-in node. You're connected to an older "
+        "ZClassic node that doesn't support collectibles yet. Quit any other running "
+        "ZClassic node, then restart this wallet so it uses its built-in node "
+        "(v2.1.2-beta7 or newer), or upgrade your node to v2.1.2-beta7+.");
+}
+
+void RPC::probeNFTCapability() {
+    // Re-probe from scratch on a (re)connect: the new node may differ.
+    nftCapability = NftCap::Unknown;
+    if (conn == nullptr)
+        return;
+
+    // PROBE an actual NFT RPC with a tiny, cheap call. zslp_listtokens accepts an
+    // optional count; we ask for 1. A node WITHOUT the NFT RPCs returns JSON-RPC
+    // -32601 (RPC_METHOD_NOT_FOUND); a node WITH them answers (success — or any
+    // non-(-32601) error such as -1 "index off", which still proves the method
+    // EXISTS, i.e. the node IS NFT-capable). We never parse the version string.
+    json payload = {
+        {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "zslp_listtokens"},
+        {"params", json::array({ 1 })}
+    };
+    conn->doRPC(payload,
+        [this] (const json&) {
+            // The method exists and answered -> NFT-capable.
+            nftCapability = NftCap::Supported;
+            if (main != nullptr) main->onNFTCapabilityResolved();
+        },
+        [this] (QNetworkReply*, const json& parsed) {
+            // -32601 == method not found -> an OLDER node WITHOUT the NFT RPCs.
+            // ANY OTHER error proves the method exists (so the node IS capable);
+            // a transient/network error also leaves us capable (fail-open) rather
+            // than falsely hiding NFTs on a healthy NFT node that hiccuped once.
+            nftCapability = (jsonRpcErrorCode(parsed) == -32601)
+                              ? NftCap::Unsupported : NftCap::Supported;
+            if (main != nullptr) main->onNFTCapabilityResolved();
+        });
+}
+
 void RPC::refreshNFTs() {
     // No connection, or the gallery isn't active (Settings off / tab not built) ->
     // nothing to do. Skipping when inactive avoids a needless RPC every poll.
@@ -1027,9 +1098,13 @@ static QString zslpCalmError(const QNetworkReply* reply, const json& parsed) {
                 msg = QString::fromStdString(m->get<std::string>());
         }
     }
-    // -13 RPC_WALLET_UNLOCK_NEEDED, -6 RPC_WALLET_INSUFFICIENT_FUNDS,
+    // -32601 RPC_METHOD_NOT_FOUND: the attached node has NO NFT RPCs (an OLDER/foreign
+    // node, NOT this wallet's embedded one). BUG #1 — NEVER surface the raw "method not
+    // found"; route to the shared honest guidance (quit the other node + restart, or
+    // upgrade). -13 RPC_WALLET_UNLOCK_NEEDED, -6 RPC_WALLET_INSUFFICIENT_FUNDS,
     // -1  RPC_MISC_ERROR (the -zslpindex-off throw, GetZSLPStoreOrThrow).
     switch (code) {
+        case -32601: return RPC::nftUnsupportedGuidance();
         case -13: return QObject::tr("Your wallet is locked. Unlock it, then try again.");
         case -6:  return QObject::tr("Not enough funds to cover the network fee for this collectible action.");
         case -1:  return QObject::tr("Collectibles tracking is turned off on your node, so collectibles can't be created or sent right now.");
@@ -1041,6 +1116,16 @@ static QString zslpCalmError(const QNetworkReply* reply, const json& parsed) {
         return reply->errorString();
     return QObject::tr("The collectible action could not be completed.");
 }
+
+#ifdef ZCL_WIDGET_TEST
+// TEST SEAM: exercise the SHARED zslpCalmError() mapper with a synthetic JSON-RPC
+// error body and a null reply, so the unit test can assert the -32601 mapping itself
+// (== nftUnsupportedGuidance(), no "method not found", no ZEC/Zcash) without a daemon.
+QString RPC::testCalmErrorForCode(int errorCode) {
+    json parsed = { {"error", { {"code", errorCode}, {"message", "Method not found"} }} };
+    return zslpCalmError(nullptr, parsed);
+}
+#endif
 
 void RPC::mintNFT(const QString& name, const QString& ticker,
                   const QString& docHashHex, const QString& documentUrl,
@@ -1471,23 +1556,22 @@ void RPC::nftCancelOffer(const QString& offerId,
 // raw scary error, and never a pretense that the channel is on.
 // ===========================================================================
 
-// Calm error mapper for the data-channel RPCs: -32601 (method not found ==
-// channel OFF / not registered) becomes the actionable Settings hint; everything
-// else falls through to the shared zslpCalmError (lock/funds/own message).
-static QString datachannelCalmError(const QNetworkReply* reply, const json& parsed) {
-    qint64 code = 0;
-    if (parsed.is_object()) {
-        auto e = parsed.find("error");
-        if (e != parsed.end() && e->is_object()) {
-            auto c = e->find("code");
-            if (c != e->end() && c->is_number())
-                code = (qint64) c->get<json::number_integer_t>();
-        }
-    }
-    if (code == -32601)   // RPC_METHOD_NOT_FOUND -> -datachannel is off (or an old daemon)
+// Calm error mapper for the data-channel RPCs: -32601 (method not found) splits two
+// honest ways. If the attached node has NO NFT support AT ALL (an OLDER/foreign node,
+// confirmed by the capability probe — `nodeSupportsNFT==false`), -32601 means the
+// node simply lacks these RPCs, so we give the node-upgrade guidance (BUG #1) — NOT a
+// misleading "turn on a Setting" hint. On an NFT-capable node, -32601 genuinely means
+// -datachannel is off, so we give the actionable Settings hint. Everything else falls
+// through to the shared zslpCalmError (lock/funds/own message).
+static QString datachannelCalmError(const QNetworkReply* reply, const json& parsed,
+                                    bool nodeSupportsNFT) {
+    if (jsonRpcErrorCode(parsed) == -32601) {   // RPC_METHOD_NOT_FOUND
+        if (!nodeSupportsNFT)
+            return RPC::nftUnsupportedGuidance();
         return QObject::tr(
             "Private file transfers are turned off on your node. Turn on "
             "“Enable private file transfers” in Settings, then restart, to use this.");
+    }
     return zslpCalmError(reply, parsed);
 }
 
@@ -1550,7 +1634,7 @@ void RPC::sendDataFile(const QString& fromAddr, const QString& toAddr,
             }
             onDone(r);
         },
-        [=] (QNetworkReply* reply, const json& parsed) { onErr(datachannelCalmError(reply, parsed)); }
+        [=] (QNetworkReply* reply, const json& parsed) { onErr(datachannelCalmError(reply, parsed, nodeSupportsNFT())); }
     );
 }
 
@@ -1595,7 +1679,7 @@ void RPC::listDataTransfers(const std::function<void(QVector<DataTransferRow>)>&
             }
             onDone(rows);
         },
-        [=] (QNetworkReply* reply, const json& parsed) { onErr(datachannelCalmError(reply, parsed)); }
+        [=] (QNetworkReply* reply, const json& parsed) { onErr(datachannelCalmError(reply, parsed, nodeSupportsNFT())); }
     );
 }
 
@@ -1655,7 +1739,7 @@ void RPC::getDataTransfer(const QString& transferId, const QString& fingerprint,
             r.error               = nftJsonStr(result, "error");
             onDone(r);
         },
-        [=] (QNetworkReply* reply, const json& parsed) { onErr(datachannelCalmError(reply, parsed)); }
+        [=] (QNetworkReply* reply, const json& parsed) { onErr(datachannelCalmError(reply, parsed, nodeSupportsNFT())); }
     );
 }
 

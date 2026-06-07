@@ -43,6 +43,7 @@ CONFIG += c++14
 SOURCES += \
     src/main.cpp \
     src/mainwindow.cpp \
+    src/flowlayout.cpp \
     src/rpc.cpp \
     src/balancestablemodel.cpp \
     src/privacybadgedelegate.cpp \
@@ -79,6 +80,7 @@ SOURCES += \
 HEADERS += \
     src/notifyserver.h \
     src/securerandom.h \
+    src/flowlayout.h \
     src/mainwindow.h \
     src/precompiled.h \
     src/rpc.h \

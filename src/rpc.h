@@ -444,6 +444,42 @@ public:
     Turnstile*  getTurnstile()  { return turnstile; }
     Connection* getConnection() { return conn; }
 
+    // ---- NFT-CAPABILITY probe (BUG #1 fix) ----
+    // True UNLESS we have CONFIRMED the currently-attached node lacks NFT support. The
+    // user can attach to an OLDER foreign ZClassic node (e.g. a running beta6 release
+    // daemon) that has no zslp_*/nft_*/z_*datafile RPCs even though THIS wallet's
+    // embedded node does — gating the NFT surfaces on this flag turns the cryptic
+    // "method not found" into honest, actionable guidance. We PROBE an actual NFT RPC
+    // (we NEVER parse the daemon version string, which the embedded node mis-reports).
+    // Fail-OPEN while the probe is unresolved (returns true) so the gallery never
+    // flashes the "unsupported" panel during the brief warmup before the first reply.
+    // Re-probed on every setConnection() (a reconnect may be a different node).
+    bool nodeSupportsNFT() const { return nftCapability != NftCap::Unsupported; }
+    // True once the probe RESOLVED, so the UI can tell "still checking" from a
+    // confirmed yes/no (it shows the unsupported panel ONLY on a resolved-No).
+    bool nodeNFTProbeResolved() const { return nftCapability != NftCap::Unknown; }
+    // The ONE honest guidance string shown when the attached node lacks NFT support:
+    // the Collections panel, the disabled-entry tooltips, AND every NFT/zslp RPC
+    // wrapper's -32601 mapping all share it, so an action can never dead-end on a raw
+    // "method not found".
+    static QString nftUnsupportedGuidance();
+    // Fire the probe against the current connection. Safe no-op when conn==nullptr;
+    // on resolve it notifies the MainWindow so the gallery + entry points re-gate.
+    void probeNFTCapability();
+
+#ifdef ZCL_WIDGET_TEST
+    // TEST SEAM (BUG #1): force the capability flag without a daemon so the L1 tests
+    // can drive the "unsupported node" gating + calm -32601 mapping deterministically.
+    void testSetNodeSupportsNFT(bool supported) {
+        nftCapability = supported ? NftCap::Supported : NftCap::Unsupported;
+    }
+    // TEST SEAM: run the SHARED zslpCalmError() mapper against a synthetic JSON-RPC
+    // error body { "error": { "code": <code> } } with a null reply, exactly as every
+    // NFT/zslp wrapper does on a daemon error. Lets the unit test assert the -32601 ->
+    // nftUnsupportedGuidance() mapping directly (no daemon, no widgets).
+    static QString testCalmErrorForCode(int errorCode);
+#endif
+
 private:
     void refreshBalances();
 
@@ -631,6 +667,15 @@ private:
     // of source. The per-address listunspent join remains the sole owner of the
     // per-address balances model / UTXO set and never touches the hero labels.
     bool                        summaryCapable              = true;
+
+    // ---- NFT-CAPABILITY probe state (BUG #1 fix) ----
+    // Tri-state, reset to Unknown on every setConnection() and resolved by the first
+    // probeNFTCapability() reply: Supported (an NFT RPC answered) / Unsupported (-32601
+    // "method not found" — an older foreign node) / Unknown (probe in flight). The
+    // accessors above fail OPEN while Unknown so the UI never flashes the unsupported
+    // panel during warmup. We PROBE, never parse the version string.
+    enum class NftCap { Unknown, Supported, Unsupported };
+    NftCap                      nftCapability               = NftCap::Unknown;
 
     Connection*                 conn                        = nullptr;
     QProcess*                   ezclassicd                     = nullptr;
