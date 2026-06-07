@@ -44,7 +44,12 @@ MainWindow::MainWindow(QWidget *parent) :
     ui(new Ui::MainWindow)
 {
     ui->setupUi(this);
-    logger = new Logger(this, QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath("zcl-qt-wallet.log"));
+    // OPSEC: the debug log is plaintext on disk, so it's OFF by default. Power users can opt in
+    // (Settings) when they need diagnostics; an empty filename makes Logger a no-op sink.
+    QString logFile = Settings::getInstance()->getSaveDebugLog()
+        ? QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath("zcl-qt-wallet.log")
+        : QString();
+    logger = new Logger(this, logFile);
 
     // SELF-HEAL: a heal/inProgress flag seen at PROCESS STARTUP is necessarily stale —
     // it's a persisted QSettings flag that a prior session set just before a deferred
