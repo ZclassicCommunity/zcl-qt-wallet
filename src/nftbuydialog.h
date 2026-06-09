@@ -49,9 +49,16 @@ public:
     qint64  lastOvershootZat()  const { return m_lastOvershoot; }
     NFTVerifyResult verifyResult() const { return m_verified; }
 
+    // The single PUBLIC seam the Market dialog (Journey 4) uses to hand a BROWSED
+    // offerBlob into the proven verify/take flow: it drops the blob into the input
+    // (which resets the verify gate via textChanged) and auto-runs nft_verifyoffer —
+    // exactly what Paste/Open would do. The browsed blob is never reconstructed; the
+    // mandatory pre-pay verify still gates Buy. (testPasteOffer just calls this.)
+    void openWithOffer(const QString& blob);
+
 #ifdef ZCL_WIDGET_TEST
     // TEST-ONLY SEAM: feed an offer blob the same way Paste/Open would (the file
-    // dialog is un-drivable under offscreen QPA). Triggers the SAME auto-verify path.
+    // dialog is un-drivable under offscreen QPA). Delegates to openWithOffer().
     void testPasteOffer(const QString& blob);
 #endif
 

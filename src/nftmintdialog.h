@@ -25,11 +25,14 @@
 #include "nftasyncdialog.h"   // shared in-flight latch + [X]-swallow + Done/Try-again
 
 #include <QString>
+#include <QVector>
 #include "contentengine.h"   // ContentDescriptor by value in a slot signature
+#include "rpc.h"             // CollectionRow by value (held while the combo is populated)
 
 class QLabel;
 class QLineEdit;
 class QPushButton;
+class QComboBox;
 class RPC;
 
 class NftMintDialog : public NftAsyncDialog {
@@ -59,12 +62,14 @@ private slots:
     void onChooseFile();
     void onDescriptorReady(quint64 token, ContentDescriptor d);
     void onCreate();
+    void onCollectionChanged(int index);   // refresh the sealed-hint when the pick changes
     // After success the primary button is re-wired to QDialog::accept() by
     // NftAsyncDialog::finishPrimaryAsDone — no per-dialog onDoneClicked needed.
 
 private:
     void setPickedFile(const QString& path);     // begin hashing a chosen file
     void refreshCreateEnabled();
+    void loadCollections();                       // populate the optional collection combo
     // The anchor (document_hash) rule lives in ContentEngine::anchorHexFor — the
     // ONE shared definition used by the mint wizard AND the detail attach-gate.
 
@@ -90,6 +95,15 @@ private:
     QLabel*      m_resultLine = nullptr;
     QPushButton* m_createBtn  = nullptr;
     QPushButton* m_cancelBtn  = nullptr;   // disabled while in flight; "Done" after success
+
+    // ---- optional "add to a collection" picker (COLLECTIONS Phase-1) ----
+    // The combo's first row is the "standalone" sentinel (group_id == ""); each following
+    // row is one of the user's owned collections. A collection with no spendable authority
+    // unit left (sealed) is shown but DISABLED with an honest note. m_collections is index-
+    // aligned with the combo rows AFTER the sentinel (combo row N+1 -> m_collections[N]).
+    QComboBox*             m_collectionCombo = nullptr;
+    QLabel*                m_collectionHint  = nullptr;   // sealed / no-collections honesty
+    QVector<CollectionRow> m_collections;                 // owned collections (excludes the sentinel row)
 };
 
 #endif // NFTMINTDIALOG_H

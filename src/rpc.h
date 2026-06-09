@@ -5,6 +5,7 @@
 
 #include <QStringList>   // NFTVerifyResult::reasons (header-signature type, #119/PART2)
 #include <QVector>       // nftListOffers callback carries QVector<NFTOfferRow>
+#include "namescommon.h" // NameRow / ResolvedName (Names pillar; header-signature types)
 
 #include "balancestablemodel.h"
 #include "txtablemodel.h"
@@ -50,6 +51,25 @@ struct NFTOfferRow {
     QString status;                  // open / filled / expired / canceled
     qint64  priceZat = 0;
     qint64  expiryHeight = 0;
+};
+
+// BROWSE pillar (decentralized market discovery; Journey 4). One discovered offer
+// from the daemon's nft_browseoffers (the gossip/offer pool projection). Carried by
+// VALUE across the synchronous doRPC callback boundary (same pattern as NFTOfferRow),
+// so no metatype registration is needed. offerBlob carries the FULL "znftoffer:..."
+// prefix and is the single thing handed into the proven NFTBuyDialog verify/take flow
+// (we NEVER reconstruct an offer client-side). tokenName/collectionId are joined
+// client-side via zslp_gettoken (the offer pool has no name index — beta7 default).
+struct NFTBrowseRow {
+    QString offerId;
+    QString offerHash;
+    QString tokenId;
+    QString offerBlob;               // full "znftoffer:..." — fed straight into Buy
+    qint64  priceZat     = 0;
+    qint64  expiryHeight = 0;
+    bool    live         = true;
+    QString tokenName;               // client-side join (zslp_gettoken); "" if unknown
+    QString collectionId;            // client-side join (group_id); "" if standalone
 };
 
 // SHIELD (private file send/receive) PODs over the ZDC1 shielded data-channel
@@ -99,6 +119,44 @@ struct SendDataFileResult {
     QString fingerprint;             // 64-hex == NFT document_hash
     QString key;                     // hex per-transfer L3 disclosure key (the secret to safeguard)
     int     frames = 0;
+};
+
+// COLLECTIONS (group/child) PODs. A collection is an ordinary ZSLP token minted WITH
+// a mint baton + a quantity of "authority units" — its tokenid IS the group_id passed
+// to children. Each authorized child mint BURNS one unit (one unit = one card). Carried
+// by VALUE across the synchronous doRPC callback boundary (same pattern as NFTOfferRow);
+// no metatype registration needed. HONESTY: membership is `group_authorized` ONLY — a
+// token that merely NAMED a group (`group_claimed`) is NEVER a member.
+
+// One collection the wallet owns (built from zslp_listmytokens: a token with a mint
+// baton or a positive authority-unit balance). `balance` is the wallet's authority-unit
+// balance (how many MORE cards it can issue while units last). `hasMintBaton` means the
+// owner can mint more units later (extend the collection).
+struct CollectionRow {
+    QString tokenId;                 // == group_id (the parent genesis txid)
+    QString name;
+    QString ticker;
+    qint64  balance      = 0;        // wallet's authority-unit balance (cards still issuable)
+    bool    hasMintBaton = false;    // can mint more units later (extend)
+    qint64  totalMinted  = 0;        // total units ever minted (display)
+};
+
+// zslp_collectioninfo result: the parent token facts + the AUTHORIZED member count and
+// whether the collection is still open (a live parent unit exists -> can authorize more).
+struct CollectionInfo {
+    QString tokenId;                 // == group_id
+    QString name;
+    QString ticker;
+    qint64  memberCount = 0;         // AUTHORIZED children only
+    bool    open        = false;     // a live parent unit still exists -> can authorize more
+    bool    found       = false;     // false when the daemon reported "not found"
+};
+
+// One AUTHORIZED member of a collection (zslp_listcollectionmembers returns authorized
+// children only; group_authorized is always true here by construction).
+struct CollectionMember {
+    QString tokenId;                 // the child genesis txid
+    QString name;
 };
 
 struct WatchedTx {
@@ -218,7 +276,26 @@ public:
         { testNextTakeTxid = txid; testNextTakeOvershoot = overshootZat; }
     void testSetNextOfferList(const QVector<NFTOfferRow>& rows)
         { testNextOfferList = rows; testOfferListSet = true; }
+    // BROWSE seam (mirror the offer-list "set" flag): an empty browse result is still a
+    // valid delivery (the "pool is empty" honest state), distinct from "nothing
+    // installed" (perpetual in-flight). The SHARED testNextNftError still wins on top
+    // (drives the method-not-found -> calm honest line test).
+    void testSetNextBrowseResult(const QVector<NFTBrowseRow>& rows)
+        { testNextBrowseList = rows; testBrowseSet = true; }
     void testSetNextCancelResult(const QString& txid) { testNextCancelTxid = txid; }
+    // NAMES seams (mirror the SELL/cancel seams): the SHARED testNextNftError wins on
+    // ALL of these (the calm-error path is L1-testable); else the installed result
+    // fires onDone; else the call returns WITHOUT firing either callback (the
+    // perpetual-in-flight closeEvent-swallow test). One-shot (consumed on use). The
+    // resolve/list results need explicit "set" flags because a not-found resolve / an
+    // empty list is still a valid delivery (distinct from "nothing installed").
+    void testSetNextNameRegisterResult(const QString& txid, const QString& owner)
+        { testNextNameTxid = txid; testNextNameOwner = owner; }
+    void testSetNextNameTransferResult(const QString& txid) { testNextNameTransferTxid = txid; }
+    void testSetNextNameResolve(bool found, const ResolvedName& r)
+        { testNextResolveFound = found; testNextResolve = r; testResolveSet = true; }
+    void testSetNextNameListMine(const QVector<NameRow>& rows)
+        { testNextNameList = rows; testNameListSet = true; }
     // SHIELD seams (mirror the SELL seams): a non-empty testNextNftError wins on all of
     // these (the calm-error path is L1-testable, incl. the channel-off -32601 message);
     // else the installed result fires onDone; else the call returns WITHOUT firing either
@@ -235,6 +312,24 @@ public:
     // testReceivedSet left false) routes to the error cb instead.
     void testSetNextReceived(qint64 confs, qint64 blocktime)
         { testNextReceivedConfs = confs; testNextReceivedBlocktime = blocktime; testReceivedSet = true; }
+    // COLLECTIONS seams (mirror the mint/sell seams). A non-empty testNextNftError wins on
+    // all of them (the calm-error path is L1-testable); else the installed result fires
+    // onDone; else the call returns WITHOUT firing either callback (the perpetual-in-flight
+    // closeEvent-swallow test). One-shot. The list/info results need explicit "set" flags
+    // because an empty list / not-found is still a valid delivery. createCollection /
+    // mintCardIntoCollection reuse testNextMintTxid/testNextMintTokenId (same {txid,tokenid}
+    // shape as mintNFT); mintCardIntoCollection ALSO records the group_id it was passed so a
+    // test can assert it was forwarded.
+    void testSetNextCollectionList(const QVector<CollectionRow>& rows)
+        { testNextCollectionList = rows; testCollectionListSet = true; }
+    void testSetNextCollectionInfo(const CollectionInfo& info)
+        { testNextCollectionInfo = info; testCollectionInfoSet = true; }
+    void testSetNextCollectionMembers(const QVector<CollectionMember>& rows)
+        { testNextCollectionMembers = rows; testCollectionMembersSet = true; }
+    // The last group_id mintCardIntoCollection was asked to forward ("" == standalone NFT),
+    // so an L1 test can assert the chosen collection was actually passed through. Cleared at
+    // the START of each mintCardIntoCollection call.
+    QString testLastMintGroupId() const { return testRecordedMintGroupId; }
 #endif
 
     // SAFE-RACE: synchronously-driven re-poll of ONLY the transparent UTXOs, spliced into
@@ -372,10 +467,64 @@ public:
     void nftListOffers(const std::function<void(QVector<NFTOfferRow>)>& onDone,
                        const std::function<void(QString errStr)>& onErr);
 
+    // BROWSE the decentralized offer pool (nft_browseoffers; Journey 4). A SINGLE JSON
+    // OBJECT param { tokenId?, maxPriceZat?, from, count } — empty tokenId / zero
+    // maxPriceZat sentinels are OMITTED from the wire (no dead filter fields). The
+    // daemon returns an array of discovered offers (each carrying the full
+    // "znftoffer:..." offerBlob); we parse it into NFTBrowseRow and the caller joins
+    // name/collection client-side via zslp_gettoken. An empty pool yields an empty
+    // list (no dialog). On RPC_METHOD_NOT_FOUND (-32601) — a daemon that predates the
+    // browse RPC, or a foreign node — onErr fires with the CALM honest guidance (the
+    // caller maps it to the "discovery is off" empty state, never a scary error).
+    void nftBrowseOffers(const QString& tokenIdOrEmpty, qint64 maxPriceZatOr0,
+                         int fromIdx, int count,
+                         std::function<void(QVector<NFTBrowseRow>)> onDone,
+                         std::function<void(QString)> onErr);
+
     // Cancel an outstanding sell offer by self-spending its NFT UTXO. onDone(txid).
     void nftCancelOffer(const QString& offerId,
                         const std::function<void(QString txid)>& onDone,
                         const std::function<void(QString errStr)>& onErr);
+
+    // ---- NAMES pillar (ZNAM; non-consensus owner-redirect overlay over standard
+    // OP_RETURN txs). Each wrapper mirrors nftCancelOffer EXACTLY: a test seam
+    // (ZCL_WIDGET_TEST) drives the dialog to a terminal state with no daemon, then
+    // the real path sends POSITIONAL params via doRPC and maps errors through
+    // zslpCalmError. The daemon name_* signatures are AUTHORITATIVE. Coin is ZCL.
+
+    // REGISTER a name (first-in-first-served). target_type is sent as a REAL JSON
+    // INT (1..7, never a string). value is the target payload (e.g. an address/onion/
+    // hash). ownerAddr "" => the daemon picks an own address. The name is validated
+    // client-side (znamIsValidName) BEFORE any RPC; an invalid name fires onErr with
+    // the reason and never touches the wire. On success onDone(txid, owner) — the
+    // registration is 0-conf (invisible to the confirmed-only indexer until it
+    // confirms), so the caller shows "registered — confirming", never instant Done.
+    void nameRegister(const QString& name, int targetType, const QString& value,
+                      const QString& ownerAddr,
+                      const std::function<void(QString txid, QString owner)>& onDone,
+                      const std::function<void(QString errStr)>& onErr);
+
+    // TRANSFER a name to a new owner. newOwner MUST be a transparent t-address (the
+    // GUI rejects z-addrs client-side; the daemon rejects them too). On success the
+    // name leaves this wallet (0-conf); onDone(txid) lets the caller show
+    // "transferred — confirming". onErr(calm honest message).
+    void nameTransfer(const QString& name, const QString& newOwner,
+                      const std::function<void(QString txid)>& onDone,
+                      const std::function<void(QString errStr)>& onErr);
+
+    // RESOLVE a name (read-only). name_resolve returns null for an unregistered
+    // (available) name -> onDone(false, {}); otherwise onDone(true, ResolvedName)
+    // with owner/status/primary + every record[] / text[] row filled. onErr only on
+    // transport/parse failure.
+    void nameResolve(const QString& name,
+                     const std::function<void(bool found, ResolvedName)>& onDone,
+                     const std::function<void(QString errStr)>& onErr);
+
+    // LIST the names this wallet owns (name_listmine, called with EMPTY params —
+    // the daemon's zero-arg wallet-self-enumeration mode). onDone(rows of NameRow);
+    // onErr(calm). An index-off / empty wallet yields an empty list (no dialog).
+    void nameListMine(const std::function<void(QVector<NameRow>)>& onDone,
+                      const std::function<void(QString errStr)>& onErr);
 
     // ---- SHIELD pillar (private file send/receive over the ZDC1 data-channel) ----
     // Each wraps one daemon z_*datafile / z_*datatransfer RPC (src/rpc/datachannel.cpp),
@@ -426,6 +575,50 @@ public:
     void nftListTransfers(const QString& tokenId,
                           const std::function<void(json transfers)>& onDone,
                           const std::function<void(QString errStr)>& onErr);
+
+    // ---- COLLECTIONS pillar (group/child; non-consensus ZSLP) ----
+    // CREATE a collection: mint a parent token WITH a mint baton + `cardCount` authority
+    // units. Its tokenid becomes the group_id passed to children; each authorized child
+    // burns one unit. name/ticker optional. cardCount is the number of cards you can issue
+    // now (>=1); the baton lets you mint more units later. onDone(txid, tokenid==group_id);
+    // onErr(calm honest message). C++14: empty-QString sentinels, no std::optional.
+    void createCollection(const QString& name, const QString& ticker, qint64 cardCount,
+                          const std::function<void(QString txid, QString tokenid)>& onDone,
+                          const std::function<void(QString errStr)>& onErr);
+
+    // MINT an AUTHORIZED child NFT into a collection. Same as mintNFT but adds
+    // group_id=<collectionId> — the daemon auto-selects + burns one live parent unit as
+    // authorization. Pass groupId "" to mint a standalone NFT (identical to mintNFT).
+    // docHashHex MUST be 64 lowercase hex; documentUrl is NEVER auto-fetched.
+    // onDone(txid, tokenid); onErr(calm).
+    void mintCardIntoCollection(const QString& name, const QString& ticker,
+                                const QString& docHashHex, const QString& documentUrl,
+                                const QString& groupId,
+                                const std::function<void(QString txid, QString tokenid)>& onDone,
+                                const std::function<void(QString errStr)>& onErr);
+
+    // LIST the collections this wallet owns. Derived client-side from zslp_listmytokens:
+    // a token qualifies as a collection the user can manage when it carries a mint baton
+    // (hasmintbaton) OR a positive non-NFT balance (authority units) — i.e. a fungible
+    // token (decimals 0, quantity > 1, or a baton) rather than a 1-of-1 child. onDone(rows);
+    // onErr(calm). An index-off / empty wallet yields an empty list (no dialog).
+    void listMyCollections(const std::function<void(QVector<CollectionRow>)>& onDone,
+                           const std::function<void(QString errStr)>& onErr);
+
+    // INFO for one collection (zslp_collectioninfo "<group_id>"): parent token facts +
+    // authorized member count + open/sealed. onDone(info); onErr(calm). A "not found"
+    // delivers onDone(info) with info.found==false (so the caller can show an honest
+    // empty header without a scary dialog).
+    void collectionInfo(const QString& groupId,
+                        const std::function<void(CollectionInfo)>& onDone,
+                        const std::function<void(QString errStr)>& onErr);
+
+    // LIST the AUTHORIZED members of a collection (zslp_listcollectionmembers, paginated).
+    // Returns authorized children ONLY — a `group_claimed` squatter is never here. onDone(
+    // rows); onErr(calm).
+    void listCollectionMembers(const QString& groupId, int from, int count,
+                               const std::function<void(QVector<CollectionMember>)>& onDone,
+                               const std::function<void(QString errStr)>& onErr);
 
     // Pure conversion helper (L0-testable): human ZCL (double) -> zatoshi (qint64),
     // rounded to the nearest zat. Clamped at 0. The ONE place price strings become zat.
@@ -760,7 +953,17 @@ private:
     qint64                      testNextTakeOvershoot     = 0;
     QVector<NFTOfferRow>        testNextOfferList;
     bool                        testOfferListSet          = false;
+    // BROWSE seam backing store (one-shot; consumed inside nftBrowseOffers).
+    QVector<NFTBrowseRow>       testNextBrowseList;
+    bool                        testBrowseSet             = false;
     QString                     testNextCancelTxid;
+    // NAMES seam backing stores (one-shot; consumed inside the name_* wrappers).
+    QString                     testNextNameTxid, testNextNameOwner, testNextNameTransferTxid;
+    ResolvedName                testNextResolve;
+    bool                        testResolveSet            = false;
+    bool                        testNextResolveFound      = false;
+    QVector<NameRow>            testNextNameList;
+    bool                        testNameListSet           = false;
     // SHIELD seam backing stores (one-shot; consumed inside the data-channel wrappers).
     SendDataFileResult          testNextSendDataFile;
     bool                        testSendDataFileSet       = false;
@@ -768,6 +971,14 @@ private:
     bool                        testDataXferListSet       = false;
     DataTransferResult          testNextDataXfer;
     bool                        testDataXferSet           = false;
+    // COLLECTIONS seam backing stores (one-shot; consumed inside the collection wrappers).
+    QVector<CollectionRow>      testNextCollectionList;
+    bool                        testCollectionListSet     = false;
+    CollectionInfo              testNextCollectionInfo;
+    bool                        testCollectionInfoSet     = false;
+    QVector<CollectionMember>   testNextCollectionMembers;
+    bool                        testCollectionMembersSet  = false;
+    QString                     testRecordedMintGroupId;   // group_id forwarded by the last mintCardIntoCollection
 #endif
 };
 

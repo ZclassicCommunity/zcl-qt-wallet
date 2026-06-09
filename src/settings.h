@@ -75,6 +75,12 @@ public:
     bool    getShowNFTGallery();
     void    setShowNFTGallery(bool show);
 
+    // Opt-out (default ON): show the native "Names" tab (ZNAM register/resolve/
+    // transfer + My-Names). Pure GUI; gating its creation keeps the nav-rail<->tab
+    // index mapping clean when disabled (same idiom as getShowNFTGallery).
+    bool    getShowNamesTab();
+    void    setShowNamesTab(bool show);
+
     // Opt-in (default OFF): the SHIELD data-channel for private FILE transfers.
     // This is the user's stated INTENT, persisted as a GUI preference; the actual
     // capability is the daemon -datachannel flag (default off), which the dialog

@@ -19,6 +19,7 @@ class QPushButton;
 class QToolButton;
 class QWidget;
 class QCheckBox;
+class QStandardItemModel;
 class NFTGalleryModel;
 class NFTImageCache;
 
@@ -134,6 +135,30 @@ public:
     // when the gallery tab was never built. Idempotent (called on every (re)connect).
     void onNFTCapabilityResolved();
 
+    // ---- IDIOTPROOF NODE-SWAP (Collections "Use this wallet's built-in node") ----
+    // User-initiated swap from an OLD foreign node to this wallet's built-in node. Spins up
+    // a FRESH ConnectionLoader (the connect-time one is gone post-handoff) and runs its swap
+    // state machine. Safe no-op if there is no RPC or we already OWN the node (embedded).
+    // Wired to the panel's nftUseBuiltInBtn (and the swap-guidance Retry button).
+    void switchToBuiltInNode();
+    // Called by the swap state machine to push honest progress/guidance copy into the
+    // Collections panel. `message` is the one honest line; when `retry` a Retry button is
+    // shown (re-runs switchToBuiltInNode); when `serviceCmd` is non-empty it is shown as a
+    // copy-pasteable command line (the systemctl-stop guidance for a service node). Empty-
+    // QString sentinel for "no command" (C++14, no std::optional).
+    void setNodeSwapProgress(const QString& message, bool retry, const QString& serviceCmd);
+    // The swap reached "start the built-in node": a reconnect + NFT re-probe is in flight.
+    // Latches so the NEXT onNFTCapabilityResolved() emits the swap end marker
+    // ("ZQW-E2E swap: supported" / "...: failed") — the loader is gone by then, so MainWindow
+    // owns that final marker. ALSO arms a never-stuck watchdog (see onNodeSwapWatchdogTimeout):
+    // if the embedded node never comes online, the probe never lands and the panel would sit on
+    // "Starting the built-in node…" forever — the watchdog ends that with a retryable failure.
+    void noteNodeSwapAwaitingProbe();
+    // NEVER-STUCK backstop. Fired by the watchdog (or invoked directly by the L1 test): if a
+    // swap is still awaiting its post-start probe, force an honest, retryable failure into the
+    // Collections panel and emit the swap 'failed' end marker. Idempotent (no-op once resolved).
+    void onNodeSwapWatchdogTimeout();
+
     // PERF (warm-latency harness, t1 marker). Emitted at the END of
     // updateHomeFixIt() once the privacy-forward HERO labels have been (re)set, i.e.
     // the exact instant the user-visible balance is painted. Production-trivial: a
@@ -149,6 +174,26 @@ public:
     void updateFromCombo();
 
     Ui::MainWindow*     ui;
+
+    // ---- NAMES pillar (ZNAM) tab ----
+    // The native "Names" tab: register / look up / transfer a ZNAM name + a list of
+    // the names this wallet owns. Built AFTER setupNFTTab() so its live tab index sits
+    // right after Collections. Gated on Settings::getShowNamesTab(); when off the tab
+    // + rail button are never created, so the existing index mapping is unchanged.
+    // Public (alongside `ui`) because the L1 widget tests assert the Names IA + the
+    // My-Names list model through these members.
+    void setupNamesTab();
+    void openRegisterNameDialog();
+    void openResolveNameDialog();
+    void openTransferNameDialog();
+    // Re-pull name_listmine and repopulate namesModel + toggle the empty state.
+    void refreshMyNames();
+    QWidget*             namesTab          = nullptr;   // the Names page (added to tabWidget)
+    QPushButton*         namesRegisterBtn  = nullptr;
+    QPushButton*         namesResolveBtn   = nullptr;
+    QPushButton*         namesTransferBtn  = nullptr;
+    QStandardItemModel*  namesModel        = nullptr;   // the My-Names list model
+    QLabel*              namesEmptyLabel   = nullptr;    // honest empty / index-off state
 
     // ---- Deliverable A: read-only "you're helping the network" panel ----
     // Built in C++ into the existing zclassicd-tab grid (groupBox_5/gridLayout_5)
@@ -332,6 +377,12 @@ private:
     // every resize, so the 40pt balance shrinks (with an ellipsis) instead of pinning a
     // large minimum width. See relayoutHero() / heroPrivateFull.
     void resizeEvent(QResizeEvent* event) override;
+    // FONT-FIT (one-shot on first show, when the stylesheet + real font/DPI are applied):
+    // size the nav rail to its widest label, grow any button that would clip its text, and make
+    // all labels copy-pasteable. Doing it in showEvent (not the ctor) is what makes it correct at
+    // the USER's font scale, not just the dev's.
+    void showEvent(QShowEvent* event) override;
+    bool guiFitDone = false;
 
     void setupTrayIcon();
     QSystemTrayIcon* trayIcon       = nullptr;
@@ -361,8 +412,12 @@ private:
     void openNFTDetail(const QModelIndex& idx);
     void openMintDialog();
     void openBuyDialog();   // "Buy an NFT" — opens NFTBuyDialog (#119/PART2)
+    void openMyListingsDialog();   // "My listings" — opens NFTListingsDialog (view + cancel my offers)
+    void openNftMarketDialog();    // "Browse market" — opens NFTMarketDialog (Journey 4: browse/search + Buy handoff)
     void openShieldSendDialog();      // SHIELD: "Send a private file" (file content only)
     void openShieldReceiveDialog();   // SHIELD: "Receive a private file" (verify-before-decrypt)
+    void openCreateCollectionDialog();  // COLLECTIONS: "Create a collection" (CollectionCreateDialog)
+    void openBrowseCollectionDialog();  // COLLECTIONS: "Browse a collection" (CollectionBrowseDialog)
     NFTGalleryModel* nftModel    = nullptr;
     NFTImageCache*   nftImgCache = nullptr;
     QWidget*         nftTab      = nullptr;   // the gallery page (added to tabWidget)
@@ -383,14 +438,41 @@ private:
     // resolved unsupported). Hidden when supported. Built in setupNFTTab, toggled by
     // onNFTCapabilityResolved()/setNFTItems via applyNFTSupportGating().
     QWidget*         nftUnsupportedPanel = nullptr;
+    // IDIOTPROOF NODE-SWAP UI (lives inside nftUnsupportedPanel). The primary "Use this
+    // wallet's built-in node" button is shown ONLY when the unsupported node is FOREIGN
+    // (ezclassicd == nullptr — not one we spawned); a swap-progress line + an optional
+    // copy-pasteable service command + a Retry button drive the swap state machine's copy.
+    QLabel*          nftUnsupportedLabel    = nullptr;   // the honest "older node" line
+    QPushButton*     nftUseBuiltInBtn       = nullptr;   // primary swap action
+    QLabel*          nftSwapProgressLabel   = nullptr;   // "Stopping…" / "Starting…" / errors
+    QLabel*          nftSwapServiceCmdLabel = nullptr;   // monospace systemctl-stop command
+    QPushButton*     nftSwapRetryBtn        = nullptr;   // retry after a service/failure
+    // True between "start the built-in node" and the next NFT probe resolving, so MainWindow
+    // emits the swap end marker (the loader is deleted before the probe lands). See
+    // noteNodeSwapAwaitingProbe().
+    bool             nodeSwapAwaitingProbe  = false;
+    // True for the whole duration of a swap (button click -> terminal state). While set, a
+    // BACKGROUND capability re-gate (setNFTItems -> applyNFTSupportGating) must NOT wipe the
+    // live "Stopping…/Starting…" progress line the user is watching. Cleared once the swap
+    // reaches a user-actionable end state (success, or any retryable failure/guidance).
+    bool             nodeSwapInProgress     = false;
+    // Generation token for the never-stuck swap watchdog (see noteNodeSwapAwaitingProbe). Each
+    // armed watchdog captures the current value; a resolve or a newer swap bumps it so a stale
+    // singleShot fires into a no-op instead of clobbering a later attempt.
+    int              nodeSwapWatchdogGen    = 0;
     // The gallery view + heading entry buttons, promoted to members so the capability
     // gating can hide the grid + disable the Mint/Sell/Send-private entry points (with
     // a matching tooltip) when the node is NFT-unsupported.
     QWidget*         nftGalleryView      = nullptr;   // the QListView (cast to QWidget)
     QPushButton*     nftMintBtn          = nullptr;
     QPushButton*     nftBuyBtn           = nullptr;
+    QPushButton*     nftBrowseOffersBtn  = nullptr;   // "Browse market" (Journey 4)
+    QPushButton*     nftMyListingsBtn    = nullptr;
     QPushButton*     nftSendFileBtn      = nullptr;
     QPushButton*     nftRecvFileBtn      = nullptr;
+    // COLLECTIONS Phase-1 entry points (also gated by applyNFTSupportGating).
+    QPushButton*     nftNewCollectionBtn = nullptr;
+    QPushButton*     nftBrowseSetBtn     = nullptr;
     // Apply the current capability gating to the Collections page. resolvedUnsupported
     // is true ONLY when the probe RESOLVED to "no NFT support" — while unknown/supported
     // the page behaves normally (fail-open). Centralizes the show/hide + enable/tooltip

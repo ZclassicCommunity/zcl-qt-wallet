@@ -5,6 +5,8 @@
 #include "nftcommon.h"
 #include "contentengine.h"
 #include "settings.h"
+#include "guiutil.h"
+#include <QTimer>
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -146,6 +148,9 @@ NFTBuyDialog::NFTBuyDialog(ContentEngine* engine, RPC* rpc, QWidget* parent)
     connect(m_offerInput,  &QPlainTextEdit::textChanged, this, &NFTBuyDialog::onOfferTextChanged);
     connect(m_ackBox,      &QCheckBox::toggled, this, &NFTBuyDialog::onAcknowledgeToggled);
 
+    makeLabelsSelectable(this);                                     // copyable text (incl. errors)
+    QTimer::singleShot(0, this, [this]{ makeButtonsFit(this); });   // no clipped button labels
+
     if (m_engine)
         connect(m_engine, &ContentEngine::posterReady, this, &NFTBuyDialog::onPosterReady);
 
@@ -189,10 +194,14 @@ void NFTBuyDialog::onVerifyClicked() {
     runVerify();
 }
 
+void NFTBuyDialog::openWithOffer(const QString& blob) {
+    m_offerInput->setPlainText(blob);   // textChanged resets the gate; auto-verify below
+    runVerify();
+}
+
 #ifdef ZCL_WIDGET_TEST
 void NFTBuyDialog::testPasteOffer(const QString& blob) {
-    m_offerInput->setPlainText(blob);   // textChanged resets the gate
-    runVerify();
+    openWithOffer(blob);
 }
 #endif
 

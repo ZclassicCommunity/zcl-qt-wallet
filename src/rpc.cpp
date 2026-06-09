@@ -1082,7 +1082,10 @@ static QString zslpCalmError(const QNetworkReply* reply, const json& parsed) {
     switch (code) {
         case -32601: return RPC::nftUnsupportedGuidance();
         case -13: return QObject::tr("Your wallet is locked. Unlock it, then try again.");
-        case -6:  return QObject::tr("Not enough funds to cover the network fee for this collectible action.");
+        case -6:  return QObject::tr(
+                      "Not enough spendable transparent ZCL for this. Collectibles need a small "
+                      "amount of regular transparent ZCL — mined (coinbase) funds must be shielded "
+                      "first, and shielded (private) funds can't pay for this directly.");
         case -1:  return QObject::tr("Collectibles tracking is off. Add \"zslpindex=1\" to your node config, then restart — the wallet catches up once.");
         default:  break;
     }
@@ -1477,6 +1480,71 @@ void RPC::nftListOffers(const std::function<void(QVector<NFTOfferRow>)>& onDone,
     );
 }
 
+void RPC::nftBrowseOffers(const QString& tokenIdOrEmpty, qint64 maxPriceZatOr0,
+                          int fromIdx, int count,
+                          std::function<void(QVector<NFTBrowseRow>)> onDone,
+                          std::function<void(QString)> onErr) {
+#ifdef ZCL_WIDGET_TEST
+    {
+        if (!testNextNftError.isEmpty()) {
+            const QString e = testNextNftError; testNextNftError.clear(); onErr(e); return;
+        }
+        if (testBrowseSet) {
+            const QVector<NFTBrowseRow> rows = testNextBrowseList;
+            testBrowseSet = false; testNextBrowseList.clear();
+            onDone(rows); return;
+        }
+        (void)tokenIdOrEmpty; (void)maxPriceZatOr0; (void)fromIdx; (void)count;
+        return;   // nothing installed -> perpetual in-flight
+    }
+#endif
+    if (conn == nullptr) { onErr(QObject::tr("Not connected to your node yet.")); return; }
+
+    // SINGLE-OBJECT param. Empty tokenId / zero maxPriceZat sentinels are OMITTED so
+    // no dead filter field rides the wire (mirrors nftMakeOffer's omit-empty pattern).
+    // from/count are always sent (pagination is always meaningful).
+    json obj = {
+        {"from",  fromIdx},
+        {"count", count}
+    };
+    if (!tokenIdOrEmpty.isEmpty())
+        obj["tokenId"] = tokenIdOrEmpty.toStdString();
+    if (maxPriceZatOr0 > 0)
+        obj["maxPriceZat"] = maxPriceZatOr0;
+
+    json payload = {
+        {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "nft_browseoffers"},
+        {"params", json::array({ obj })}
+    };
+
+    conn->doRPC(payload,
+        [=] (const json& result) {
+            QVector<NFTBrowseRow> rows;
+            if (result.is_array()) {
+                for (auto& r : result) {
+                    if (!r.is_object()) continue;
+                    NFTBrowseRow row;
+                    row.offerId      = nftJsonStr(r, "offerId");
+                    row.offerHash    = nftJsonStr(r, "offerHash");
+                    row.tokenId      = nftJsonStr(r, "tokenId");
+                    row.offerBlob    = nftJsonStr(r, "offerBlob");   // carries "znftoffer:" prefix
+                    row.priceZat     = nftJsonInt(r, "priceZat", 0);
+                    row.expiryHeight = nftJsonInt(r, "expiryHeight", 0);
+                    // "live" defaults true; honor an explicit false from the daemon.
+                    {
+                        auto lv = r.find("live");
+                        if (lv != r.end() && lv->is_boolean())
+                            row.live = lv->get<bool>();
+                    }
+                    rows.push_back(row);
+                }
+            }
+            onDone(rows);   // an empty pool -> onDone(empty), never an error
+        },
+        [=] (QNetworkReply* reply, const json& parsed) { onErr(zslpCalmError(reply, parsed)); }
+    );
+}
+
 void RPC::nftCancelOffer(const QString& offerId,
                          const std::function<void(QString txid)>& onDone,
                          const std::function<void(QString errStr)>& onErr) {
@@ -1510,6 +1578,213 @@ void RPC::nftCancelOffer(const QString& offerId,
             }
             onDone(txid);
             refreshNFTs();   // the NFT returns to our gallery once the cancel confirms
+        },
+        [=] (QNetworkReply* reply, const json& parsed) { onErr(zslpCalmError(reply, parsed)); }
+    );
+}
+
+// ===========================================================================
+// NAMES pillar (ZNAM). Each wrapper mirrors nftCancelOffer EXACTLY: a test seam
+// (ZCL_WIDGET_TEST) drives the dialog to a terminal state with no daemon, then
+// the real path sends POSITIONAL params via doRPC and maps errors through
+// zslpCalmError. The daemon name_* signatures are AUTHORITATIVE. Coin is ZCL.
+// Names are 0-conf-invisible to the confirmed-only indexer (registered/transferred
+// names only appear once confirmed) — the dialogs say "confirming", never "Done".
+// ===========================================================================
+
+void RPC::nameRegister(const QString& name, int targetType, const QString& value,
+                       const QString& ownerAddr,
+                       const std::function<void(QString txid, QString owner)>& onDone,
+                       const std::function<void(QString errStr)>& onErr) {
+#ifdef ZCL_WIDGET_TEST
+    {
+        if (!testNextNftError.isEmpty()) {
+            const QString e = testNextNftError; testNextNftError.clear(); onErr(e); return;
+        }
+        if (!testNextNameTxid.isEmpty()) {
+            const QString t = testNextNameTxid, o = testNextNameOwner;
+            testNextNameTxid.clear(); testNextNameOwner.clear();
+            onDone(t, o); return;
+        }
+        (void)name; (void)targetType; (void)value; (void)ownerAddr;
+        return;   // nothing installed -> perpetual in-flight (the swallow test)
+    }
+#endif
+    // VALIDATE the name client-side (exactly as the daemon does) BEFORE any RPC, so an
+    // invalid name fails fast with a precise reason and never touches the wire.
+    QString reason;
+    if (!znamIsValidName(name, &reason)) { onErr(reason); return; }
+
+    if (conn == nullptr) { onErr(QObject::tr("Not connected to your node yet.")); return; }
+
+    // Positional params: "name", target_type (REAL JSON INT), "value", ("owner").
+    // Append owner ONLY when non-empty so the daemon picks an own address otherwise.
+    json params = json::array({ name.toStdString(), targetType, value.toStdString() });
+    if (!ownerAddr.isEmpty()) params.push_back(ownerAddr.toStdString());
+
+    json payload = {
+        {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "name_register"},
+        {"params", params}
+    };
+
+    conn->doRPC(payload,
+        [=] (const json& result) {
+            const QString txid  = nftJsonStr(result, "txid");
+            const QString owner = nftJsonStr(result, "owner");
+            if (txid.isEmpty()) {
+                onErr(QObject::tr("The registration was submitted but the node returned an unexpected reply."));
+                return;
+            }
+            onDone(txid, owner);
+        },
+        [=] (QNetworkReply* reply, const json& parsed) { onErr(zslpCalmError(reply, parsed)); }
+    );
+}
+
+void RPC::nameTransfer(const QString& name, const QString& newOwner,
+                       const std::function<void(QString txid)>& onDone,
+                       const std::function<void(QString errStr)>& onErr) {
+#ifdef ZCL_WIDGET_TEST
+    {
+        if (!testNextNftError.isEmpty()) {
+            const QString e = testNextNftError; testNextNftError.clear(); onErr(e); return;
+        }
+        if (!testNextNameTransferTxid.isEmpty()) {
+            const QString t = testNextNameTransferTxid; testNextNameTransferTxid.clear();
+            onDone(t); return;
+        }
+        (void)name; (void)newOwner;
+        return;   // nothing installed -> perpetual in-flight
+    }
+#endif
+    if (conn == nullptr) { onErr(QObject::tr("Not connected to your node yet.")); return; }
+    if (name.isEmpty()) { onErr(QObject::tr("Choose a name to transfer.")); return; }
+    // The new owner MUST be a PUBLIC (transparent) t-address. Reject z-addrs client-
+    // side with a calm reason (the daemon rejects them too).
+    if (!Settings::isTAddress(newOwner)) {
+        onErr(QObject::tr("A name's owner must be a public (transparent) address."));
+        return;
+    }
+
+    // Positional params: "name", "new_owner_taddr".
+    json payload = {
+        {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "name_transfer"},
+        {"params", json::array({ name.toStdString(), newOwner.toStdString() })}
+    };
+
+    conn->doRPC(payload,
+        [=] (const json& result) {
+            const QString txid = nftJsonStr(result, "txid");
+            if (txid.isEmpty()) {
+                onErr(QObject::tr("The transfer was submitted but the node returned an unexpected reply."));
+                return;
+            }
+            onDone(txid);
+        },
+        [=] (QNetworkReply* reply, const json& parsed) { onErr(zslpCalmError(reply, parsed)); }
+    );
+}
+
+void RPC::nameResolve(const QString& name,
+                      const std::function<void(bool found, ResolvedName)>& onDone,
+                      const std::function<void(QString errStr)>& onErr) {
+#ifdef ZCL_WIDGET_TEST
+    {
+        if (!testNextNftError.isEmpty()) {
+            const QString e = testNextNftError; testNextNftError.clear(); onErr(e); return;
+        }
+        if (testResolveSet) {
+            const bool f = testNextResolveFound; const ResolvedName r = testNextResolve;
+            testResolveSet = false; testNextResolveFound = false; testNextResolve = ResolvedName();
+            onDone(f, r); return;
+        }
+        (void)name;
+        return;   // nothing installed -> perpetual in-flight
+    }
+#endif
+    if (conn == nullptr) { onErr(QObject::tr("Not connected to your node yet.")); return; }
+    if (name.isEmpty()) { onErr(QObject::tr("Enter a name to look up.")); return; }
+
+    // Positional params: "name".
+    json payload = {
+        {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "name_resolve"},
+        {"params", json::array({ name.toStdString() })}
+    };
+
+    conn->doRPC(payload,
+        [=] (const json& result) {
+            // A null result means the name is NOT registered (available).
+            if (result.is_null()) { onDone(false, ResolvedName()); return; }
+
+            ResolvedName r;
+            r.name   = nftJsonStr(result, "name");
+            r.owner  = nftJsonStr(result, "owner");
+            r.status = nftJsonStr(result, "status");
+
+            if (result.is_object()) {
+                auto pit = result.find("primary");
+                if (pit != result.end() && pit->is_object()) {
+                    r.primaryType     = (int) nftJsonInt(*pit, "type", 0);
+                    r.primaryTypeName = nftJsonStr(*pit, "typeName");
+                    r.primaryValue    = nftJsonStr(*pit, "value");
+                }
+                auto rit = result.find("records");
+                if (rit != result.end() && rit->is_array())
+                    for (auto& rec : *rit)
+                        if (rec.is_object())
+                            r.records.push_back(qMakePair((int) nftJsonInt(rec, "type", 0),
+                                                          nftJsonStr(rec, "value")));
+                auto tit = result.find("text");
+                if (tit != result.end() && tit->is_array())
+                    for (auto& t : *tit)
+                        if (t.is_object())
+                            r.text.push_back(qMakePair(nftJsonStr(t, "key"),
+                                                       nftJsonStr(t, "value")));
+            }
+            onDone(true, r);
+        },
+        [=] (QNetworkReply* reply, const json& parsed) { onErr(zslpCalmError(reply, parsed)); }
+    );
+}
+
+void RPC::nameListMine(const std::function<void(QVector<NameRow>)>& onDone,
+                       const std::function<void(QString errStr)>& onErr) {
+#ifdef ZCL_WIDGET_TEST
+    {
+        if (!testNextNftError.isEmpty()) {
+            const QString e = testNextNftError; testNextNftError.clear(); onErr(e); return;
+        }
+        if (testNameListSet) {
+            const QVector<NameRow> rows = testNextNameList;
+            testNameListSet = false; testNextNameList.clear();
+            onDone(rows); return;
+        }
+        return;   // nothing installed -> perpetual in-flight
+    }
+#endif
+    if (conn == nullptr) { onErr(QObject::tr("Not connected to your node yet.")); return; }
+
+    // EMPTY params: the daemon's zero-arg wallet-self-enumeration mode (D2).
+    json payload = {
+        {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "name_listmine"},
+        {"params", json::array()}
+    };
+
+    conn->doRPC(payload,
+        [=] (const json& result) {
+            QVector<NameRow> rows;
+            if (result.is_array()) {
+                for (auto& r : result) {
+                    if (!r.is_object()) continue;
+                    NameRow row;
+                    row.name         = nftJsonStr(r, "name");
+                    row.owner        = nftJsonStr(r, "owner");
+                    row.status       = nftJsonStr(r, "status");
+                    row.expiryHeight = nftJsonInt(r, "expiryHeight", 0);
+                    rows.push_back(row);
+                }
+            }
+            onDone(rows);
         },
         [=] (QNetworkReply* reply, const json& parsed) { onErr(zslpCalmError(reply, parsed)); }
     );
@@ -1730,6 +2005,296 @@ void RPC::nftListTransfers(const QString& tokenId,
     };
     conn->doRPC(payload,
         [=] (const json& result) { onDone(result); },
+        [=] (QNetworkReply* reply, const json& parsed) { onErr(zslpCalmError(reply, parsed)); }
+    );
+}
+
+// ===========================================================================
+// COLLECTIONS pillar (group/child; non-consensus ZSLP). A collection is an ordinary
+// token minted WITH a mint baton + a quantity of authority units; each authorized child
+// burns one unit. These wrappers mirror mintNFT/nftMakeOffer EXACTLY: a ZCL_WIDGET_TEST
+// short-circuit, a single-object zslp_genesis write (createCollection/mintCardIntoCollection)
+// or a read RPC (collectioninfo/listcollectionmembers/listmytokens), errors routed through
+// the shared zslpCalmError so an OLD node gives friendly -32601 guidance.
+// ===========================================================================
+
+void RPC::createCollection(const QString& name, const QString& ticker, qint64 cardCount,
+                           const std::function<void(QString txid, QString tokenid)>& onDone,
+                           const std::function<void(QString errStr)>& onErr) {
+#ifdef ZCL_WIDGET_TEST
+    // Reuses the mint seam ({txid,tokenid}); error wins; else perpetual in-flight.
+    {
+        if (!testNextNftError.isEmpty()) {
+            const QString e = testNextNftError; testNextNftError.clear(); onErr(e); return;
+        }
+        if (!testNextMintTxid.isEmpty()) {
+            const QString t = testNextMintTxid, k = testNextMintTokenId;
+            testNextMintTxid.clear(); testNextMintTokenId.clear();
+            onDone(t, k); return;
+        }
+        (void)name; (void)ticker; (void)cardCount;
+        return;   // nothing installed -> perpetual in-flight (the swallow test)
+    }
+#endif
+    if (conn == nullptr) { onErr(QObject::tr("Not connected to your node yet.")); return; }
+    if (cardCount < 1) {
+        onErr(QObject::tr("A collection needs room for at least one card."));
+        return;
+    }
+
+    // SINGLE object param zslp_genesis. A collection is a normal token (NOT nft:true — it
+    // must hold >1 unit + a baton). quantity = number of authority units (cards issuable
+    // now). mint_baton_vout=2 issues the re-issue baton so the owner can mint MORE units
+    // later (extend the collection). quantity as a STRING avoids any 53-bit JSON-number
+    // rounding on a large card count (mirrors nftMakeOffer's priceZat). decimals defaults 0.
+    json obj = {
+        {"quantity",        std::to_string((long long)cardCount)},
+        {"mint_baton_vout", 2}
+    };
+    if (!name.isEmpty())   obj["name"]   = name.toStdString();
+    if (!ticker.isEmpty()) obj["ticker"] = ticker.toStdString();
+    // 'to' omitted => the daemon mints the units + baton to a fresh OWN wallet address.
+
+    json payload = {
+        {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "zslp_genesis"},
+        {"params", json::array({ obj })}
+    };
+
+    conn->doRPC(payload,
+        [=] (const json& result) {
+            QString txid  = nftJsonStr(result, "txid");
+            QString tokid = nftJsonStr(result, "tokenid");   // == group_id
+            if (txid.isEmpty() || tokid.isEmpty()) {
+                onErr(QObject::tr("The collection was submitted but the node returned an unexpected reply."));
+                return;
+            }
+            onDone(txid, tokid);
+            refreshNFTs();   // the parent token lands in our holdings once it confirms
+        },
+        [=] (QNetworkReply* reply, const json& parsed) { onErr(zslpCalmError(reply, parsed)); }
+    );
+}
+
+void RPC::mintCardIntoCollection(const QString& name, const QString& ticker,
+                                 const QString& docHashHex, const QString& documentUrl,
+                                 const QString& groupId,
+                                 const std::function<void(QString txid, QString tokenid)>& onDone,
+                                 const std::function<void(QString errStr)>& onErr) {
+#ifdef ZCL_WIDGET_TEST
+    {
+        // Record the group_id forwarded (the L1 test asserts it passed through).
+        testRecordedMintGroupId = groupId;
+        if (!testNextNftError.isEmpty()) {
+            const QString e = testNextNftError; testNextNftError.clear(); onErr(e); return;
+        }
+        if (!testNextMintTxid.isEmpty()) {
+            const QString t = testNextMintTxid, k = testNextMintTokenId;
+            testNextMintTxid.clear(); testNextMintTokenId.clear();
+            onDone(t, k); return;
+        }
+        (void)name; (void)ticker; (void)docHashHex; (void)documentUrl;
+        return;   // nothing installed -> perpetual in-flight
+    }
+#endif
+    if (conn == nullptr) { onErr(QObject::tr("Not connected to your node yet.")); return; }
+
+    // Same single-object zslp_genesis as mintNFT (nft:true forces decimals0/qty1/no-baton
+    // for the child), PLUS group_id when minting INTO a collection — the daemon spends +
+    // BURNS one live parent authority unit as authorization (auto-selected). An empty
+    // groupId is identical to a standalone mintNFT (the field is simply omitted).
+    json obj = { {"nft", true} };
+    if (!name.isEmpty())        obj["name"]          = name.toStdString();
+    if (!ticker.isEmpty())      obj["ticker"]        = ticker.toStdString();
+    if (!docHashHex.isEmpty())  obj["document_hash"] = docHashHex.toLower().toStdString(); // 64 hex
+    if (!documentUrl.isEmpty()) obj["document_url"]  = documentUrl.toStdString();
+    if (!groupId.isEmpty())     obj["group_id"]      = groupId.toLower().toStdString();    // 64 hex
+
+    json payload = {
+        {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "zslp_genesis"},
+        {"params", json::array({ obj })}
+    };
+
+    conn->doRPC(payload,
+        [=] (const json& result) {
+            QString txid  = nftJsonStr(result, "txid");
+            QString tokid = nftJsonStr(result, "tokenid");
+            if (txid.isEmpty() || tokid.isEmpty()) {
+                onErr(QObject::tr("The card was submitted but the node returned an unexpected reply."));
+                return;
+            }
+            onDone(txid, tokid);
+            refreshNFTs();
+        },
+        [=] (QNetworkReply* reply, const json& parsed) { onErr(zslpCalmError(reply, parsed)); }
+    );
+}
+
+void RPC::listMyCollections(const std::function<void(QVector<CollectionRow>)>& onDone,
+                            const std::function<void(QString errStr)>& onErr) {
+#ifdef ZCL_WIDGET_TEST
+    {
+        if (!testNextNftError.isEmpty()) {
+            const QString e = testNextNftError; testNextNftError.clear(); onErr(e); return;
+        }
+        if (testCollectionListSet) {
+            const QVector<CollectionRow> rows = testNextCollectionList;
+            testCollectionListSet = false; testNextCollectionList.clear();
+            onDone(rows); return;
+        }
+        return;   // nothing installed -> perpetual in-flight
+    }
+#endif
+    if (conn == nullptr) { onErr(QObject::tr("Not connected to your node yet.")); return; }
+
+    // Derived from zslp_listmytokens (the wallet's holdings). A COLLECTION the user can
+    // manage is a fungible/parent token — it carries a mint baton (hasmintbaton) OR a
+    // balance of more-than-one authority unit / has decimals — NOT a 1-of-1 child NFT
+    // (decimals 0, total minted 1, no baton). We filter client-side: there is no
+    // "list my collections" RPC, so this mirrors the doc's guidance (use listmytokens to
+    // find the collections the user owns + their authority-unit balance).
+    json payload = {
+        {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "zslp_listmytokens"}
+    };
+    conn->doRPC(payload,
+        [=] (const json& myTokens) {
+            QVector<CollectionRow> rows;
+            if (!myTokens.is_array()) { onDone(rows); return; }
+            for (auto& tok : myTokens) {
+                if (!tok.is_object()) continue;
+                const QString tid = nftJsonStr(tok, "tokenid");
+                if (tid.isEmpty()) continue;
+
+                const bool    hasBaton = nftJsonBool(tok, "hasmintbaton", false);
+                const qint64  balance  = nftJsonInt(tok, "balance", 0);
+                const qint64  total    = nftJsonInt(tok, "totalminted", 0);
+                const bool    isChild  = nftJsonBool(tok, "group_authorized", false);
+
+                // A collection PARENT the user manages: it can issue cards. That means it
+                // still carries the mint baton (can mint more units) OR the wallet holds a
+                // spendable authority unit (balance > 0 and the token is fungible-shaped,
+                // i.e. total minted > 1). An AUTHORIZED child (group_authorized) is a card,
+                // never a collection — exclude it. A lone 1-of-1 (total==1, no baton) is a
+                // plain NFT, not a collection.
+                const bool fungibleParent = (total > 1);
+                const bool qualifies = !isChild && (hasBaton || (balance > 0 && fungibleParent));
+                if (!qualifies) continue;
+
+                CollectionRow r;
+                r.tokenId      = tid;
+                r.name         = nftJsonStr(tok, "name");
+                r.ticker       = nftJsonStr(tok, "ticker");
+                r.balance      = balance;
+                r.hasMintBaton = hasBaton;
+                r.totalMinted  = total;
+                rows.push_back(r);
+            }
+            onDone(rows);
+        },
+        [=] (QNetworkReply* reply, const json& parsed) { onErr(zslpCalmError(reply, parsed)); }
+    );
+}
+
+void RPC::collectionInfo(const QString& groupId,
+                         const std::function<void(CollectionInfo)>& onDone,
+                         const std::function<void(QString errStr)>& onErr) {
+#ifdef ZCL_WIDGET_TEST
+    {
+        if (!testNextNftError.isEmpty()) {
+            const QString e = testNextNftError; testNextNftError.clear(); onErr(e); return;
+        }
+        if (testCollectionInfoSet) {
+            const CollectionInfo info = testNextCollectionInfo;
+            testCollectionInfoSet = false; testNextCollectionInfo = CollectionInfo();
+            onDone(info); return;
+        }
+        (void)groupId;
+        return;   // nothing installed -> perpetual in-flight
+    }
+#endif
+    if (conn == nullptr) { onErr(QObject::tr("Not connected to your node yet.")); return; }
+    if (groupId.isEmpty()) { onErr(QObject::tr("Missing collection id.")); return; }
+
+    // POSITIONAL: zslp_collectioninfo "<group_id>".
+    json payload = {
+        {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "zslp_collectioninfo"},
+        {"params", json::array({ groupId.toStdString() })}
+    };
+    conn->doRPC(payload,
+        [=] (const json& result) {
+            CollectionInfo info;
+            info.tokenId     = nftJsonStr(result, "tokenid");
+            info.name        = nftJsonStr(result, "name");
+            info.ticker      = nftJsonStr(result, "ticker");
+            info.memberCount = nftJsonInt(result, "member_count", 0);
+            info.open        = nftJsonBool(result, "open", false);
+            info.found       = !info.tokenId.isEmpty();
+            onDone(info);
+        },
+        // A genuine "Collection (group) not found" (RPC_INVALID_PARAMETER) is not an error
+        // condition for the browse view — deliver an honest not-found header rather than a
+        // scary dialog. Any OTHER error (index off / old node / transport) routes to onErr
+        // via the shared calm mapper.
+        [=] (QNetworkReply* reply, const json& parsed) {
+            if (jsonRpcErrorCode(parsed) == -8) {   // RPC_INVALID_PARAMETER ("not found")
+                CollectionInfo info; info.tokenId = groupId; info.found = false;
+                onDone(info);
+                return;
+            }
+            onErr(zslpCalmError(reply, parsed));
+        }
+    );
+}
+
+void RPC::listCollectionMembers(const QString& groupId, int from, int count,
+                                const std::function<void(QVector<CollectionMember>)>& onDone,
+                                const std::function<void(QString errStr)>& onErr) {
+#ifdef ZCL_WIDGET_TEST
+    {
+        if (!testNextNftError.isEmpty()) {
+            const QString e = testNextNftError; testNextNftError.clear(); onErr(e); return;
+        }
+        if (testCollectionMembersSet) {
+            const QVector<CollectionMember> rows = testNextCollectionMembers;
+            testCollectionMembersSet = false; testNextCollectionMembers.clear();
+            onDone(rows); return;
+        }
+        (void)groupId; (void)from; (void)count;
+        return;   // nothing installed -> perpetual in-flight
+    }
+#endif
+    if (conn == nullptr) { onErr(QObject::tr("Not connected to your node yet.")); return; }
+    if (groupId.isEmpty()) { onErr(QObject::tr("Missing collection id.")); return; }
+
+    // POSITIONAL: zslp_listcollectionmembers "<group_id>" count from. The daemon returns
+    // AUTHORIZED children ONLY (a group_claimed squatter is never here), so the GUI shows
+    // them verbatim as the verified set with NO further membership filtering needed.
+    const int safeCount = count > 0 ? count : 100;
+    const int safeFrom  = from  > 0 ? from  : 0;
+    json payload = {
+        {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "zslp_listcollectionmembers"},
+        {"params", json::array({ groupId.toStdString(), safeCount, safeFrom })}
+    };
+    conn->doRPC(payload,
+        [=] (const json& result) {
+            QVector<CollectionMember> rows;
+            if (result.is_array()) {
+                for (auto& m : result) {
+                    if (!m.is_object()) continue;
+                    const QString tid = nftJsonStr(m, "tokenid");
+                    if (tid.isEmpty()) continue;
+                    // Defense-in-depth: the index returns authorized-only, but never
+                    // surface a row that does not assert group_authorized (a malformed /
+                    // future row must NOT be shown as a verified member). The daemon sets
+                    // this true for every row it returns.
+                    if (!nftJsonBool(m, "group_authorized", false)) continue;
+                    CollectionMember cm;
+                    cm.tokenId = tid;
+                    cm.name    = nftJsonStr(m, "name");
+                    rows.push_back(cm);
+                }
+            }
+            onDone(rows);
+        },
         [=] (QNetworkReply* reply, const json& parsed) { onErr(zslpCalmError(reply, parsed)); }
     );
 }

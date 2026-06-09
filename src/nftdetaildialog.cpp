@@ -7,6 +7,8 @@
 #include "nftselldialog.h"
 #include "shieldsenddialog.h"
 #include "shieldreceivedialog.h"
+#include "guiutil.h"
+#include <QTimer>
 #include "contentengine.h"
 #include "rpc.h"
 #include "settings.h"

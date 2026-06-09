@@ -3,13 +3,18 @@
 // ============================================================================
 #include "nftmintdialog.h"
 #include "rpc.h"
+#include "guiutil.h"     // makeLabelsSelectable / makeButtonsFit
+#include <QTimer>
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
+#include <QComboBox>
 #include <QPushButton>
 #include <QFrame>
+#include <QScrollArea>
+#include <QWidget>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QDragEnterEvent>
@@ -18,6 +23,7 @@
 #include <QUrl>
 #include <QPointer>
 #include <QCloseEvent>
+#include <QStandardItemModel>
 
 namespace {
     // A unique-enough token for the single in-flight hash job per dialog.
@@ -30,7 +36,26 @@ NftMintDialog::NftMintDialog(ContentEngine* engine, RPC* rpc, QWidget* parent)
     setMinimumWidth(460);
     setAcceptDrops(true);
 
-    auto* outer = new QVBoxLayout(this);
+    // ---- scrollable content host (small-screen fit) ----
+    // Mirror NFTDetailDialog: `this` holds ONLY a QScrollArea (the body) + the action
+    // button row, so a short screen scrolls the body instead of forcing the window
+    // taller than the screen (kept the dialog's minimumSizeHint().height() under the
+    // 640px small-screen cap once the optional collection combo was added). All the
+    // rich content lives under `content`; the Create/Cancel row stays OUTSIDE the
+    // scroll area so it's always visible.
+    auto* dlgLayout = new QVBoxLayout(this);
+    dlgLayout->setContentsMargins(0, 0, 0, 0);
+    dlgLayout->setSpacing(0);
+    auto* scroll = new QScrollArea(this);
+    scroll->setObjectName("nftMintScroll");
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    auto* content = new QWidget(scroll);
+    scroll->setWidget(content);
+    dlgLayout->addWidget(scroll, 1);
+
+    auto* outer = new QVBoxLayout(content);
     outer->setContentsMargins(18, 18, 18, 18);
     outer->setSpacing(10);
 
@@ -80,6 +105,29 @@ NftMintDialog::NftMintDialog(ContentEngine* engine, RPC* rpc, QWidget* parent)
     m_urlEdit->setPlaceholderText(tr("https://… (a hint — we never open it)"));
     outer->addWidget(m_urlEdit);
 
+    // ---- optional: add this card to one of YOUR collections (COLLECTIONS Phase-1) ----
+    // The first row is the "standalone" sentinel (no collection). Each owned collection
+    // follows; a sealed one (no spendable authority unit) is shown DISABLED with a note.
+    // The combo + hint are added even before the list loads, so the layout never jumps.
+    outer->addWidget(new QLabel(tr("Add to a collection (optional)"), this));
+    m_collectionCombo = new QComboBox(this);
+    m_collectionCombo->setObjectName("nftMintCollectionCombo");
+    m_collectionCombo->addItem(tr("Not part of a collection"));   // sentinel, group_id ""
+    m_collectionCombo->setEnabled(false);                          // until the list loads
+    outer->addWidget(m_collectionCombo);
+
+    m_collectionHint = new QLabel(this);
+    m_collectionHint->setObjectName("nftMintCollectionHint");
+    m_collectionHint->setProperty("hint", true);
+    m_collectionHint->setWordWrap(true);
+    m_collectionHint->setStyleSheet("color:#9aa0a6; font-size:12pt;");
+    m_collectionHint->setText(tr("Loading your collections…"));
+    outer->addWidget(m_collectionHint);
+
+    connect(m_collectionCombo,
+            static_cast<void (QComboBox::*)(int)>(&QComboBox::currentIndexChanged),
+            this, &NftMintDialog::onCollectionChanged);
+
     // ---- honesty block (load-bearing): ONE amber public/permanence line + ONE grey
     // "file never uploaded" line. ZSLP genesis is PUBLIC; ownership is always public —
     // only the file CONTENT stays on your computer. (Collapsed from 3 stacked labels.)
@@ -99,14 +147,17 @@ NftMintDialog::NftMintDialog(ContentEngine* engine, RPC* rpc, QWidget* parent)
     honest->setStyleSheet("color:#9aa0a6; font-size:12pt;");
     outer->addWidget(honest);
 
-    // ---- result + action bar ----
+    // ---- result line (stays inside the scroll body, beside the fields) ----
     m_resultLine = new QLabel(this);
     m_resultLine->setObjectName("nftMintResultLine");
     m_resultLine->setWordWrap(true);
     m_resultLine->setMinimumHeight(18);
     outer->addWidget(m_resultLine);
 
+    // ---- action bar: lives OUTSIDE the scroll area (on the dialog) so Create/Cancel
+    // are always visible no matter how the body scrolls. Parented to `this`.
     auto* btnRow = new QHBoxLayout();
+    btnRow->setContentsMargins(18, 8, 18, 18);
     btnRow->addStretch(1);
     m_cancelBtn = new QPushButton(tr("Cancel"), this);
     m_createBtn = new QPushButton(tr("Create"), this);
@@ -121,7 +172,7 @@ NftMintDialog::NftMintDialog(ContentEngine* engine, RPC* rpc, QWidget* parent)
            "Your file itself is never uploaded — only its fingerprint goes on-chain."));
     btnRow->addWidget(m_cancelBtn);
     btnRow->addWidget(m_createBtn);
-    outer->addLayout(btnRow);
+    dlgLayout->addLayout(btnRow);
 
     connect(m_cancelBtn, &QPushButton::clicked, this, &QDialog::reject);
     connect(chooseBtn, &QPushButton::clicked, this, &NftMintDialog::onChooseFile);
@@ -133,6 +184,76 @@ NftMintDialog::NftMintDialog(ContentEngine* engine, RPC* rpc, QWidget* parent)
                 this, &NftMintDialog::onDescriptorReady);
 
     refreshCreateEnabled();
+
+    // Make all text here copy-pasteable (esp. the result/error line, fingerprint, ids) and ensure
+    // no button clips its label at the user's font (deferred so sizeHint() is post-style).
+    makeLabelsSelectable(this);
+    QTimer::singleShot(0, this, [this]{ makeButtonsFit(this); });
+
+    // Populate the optional collection picker from the wallet's owned collections.
+    loadCollections();
+}
+
+// Fill the collection combo from RPC::listMyCollections (owned collections). The reply is
+// QPointer-guarded (the modal can close before it lands). A SEALED collection (no spendable
+// authority unit AND no baton-mintable unit, i.e. balance==0) is shown DISABLED with an
+// honest note rather than hidden — so the user understands why they can't pick it.
+void NftMintDialog::loadCollections() {
+    if (m_rpc == nullptr || m_collectionCombo == nullptr)
+        return;
+
+    QPointer<NftMintDialog> self(this);
+    m_rpc->listMyCollections(
+        [self](QVector<CollectionRow> rows) {
+            if (self.isNull())
+                return;
+            self->m_collections = rows;
+            self->m_collectionCombo->setEnabled(true);
+
+            // The combo's underlying model lets us DISABLE a sealed row (QComboBox itself
+            // has no per-item enabled flag). Cast is safe for the default combo model.
+            auto* model = qobject_cast<QStandardItemModel*>(self->m_collectionCombo->model());
+
+            for (int i = 0; i < rows.size(); ++i) {
+                const CollectionRow& c = rows.at(i);
+                // A spendable authority unit is needed to authorize a child. balance == the
+                // wallet's authority-unit balance; 0 means sealed for this wallet (no unit to
+                // burn — the daemon would refuse unless allow_baton, which we never auto-do).
+                const bool sealed = (c.balance <= 0);
+                QString label = c.name.isEmpty()
+                                    ? (c.ticker.isEmpty() ? c.tokenId.left(10) + QStringLiteral("…")
+                                                          : c.ticker)
+                                    : c.name;
+                if (sealed)
+                    label += QObject::tr(" — full (no card slots left)");
+                else
+                    label += QObject::tr(" — %1 card slot(s) left").arg(c.balance);
+                self->m_collectionCombo->addItem(label);
+                if (sealed && model != nullptr) {
+                    // Disable the sealed row so it can't be chosen.
+                    if (auto* item = model->item(self->m_collectionCombo->count() - 1))
+                        item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
+                }
+            }
+
+            if (rows.isEmpty()) {
+                self->m_collectionHint->setText(QObject::tr(
+                    "You don't own any collections yet. Create one first to group cards into a set."));
+            } else {
+                self->m_collectionHint->setText(QObject::tr(
+                    "Choose a collection to add this card to. Adding a card uses one of its slots."));
+            }
+        },
+        [self](QString /*errStr*/) {
+            if (self.isNull())
+                return;
+            // Honest, non-blocking: the picker just stays on "standalone". An old node /
+            // index-off surfaces here; we don't pop a dialog — minting standalone still works.
+            self->m_collectionCombo->setEnabled(false);
+            self->m_collectionHint->setText(QObject::tr(
+                "Couldn't load your collections. You can still make this as a standalone collectible."));
+        }
+    );
 }
 
 void NftMintDialog::dragEnterEvent(QDragEnterEvent* e) {
@@ -213,6 +334,27 @@ void NftMintDialog::refreshCreateEnabled() {
     m_createBtn->setEnabled(nameOk && anchorOk && !m_hashing && !isInFlight());
 }
 
+// The chosen collection changed. Refresh the honesty hint (sealed rows are already
+// disabled in the model, so index 0 == standalone; index N>0 == m_collections[N-1]).
+void NftMintDialog::onCollectionChanged(int index) {
+    if (m_collectionHint == nullptr)
+        return;
+    if (index <= 0) {
+        m_collectionHint->setText(
+            m_collections.isEmpty()
+                ? tr("You don't own any collections yet. Create one first to group cards into a set.")
+                : tr("Choose a collection to add this card to. Adding a card uses one of its slots."));
+        return;
+    }
+    const int row = index - 1;   // skip the standalone sentinel
+    if (row < 0 || row >= m_collections.size())
+        return;
+    const CollectionRow& c = m_collections.at(row);
+    m_collectionHint->setText(
+        tr("This card joins \"%1\" as a verified member and uses one of its slots.")
+            .arg(c.name.isEmpty() ? c.ticker : c.name));
+}
+
 void NftMintDialog::onCreate() {
     if (isInFlight() || m_succeeded || m_rpc == nullptr || m_anchorHex.isEmpty())
         return;
@@ -232,12 +374,27 @@ void NftMintDialog::onCreate() {
     const QString srcPath = m_srcPath;
     const QString anchor  = m_anchorHex;
 
+    // Resolve the chosen collection (combo index 0 == standalone sentinel; N>0 maps to
+    // m_collections[N-1]). A disabled (sealed) row can't be selected, so groupId here is
+    // always either "" or a collection the wallet can still authorize a child into.
+    QString groupId;
+    const bool intoCollection = m_collectionCombo && m_collectionCombo->currentIndex() > 0;
+    if (intoCollection) {
+        const int row = m_collectionCombo->currentIndex() - 1;
+        if (row >= 0 && row < m_collections.size())
+            groupId = m_collections.at(row).tokenId;
+    }
+    const bool joining = !groupId.isEmpty();
+
     // LIFETIME (review fix #5): the modal exec() can still be torn down (the [X] is
     // swallowed while in-flight, but be belt-and-suspenders) — guard the reply with a
     // QPointer and bail before touching any member if we've been deleted.
     QPointer<NftMintDialog> self(this);
-    m_rpc->mintNFT(name, ticker, anchor, url,
-        [self, srcPath, anchor](QString txid, QString tokenid) {
+    // ONE code path: mintCardIntoCollection with an empty groupId is byte-identical to a
+    // standalone mintNFT (the daemon just omits group_id), so we always route here and let
+    // the chosen collection (if any) flow through.
+    m_rpc->mintCardIntoCollection(name, ticker, anchor, url, groupId,
+        [self, srcPath, anchor, joining](QString txid, QString tokenid) {
             if (self.isNull())
                 return;   // dialog gone — safe no-op
             self->m_lastTxid    = txid;
@@ -251,7 +408,8 @@ void NftMintDialog::onCreate() {
             // line, then retire Create -> terminal "Done" (shared scaffold).
             self->m_succeeded = true;
             self->m_resultLine->setText(
-                tr("Created — it'll appear once confirmed."));
+                joining ? tr("Added to your collection — it'll appear once confirmed.")
+                        : tr("Created — it'll appear once confirmed."));
             self->m_resultLine->setStyleSheet("color:#34c759;");
             self->finishPrimaryAsDone(self->m_createBtn, self->m_cancelBtn);
         },

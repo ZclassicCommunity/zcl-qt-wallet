@@ -327,6 +327,17 @@ void Settings::setShowNFTGallery(bool show) {
     QSettings().setValue("options/shownftgallery", show);
 }
 
+bool Settings::getShowNamesTab() {
+    // Default ON: surface the native Names tab. Pure GUI (no chain dependency); users
+    // can hide the tab via this preference. When OFF the tab is never created, so the
+    // rail/tab indices simply collapse back to the pre-Names layout.
+    return QSettings().value("options/shownamestab", true).toBool();
+}
+
+void Settings::setShowNamesTab(bool show) {
+    QSettings().setValue("options/shownamestab", show);
+}
+
 bool Settings::getEnableDataChannel() {
     // Default OFF (opt-in): private FILE transfers via the ZDC1 data-channel. This
     // is the persisted GUI INTENT; the daemon -datachannel flag is what actually

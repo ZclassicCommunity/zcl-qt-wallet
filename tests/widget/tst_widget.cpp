@@ -94,12 +94,25 @@
 #include "nftsenddialog.h"
 #include "nftselldialog.h"
 #include "nftbuydialog.h"
+#include "nftlistingsdialog.h"
+#include "nftmarketdialog.h"
+#include "collectioncreatedialog.h"
+#include "collectionbrowsedialog.h"
+#include "namescommon.h"
+#include "nameregisterdialog.h"
+#include "nameresolvedialog.h"
+#include "nametransferdialog.h"
 #include "shieldsenddialog.h"
 #include "shieldreceivedialog.h"
 #include <QPlainTextEdit>
 #include <QCheckBox>
 #include <QListWidget>
+#include <QTableWidget>
+#include <QTableWidgetItem>
 #include <QComboBox>
+#include <QSpinBox>
+#include <QStackedWidget>
+#include <QStandardItemModel>
 #include <QTemporaryFile>
 
 // Kept alive for the whole process so QStandardPaths/QSettings stay isolated.
@@ -2572,6 +2585,241 @@ private slots:
         dlg->close();
     }
 
+    // ====================================================================
+    // MY LISTINGS (Journey 3): view the sell offers I created + cancel an
+    // open one. PURE REUSE — RPC::nftListOffers / nftCancelOffer + their
+    // ZCL_WIDGET_TEST seams (testSetNextOfferList / testSetNextCancelResult /
+    // testSetNextNftError). NFTOfferRow is constructed directly. The role is
+    // the LITERAL daemon string "sell" — never "seller".
+    // ====================================================================
+
+    // Build one NFTOfferRow inline (no daemon, no JSON).
+    static NFTOfferRow offerRow(const QString& offerId, const QString& tokenId,
+                                const QString& role, const QString& status,
+                                qint64 priceZat, qint64 expiryHeight) {
+        NFTOfferRow r;
+        r.offerId      = offerId;
+        r.tokenId      = tokenId;
+        r.role         = role;
+        r.status       = status;
+        r.priceZat     = priceZat;
+        r.expiryHeight = expiryHeight;
+        return r;
+    }
+
+    // -- MY LISTINGS: shows ONLY role=="sell" rows; a "buyer" row and a row with a
+    //    daemon status are both handled (the buyer row is filtered out, the sell
+    //    rows render their status verbatim). Pins the literal "sell".
+    void myListings_showsOnlySellRows_filtersBuyAndDaemonStatus() {
+        MainWindow* w = makeWindow();
+        QVector<NFTOfferRow> rows;
+        rows << offerRow("off_sell_open", "tokABCDEF0123456789", "sell", "open",
+                         100000000, 555);
+        rows << offerRow("off_sell_filled", "tokFILLED01", "sell", "filled",
+                         250000000, 600);
+        // A NON-sell row must NEVER appear as a listing (defensive filter). If we
+        // matched on "seller" instead of "sell" this row's exclusion would still
+        // pass, but the two REAL sell rows would vanish — so the count pins "sell".
+        rows << offerRow("off_buy", "tokBUY01", "buyer", "open", 999, 1);
+        w->getRPC()->testSetNextOfferList(rows);
+
+        NFTListingsDialog* dlg = new NFTListingsDialog(w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* table = dlg->findChild<QTableWidget*>("nftListingsTable");
+        QVERIFY2(table, "the listings table must exist");
+        QVERIFY2(pumpUntil([&]{ return table->rowCount() == 2; }),
+                 qPrintable(QStringLiteral("exactly the two role==\"sell\" rows must show "
+                                           "(buyer filtered); got %1").arg(table->rowCount())));
+
+        // The two sell rows are present, with their daemon statuses verbatim. Open
+        // sorts above terminal, so row 0 == open, row 1 == filled.
+        QCOMPARE(table->item(0, 2)->text(), QString("open"));
+        QCOMPARE(table->item(1, 2)->text(), QString("filled"));
+        // The buyer row's offerId must be nowhere in the table.
+        for (int r = 0; r < table->rowCount(); ++r)
+            QVERIFY2(table->item(r, 0)->data(Qt::UserRole).toString() != QString("off_buy"),
+                     "a non-sell (buyer) offer must never appear as a listing");
+        dlg->close();
+    }
+
+    // -- MY LISTINGS: with no sell offers, the honest empty state shows and the
+    //    table is hidden.
+    void myListings_emptyState() {
+        MainWindow* w = makeWindow();
+        w->getRPC()->testSetNextOfferList(QVector<NFTOfferRow>());   // empty delivery
+
+        NFTListingsDialog* dlg = new NFTListingsDialog(w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* empty = dlg->findChild<QLabel*>("nftListingsEmptyLabel");
+        QVERIFY2(empty, "the empty-state label must exist");
+        QVERIFY2(pumpUntil([&]{ return empty->isVisible(); }),
+                 "the empty state must show when there are no listings");
+        QVERIFY2(empty->text().contains("no listings", Qt::CaseInsensitive),
+                 qPrintable("empty copy: " + empty->text()));
+        dlg->close();
+    }
+
+    // -- MY LISTINGS: with ONLY non-sell rows the empty state shows too (the buyer
+    //    row is filtered — exercises the all-filtered path).
+    void myListings_emptyState_whenOnlyNonSellRows() {
+        MainWindow* w = makeWindow();
+        QVector<NFTOfferRow> rows;
+        rows << offerRow("off_buy", "tokBUY01", "buyer", "open", 999, 1);
+        w->getRPC()->testSetNextOfferList(rows);
+
+        NFTListingsDialog* dlg = new NFTListingsDialog(w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* empty = dlg->findChild<QLabel*>("nftListingsEmptyLabel");
+        QVERIFY(empty);
+        QVERIFY2(pumpUntil([&]{ return empty->isVisible(); }),
+                 "a list with only non-sell rows must show the empty state");
+        dlg->close();
+    }
+
+    // -- MY LISTINGS: the Cancel button is gated to an "open" selection — disabled
+    //    when nothing is selected and when a terminal (filled) row is selected.
+    void myListings_cancelButtonGatedToOpenStatus() {
+        MainWindow* w = makeWindow();
+        QVector<NFTOfferRow> rows;
+        rows << offerRow("off_open", "tokOPEN01", "sell", "open", 100000000, 555);
+        rows << offerRow("off_filled", "tokFILLED01", "sell", "filled", 200000000, 600);
+        w->getRPC()->testSetNextOfferList(rows);
+
+        NFTListingsDialog* dlg = new NFTListingsDialog(w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* table  = dlg->findChild<QTableWidget*>("nftListingsTable");
+        auto* cancel = dlg->findChild<QPushButton*>("nftListingsCancelButton");
+        QVERIFY(table && cancel);
+        QVERIFY2(pumpUntil([&]{ return table->rowCount() == 2; }), "two sell rows expected");
+
+        QVERIFY2(!cancel->isEnabled(), "Cancel disabled with no selection");
+
+        // Open sorts to row 0, filled to row 1. Select the OPEN row -> enabled.
+        QCOMPARE(table->item(0, 2)->text(), QString("open"));
+        table->selectRow(0);
+        QVERIFY2(cancel->isEnabled(), "Cancel must enable for an open listing");
+
+        // Select the TERMINAL (filled) row -> disabled again.
+        table->selectRow(1);
+        QVERIFY2(!cancel->isEnabled(), "Cancel must stay disabled for a terminal (filled) listing");
+        dlg->close();
+    }
+
+    // -- MY LISTINGS: a successful cancel re-pulls the list (the follow-up list shows
+    //    the row as "canceled") + confirms calmly. QPointer-valid throughout = no UAF.
+    void myListings_cancelSuccessRefreshesAndConfirms() {
+        MainWindow* w = makeWindow();
+        // First delivery: one open listing.
+        QVector<NFTOfferRow> first;
+        first << offerRow("off_open", "tokOPEN01", "sell", "open", 100000000, 555);
+        w->getRPC()->testSetNextOfferList(first);
+
+        QPointer<NFTListingsDialog> dlg = new NFTListingsDialog(w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* table  = dlg->findChild<QTableWidget*>("nftListingsTable");
+        auto* cancel = dlg->findChild<QPushButton*>("nftListingsCancelButton");
+        auto* status = dlg->findChild<QLabel*>("nftListingsStatusLine");
+        QVERIFY(table && cancel && status);
+        QVERIFY2(pumpUntil([&]{ return table->rowCount() == 1; }), "one open listing expected");
+        table->selectRow(0);
+        QVERIFY(cancel->isEnabled());
+
+        // Install BOTH the cancel result AND the follow-up list (the cancelled row
+        // comes back terminal). We set the results first, then arm the confirm
+        // auto-answer (Yes) and click.
+        w->getRPC()->testSetNextCancelResult("canceltxid01");
+        QVector<NFTOfferRow> after;
+        after << offerRow("off_open", "tokOPEN01", "sell", "canceled", 100000000, 555);
+        w->getRPC()->testSetNextOfferList(after);
+
+        // Auto-accept the "Cancel this listing?" confirm.
+        armQuestionYes();
+        cancel->click();
+
+        QVERIFY2(pumpUntil([&]{
+                     return !dlg.isNull()
+                         && status->text().contains("cancelled", Qt::CaseInsensitive);
+                 }),
+                 qPrintable("a successful cancel must confirm calmly: "
+                            + (dlg.isNull() ? QString("(dialog was destroyed — UAF!)")
+                                            : status->text())));
+        QVERIFY2(!dlg.isNull(), "the dialog must survive its own reply (QPointer-valid, no UAF)");
+        // The follow-up list shows the row as terminal "canceled" -> Cancel re-disabled.
+        QVERIFY2(pumpUntil([&]{ return table->rowCount() == 1
+                                    && table->item(0, 2)->text() == QString("canceled"); }),
+                 "the refresh must reflect the now-canceled status");
+        QVERIFY2(!cancel->isEnabled(), "Cancel must be disabled for the now-terminal row");
+        dlg->close();
+    }
+
+    // -- MY LISTINGS: a cancel error is CALM (red status) and KEEPS the row (the
+    //    listing still stands; Cancel stays available for the open selection).
+    void myListings_cancelErrorIsCalmAndKeepsRow() {
+        MainWindow* w = makeWindow();
+        QVector<NFTOfferRow> rows;
+        rows << offerRow("off_open", "tokOPEN01", "sell", "open", 100000000, 555);
+        w->getRPC()->testSetNextOfferList(rows);
+
+        NFTListingsDialog* dlg = new NFTListingsDialog(w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* table  = dlg->findChild<QTableWidget*>("nftListingsTable");
+        auto* cancel = dlg->findChild<QPushButton*>("nftListingsCancelButton");
+        auto* status = dlg->findChild<QLabel*>("nftListingsStatusLine");
+        QVERIFY(table && cancel && status);
+        QVERIFY2(pumpUntil([&]{ return table->rowCount() == 1; }), "one open listing expected");
+        table->selectRow(0);
+        QVERIFY(cancel->isEnabled());
+
+        // The error seam wins on nftCancelOffer -> the error cb fires.
+        w->getRPC()->testSetNextNftError("The node couldn't cancel the listing right now.");
+        armQuestionYes();
+        cancel->click();
+
+        QVERIFY2(pumpUntil([&]{ return status->text().contains("couldn't cancel", Qt::CaseInsensitive); }),
+                 qPrintable("a cancel error must surface calmly: " + status->text()));
+        // The row is still there (the listing stands) and Cancel is available again.
+        QCOMPARE(table->rowCount(), 1);
+        QVERIFY2(cancel->isEnabled(), "Cancel must remain available after a failed cancel (row kept)");
+        QVERIFY2(cancel->text().contains("Cancel listing"),
+                 qPrintable("the Cancel button must restore its label: " + cancel->text()));
+        dlg->close();
+    }
+
+    // -- MY LISTINGS: an index-off (list) error doesn't crash — it lands as a calm
+    //    line and the dialog stays alive.
+    void myListings_indexOffErrorDoesNotCrash() {
+        MainWindow* w = makeWindow();
+        // The shared error seam wins on nftListOffers -> the list error cb fires.
+        w->getRPC()->testSetNextNftError(
+            "Collectibles aren't indexed on this node yet (add zslpindex=1).");
+
+        QPointer<NFTListingsDialog> dlg = new NFTListingsDialog(w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* status = dlg->findChild<QLabel*>("nftListingsStatusLine");
+        QVERIFY(status);
+        QVERIFY2(pumpUntil([&]{
+                     return !dlg.isNull() && status->text().contains("zslpindex", Qt::CaseInsensitive);
+                 }),
+                 qPrintable("an index-off list error must land calmly without a crash: "
+                            + (dlg.isNull() ? QString("(destroyed)") : status->text())));
+        QVERIFY2(!dlg.isNull(), "the dialog must survive a list error (no crash)");
+        dlg->close();
+    }
+
     // -- BUY: a green verify renders the green verdict + enables Buy (after ack).
     void nftBuy_verifyGreenEnablesBuy() {
         MainWindow* w = makeWindow();
@@ -2762,6 +3010,313 @@ private slots:
                  qPrintable("public-trade note must stay honest: " + sellNote->text()));
         sell->close();
         buy->close();
+    }
+
+    // ======================================================================
+    // PILLAR C — decentralized NFT Browse/Search + Buy handoff (Journey 4).
+    // NFTMarketDialog drives RPC::nftBrowseOffers (test seam:
+    // testSetNextBrowseResult) and hands a selected offerBlob into the proven
+    // NFTBuyDialog::openWithOffer verify/take flow.
+    // ======================================================================
+
+    // Build a browse row helper (priceZat, name/collection joined, full offerBlob).
+    static NFTBrowseRow mkBrowseRow(const QString& offerId, const QString& tokenId,
+                                    qint64 priceZat, const QString& name,
+                                    const QString& collectionId = QString()) {
+        NFTBrowseRow r;
+        r.offerId      = offerId;
+        r.offerHash    = offerId + "hash";
+        r.tokenId      = tokenId;
+        r.offerBlob    = "znftoffer:" + offerId;   // the exact thing the Buy handoff routes
+        r.priceZat     = priceZat;
+        r.expiryHeight = 99999;
+        r.live         = true;
+        r.tokenName    = name;
+        r.collectionId = collectionId;
+        return r;
+    }
+
+    // -- BROWSE: results render PRICE-ASCENDING and in ZCL (never "ZEC", never "zat").
+    void browse_searchRendersPriceAscending_ZCLNotZat() {
+        MainWindow* w = makeWindow();
+        ContentEngine engine(nullptr);
+
+        QVector<NFTBrowseRow> rows;
+        rows << mkBrowseRow("offHi",  "tokHi",  500000000, "Expensive Cat")    // 5 ZCL
+             << mkBrowseRow("offLo",  "tokLo",  100000000, "Cheap Dog")        // 1 ZCL
+             << mkBrowseRow("offMid", "tokMid", 250000000, "Mid Fox");         // 2.5 ZCL
+        w->getRPC()->testSetNextBrowseResult(rows);
+
+        QPointer<NFTMarketDialog> dlg = new NFTMarketDialog(&engine, w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* list = dlg->findChild<QListWidget*>("nftMarketResultsList");
+        QVERIFY(list);
+        dlg->testRunSearch(QString());   // empty query -> whole page
+
+        QVERIFY2(pumpUntil([&]{ return !dlg.isNull() && list->count() == 3; }),
+                 qPrintable(QString("browse must render all 3 rows, got %1")
+                                .arg(dlg.isNull() ? -1 : list->count())));
+        // Price-ascending: Cheap Dog (1) first, Mid Fox (2.5) next, Expensive Cat (5) last.
+        QVERIFY2(list->item(0)->text().contains("Cheap Dog"),
+                 qPrintable("cheapest first: " + list->item(0)->text()));
+        QVERIFY2(list->item(2)->text().contains("Expensive Cat"),
+                 qPrintable("priciest last: " + list->item(2)->text()));
+        // ZCL only — NEVER "ZEC", NEVER "zat", anywhere in the rendered rows/state.
+        for (int i = 0; i < list->count(); ++i) {
+            const QString t = list->item(i)->text();
+            QVERIFY2(t.contains("ZCL"), qPrintable("row must price in ZCL: " + t));
+            QVERIFY2(!t.contains("ZEC"), qPrintable("row must NEVER say ZEC: " + t));
+            QVERIFY2(!t.contains("zat", Qt::CaseSensitive),
+                     qPrintable("row must NEVER show raw zatoshi: " + t));
+        }
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- BROWSE: a free-text NAME query filters CLIENT-SIDE over the fetched page.
+    void browse_filterByNameClientSide() {
+        MainWindow* w = makeWindow();
+        ContentEngine engine(nullptr);
+
+        QVector<NFTBrowseRow> rows;
+        rows << mkBrowseRow("offA", "tokA", 100000000, "Galactic Llama")
+             << mkBrowseRow("offB", "tokB", 200000000, "Desert Llama")
+             << mkBrowseRow("offC", "tokC", 300000000, "Mountain Goat");
+        w->getRPC()->testSetNextBrowseResult(rows);
+
+        QPointer<NFTMarketDialog> dlg = new NFTMarketDialog(&engine, w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* list = dlg->findChild<QListWidget*>("nftMarketResultsList");
+        QVERIFY(list);
+        // A non-hex free-text query => the daemon page is unfiltered server-side, then
+        // the client filters by name. "Llama" should keep exactly the two Llamas.
+        dlg->testRunSearch("Llama");
+
+        QVERIFY2(pumpUntil([&]{ return !dlg.isNull() && list->count() == 2; }),
+                 qPrintable(QString("name filter must keep the 2 Llamas, got %1")
+                                .arg(dlg.isNull() ? -1 : list->count())));
+        for (int i = 0; i < list->count(); ++i)
+            QVERIFY2(list->item(i)->text().contains("Llama"),
+                     qPrintable("only Llamas survive the name filter: " + list->item(i)->text()));
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- BROWSE: a COLLECTION query filters CLIENT-SIDE on the joined collection id.
+    void browse_filterByCollectionClientSide() {
+        MainWindow* w = makeWindow();
+        ContentEngine engine(nullptr);
+
+        QVector<NFTBrowseRow> rows;
+        rows << mkBrowseRow("offA", "tokA", 100000000, "Card One",   "setalpha01")
+             << mkBrowseRow("offB", "tokB", 200000000, "Card Two",   "setalpha01")
+             << mkBrowseRow("offC", "tokC", 300000000, "Card Three", "setbeta99");
+        w->getRPC()->testSetNextBrowseResult(rows);
+
+        QPointer<NFTMarketDialog> dlg = new NFTMarketDialog(&engine, w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* list = dlg->findChild<QListWidget*>("nftMarketResultsList");
+        QVERIFY(list);
+        dlg->testRunSearch("setalpha01");
+
+        QVERIFY2(pumpUntil([&]{ return !dlg.isNull() && list->count() == 2; }),
+                 qPrintable(QString("collection filter must keep the 2 alpha cards, got %1")
+                                .arg(dlg.isNull() ? -1 : list->count())));
+        QVERIFY2(list->item(0)->text().contains("Card One")
+                     || list->item(0)->text().contains("Card Two"),
+                 qPrintable("only setalpha01 members survive: " + list->item(0)->text()));
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- BROWSE: a method-not-found browse (daemon predates the RPC / foreign node)
+    //    shows the CALM honest "discovery is off" line, NOT a scary error dialog.
+    void browse_emptyShowsDiscoveryOffCalmLine() {
+        MainWindow* w = makeWindow();
+        ContentEngine engine(nullptr);
+
+        // The shared NFT error mapper turns -32601 into nftUnsupportedGuidance(); the
+        // dialog must translate THAT into the calm discovery-off line. Drive it via the
+        // shared testNextNftError seam (which wins inside nftBrowseOffers).
+        w->getRPC()->testSetNextNftError(RPC::nftUnsupportedGuidance());
+
+        QPointer<NFTMarketDialog> dlg = new NFTMarketDialog(&engine, w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* state = dlg->findChild<QLabel*>("nftMarketStateLabel");
+        auto* list  = dlg->findChild<QListWidget*>("nftMarketResultsList");
+        QVERIFY(state && list);
+        dlg->testRunSearch(QString());
+
+        QVERIFY2(pumpUntil([&]{ return !dlg.isNull() && !state->isHidden()
+                                        && state->text().contains("discovery is off",
+                                                                   Qt::CaseInsensitive); }),
+                 qPrintable("method-not-found must show the calm discovery-off line: "
+                            + (dlg.isNull() ? QString("(destroyed)") : state->text())));
+        QVERIFY2(!dlg.isNull(), "the dialog must survive a method-not-found (no crash)");
+        QCOMPARE(list->count(), 0);
+        // It must mention enabling -nftmarket once Tor relay ships, and never be a raw error.
+        QVERIFY2(state->text().contains("-nftmarket", Qt::CaseInsensitive),
+                 qPrintable("calm line must name the future toggle: " + state->text()));
+        QVERIFY2(!state->text().contains("method not found", Qt::CaseInsensitive),
+                 "must NEVER surface the raw 'method not found'");
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- BROWSE: clicking Buy hands the EXACT selected row's offerBlob into the proven
+    //    NFTBuyDialog flow (openWithOffer). We assert the routed blob is the selection's.
+    void browse_buyHandoffRoutesExactBlob() {
+        MainWindow* w = makeWindow();
+        ContentEngine engine(nullptr);
+
+        QVector<NFTBrowseRow> rows;
+        rows << mkBrowseRow("offLo",  "tokLo",  100000000, "Cheap Dog")    // 1 ZCL (row 0 after sort)
+             << mkBrowseRow("offHi",  "tokHi",  500000000, "Costly Cat");  // 5 ZCL (row 1 after sort)
+        w->getRPC()->testSetNextBrowseResult(rows);
+        // The child NFTBuyDialog auto-verifies on openWithOffer — give it a result so the
+        // verify lands (an ok=false is fine; we only assert the handoff blob here).
+        NFTVerifyResult vr; vr.ok = false; vr.tokenId = "tokHi"; vr.priceZat = 500000000;
+        vr.reasons << "test stub verify";
+        w->getRPC()->testSetNextVerifyResult(vr);
+
+        QPointer<NFTMarketDialog> dlg = new NFTMarketDialog(&engine, w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* list = dlg->findChild<QListWidget*>("nftMarketResultsList");
+        QVERIFY(list);
+        dlg->testRunSearch(QString());
+        QVERIFY(pumpUntil([&]{ return !dlg.isNull() && list->count() == 2; }));
+
+        // Row 1 (price-ascending) is the Costly Cat -> offerBlob "znftoffer:offHi".
+        dlg->selectRow(1);
+
+        // clickBuy() opens a MODAL child NFTBuyDialog via exec() (a nested event loop),
+        // so it does not return until the child is dismissed. Arm a self-rescheduling
+        // timer FIRST that finds + dismisses the modal child from INSIDE that nested
+        // loop; only then does clickBuy() return. The handoff blob is recorded before
+        // exec() begins, so we assert it after clickBuy() returns.
+        QTimer killer;
+        killer.setInterval(20);
+        QObject::connect(&killer, &QTimer::timeout, [&]{
+            for (QWidget* tw : QApplication::topLevelWidgets()) {
+                auto* b = qobject_cast<NFTBuyDialog*>(tw);
+                if (b && b->isVisible()) { b->reject(); }
+            }
+        });
+        killer.start();
+        dlg->clickBuy();          // blocks in the child exec() until killer dismisses it
+        killer.stop();
+
+        QVERIFY2(!dlg.isNull() && dlg->lastHandoffBlob() == QString("znftoffer:offHi"),
+                 qPrintable("Buy must route the selected row's exact offerBlob: "
+                            + (dlg.isNull() ? QString("(destroyed)") : dlg->lastHandoffBlob())));
+        if (!dlg.isNull()) dlg->close();
+        w->deleteLater();
+    }
+
+    // -- BROWSE: the verify gate carries through the handoff — a bad verify (ok=false)
+    //    HARD-disables Buy inside the child dialog + shows the amber reason.
+    void browse_buyVerifyGateDisablesOnBadVerify() {
+        MainWindow* w = makeWindow();
+        ContentEngine engine(nullptr);
+
+        // Verify the child NFTBuyDialog behavior directly via openWithOffer (the exact
+        // method the Market dialog calls). A non-ok verify must keep Buy disabled even
+        // after acknowledging, and paint the amber "Don't pay" reason.
+        NFTVerifyResult vr; vr.ok = false; vr.tokenId = "tokbadmarket";
+        vr.priceZat = 100000000;
+        vr.reasons << "vin[0] is not a live (unspent) UTXO";
+        w->getRPC()->testSetNextVerifyResult(vr);
+
+        QPointer<NFTBuyDialog> buy = new NFTBuyDialog(&engine, w->getRPC(), w);
+        buy->setAttribute(Qt::WA_DeleteOnClose);
+        buy->show();
+
+        auto* verdict = buy->findChild<QLabel*>("nftBuyVerdict");
+        auto* buyBtn  = buy->findChild<QPushButton*>("nftBuyButton");
+        auto* ack     = buy->findChild<QCheckBox*>("nftBuyAcknowledge");
+        QVERIFY(verdict && buyBtn && ack);
+
+        buy->openWithOffer("znftoffer:browsedBad");   // the Market handoff entry point
+
+        QVERIFY2(pumpUntil([&]{ return !buy.isNull()
+                                        && verdict->text().contains("Don't pay", Qt::CaseInsensitive); }),
+                 qPrintable("amber verdict after a bad verify via the handoff: "
+                            + (buy.isNull() ? QString("(destroyed)") : verdict->text())));
+        QVERIFY2(verdict->text().contains("not a live", Qt::CaseInsensitive),
+                 qPrintable("amber verdict must carry the honest reason: " + verdict->text()));
+        ack->setChecked(true);
+        QVERIFY2(!buyBtn->isEnabled(), "a bad verify via the handoff must keep Buy hard-disabled");
+        buy->close();
+        w->deleteLater();
+    }
+
+    // -- BROWSE: the RPC wrapper shape — single object param, omit-empty sentinels,
+    //    full "znftoffer:" offerBlob preserved, empty pool -> onDone(empty).
+    void browse_rpcWrapperShape() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+
+        // (1) A populated result is delivered to onDone with the offerBlob prefix intact.
+        QVector<NFTBrowseRow> rows;
+        rows << mkBrowseRow("offX", "tokX", 123456789, "Thing");
+        rpc->testSetNextBrowseResult(rows);
+
+        bool done = false;
+        QVector<NFTBrowseRow> got;
+        rpc->nftBrowseOffers(QString(), 0, 0, 50,
+            [&](QVector<NFTBrowseRow> r){ got = r; done = true; },
+            [&](QString){ QFAIL("a delivered browse result must not hit onErr"); });
+        QVERIFY(pumpUntil([&]{ return done; }));
+        QCOMPARE(got.size(), 1);
+        QVERIFY2(got[0].offerBlob.startsWith("znftoffer:"),
+                 qPrintable("offerBlob must keep the znftoffer: prefix: " + got[0].offerBlob));
+        QCOMPARE(got[0].priceZat, (qint64)123456789);
+
+        // (2) An EMPTY pool delivers onDone(empty) — never an error.
+        rpc->testSetNextBrowseResult(QVector<NFTBrowseRow>());
+        bool done2 = false; bool err2 = false;
+        rpc->nftBrowseOffers("deadbeef", 100000000, 0, 50,
+            [&](QVector<NFTBrowseRow> r){ done2 = true; QCOMPARE(r.size(), 0); },
+            [&](QString){ err2 = true; });
+        QVERIFY(pumpUntil([&]{ return done2 || err2; }));
+        QVERIFY2(done2 && !err2, "an empty pool must be onDone(empty), not onErr");
+
+        // (3) A method-not-found routes to onErr with the shared calm guidance.
+        rpc->testSetNextNftError(RPC::nftUnsupportedGuidance());
+        bool sawErr = false; QString errMsg;
+        rpc->nftBrowseOffers(QString(), 0, 0, 50,
+            [&](QVector<NFTBrowseRow>){ QFAIL("a method-not-found must hit onErr, not onDone"); },
+            [&](QString e){ sawErr = true; errMsg = e; });
+        QVERIFY(pumpUntil([&]{ return sawErr; }));
+        QCOMPARE(errMsg, RPC::nftUnsupportedGuidance());
+        QVERIFY2(!errMsg.contains("method not found", Qt::CaseInsensitive),
+                 "the wrapper must never surface the raw 'method not found'");
+        w->deleteLater();
+    }
+
+    // -- BROWSE: when the Collections gallery is gated OFF, the Browse-market button is
+    //    never built (no entry point exists).
+    void browse_gatingOffHidesButton() {
+        Settings::getInstance()->setShowNFTGallery(false);
+        MainWindow* w = makeWindow();
+        QVERIFY2(!w->isNFTGalleryActive(),
+                 "with the gallery gated off the NFT tab must not be built");
+        auto* btn = w->findChild<QPushButton*>("nftBrowseOffersButton");
+        QVERIFY2(btn == nullptr,
+                 "gallery off => the Browse-market button must not exist");
+        // Restore the default for subsequent tests that expect the gallery on.
+        Settings::getInstance()->setShowNFTGallery(true);
+        w->deleteLater();
     }
 
     // -- C-4 (DRY): the shared 4-state t-address validator must paint the SAME copy
@@ -3251,6 +3806,294 @@ private slots:
     }
 
     // ======================================================================
+    // COLLECTIONS Phase-1 — create a collection, mint a card INTO one, and
+    // browse a set (authorized members only). All drive the REAL dialogs +
+    // RPC seams (testSetNextMintResult / testSetNextCollectionList / ...Info /
+    // ...Members + testLastMintGroupId) under ZCL_WIDGET_TEST + offscreen QPA.
+    // No daemon.
+    // ======================================================================
+
+    // -- CREATE COLLECTION: Create gated until a name; success -> Done + honest line.
+    void collectionCreate_gatedUntilNameThenSucceeds() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+        CollectionCreateDialog* dlg = new CollectionCreateDialog(rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* name   = dlg->findChild<QLineEdit*>("collectionCreateNameEdit");
+        auto* count  = dlg->findChild<QSpinBox*>("collectionCreateCountSpin");
+        auto* create = dlg->findChild<QPushButton*>("collectionCreateButton");
+        auto* result = dlg->findChild<QLabel*>("collectionCreateResultLine");
+        QVERIFY(name && count && create && result);
+
+        // Gated: no name -> Create disabled (card count defaults to a valid >=1).
+        QVERIFY2(!create->isEnabled(), "Create must be disabled with no name");
+        QVERIFY2(count->value() >= 1, "card count must default to at least one");
+
+        name->setText("Series 1");
+        QVERIFY2(create->isEnabled(), "Create must enable once a name is present");
+
+        // Install the create result (reuses the mint seam: {txid, tokenid==group_id}).
+        rpc->testSetNextMintResult("txcoll", "groupcoll01");
+        create->click();
+
+        QVERIFY2(pumpUntil([&]{ return create->text() == QString("Done"); }),
+                 qPrintable("Create did not retire to Done: " + create->text()));
+        QVERIFY2(result->text().contains("created", Qt::CaseInsensitive)
+                     && result->text().contains("confirm", Qt::CaseInsensitive),
+                 qPrintable("result line must show the honest confirming copy: " + result->text()));
+        QCOMPARE(dlg->lastGroupId(), QString("groupcoll01"));
+        QVERIFY2(dlg->result() != QDialog::Accepted,
+                 "create dialog must NOT auto-accept on success (user reads the confirmation)");
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- CREATE COLLECTION: the copy is HONEST about authority + slots + public/permanent.
+    void collectionCreate_honestAboutAuthorityAndPublic() {
+        MainWindow* w = makeWindow();
+        CollectionCreateDialog* dlg = new CollectionCreateDialog(w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* intro = dlg->findChild<QLabel*>("collectionCreateIntro");
+        auto* perm  = dlg->findChild<QLabel*>("collectionCreatePermanenceLabel");
+        QVERIFY(intro && perm);
+        // You keep the authority; each card uses a slot.
+        QVERIFY2(intro->text().contains("control", Qt::CaseInsensitive)
+                     || intro->text().contains("authority", Qt::CaseInsensitive),
+                 qPrintable("intro must explain you keep control/authority: " + intro->text()));
+        QVERIFY2(intro->text().contains("uses up one", Qt::CaseInsensitive)
+                     || intro->text().contains("slot", Qt::CaseInsensitive),
+                 qPrintable("intro must explain each card uses a slot: " + intro->text()));
+        // Public + permanent honesty (never implies private).
+        QVERIFY2(perm->text().contains("public", Qt::CaseInsensitive)
+                     && perm->text().contains("permanent", Qt::CaseInsensitive),
+                 qPrintable("permanence line must be public + permanent: " + perm->text()));
+        QVERIFY2(!perm->text().contains("ZEC") && !perm->text().contains("Zcash"),
+                 "copy must be ZCL, never ZEC/Zcash");
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- MINT INTO COLLECTION: choosing a collection forwards its group_id to the RPC;
+    //    a sealed (0-slot) collection is shown DISABLED so it can't be picked.
+    void collectionMint_choosingCollectionForwardsGroupId() {
+        QTemporaryDir appDir; QVERIFY(appDir.isValid());
+        qputenv("XDG_DATA_HOME", appDir.path().toUtf8());
+        QStandardPaths::setTestModeEnabled(true);
+        ContentEngine engine(nullptr);
+
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+
+        // Install the collection list the mint dialog loads: one open (slots left) and
+        // one sealed (0 slots). The open one must be selectable; the sealed one disabled.
+        QVector<CollectionRow> cols;
+        CollectionRow open; open.tokenId = "groupOPEN"; open.name = "Open Set";
+        open.balance = 5; open.hasMintBaton = true; open.totalMinted = 5;
+        CollectionRow sealed; sealed.tokenId = "groupSEALED"; sealed.name = "Full Set";
+        sealed.balance = 0; sealed.hasMintBaton = false; sealed.totalMinted = 3;
+        cols.push_back(open); cols.push_back(sealed);
+        rpc->testSetNextCollectionList(cols);
+
+        NftMintDialog* dlg = new NftMintDialog(&engine, rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* combo  = dlg->findChild<QComboBox*>("nftMintCollectionCombo");
+        auto* name   = dlg->findChild<QLineEdit*>("nftMintNameEdit");
+        auto* create = dlg->findChild<QPushButton*>("nftMintCreateButton");
+        QVERIFY(combo && name && create);
+
+        // The combo loads asynchronously: sentinel + 2 collections.
+        QVERIFY2(pumpUntil([&]{ return combo->count() == 3; }),
+                 qPrintable(QString("combo should hold sentinel + 2 collections, has %1")
+                                .arg(combo->count())));
+        // Row 0 = standalone sentinel; row 1 = open; row 2 = sealed (disabled).
+        QVERIFY2(combo->itemText(0).contains("Not part", Qt::CaseInsensitive),
+                 qPrintable("row 0 must be the standalone sentinel: " + combo->itemText(0)));
+        QVERIFY2(combo->itemText(1).contains("Open Set", Qt::CaseInsensitive),
+                 qPrintable("row 1 must be the open collection: " + combo->itemText(1)));
+        QVERIFY2(combo->itemText(2).contains("full", Qt::CaseInsensitive),
+                 qPrintable("the sealed collection must read 'full': " + combo->itemText(2)));
+        // The sealed row must be DISABLED in the model (can't be chosen).
+        auto* model = qobject_cast<QStandardItemModel*>(combo->model());
+        QVERIFY2(model, "combo must use a QStandardItemModel for per-item enabled flags");
+        QVERIFY2(!(model->item(2)->flags() & Qt::ItemIsEnabled),
+                 "the sealed (0-slot) collection row must be disabled");
+        QVERIFY2(model->item(1)->flags() & Qt::ItemIsEnabled,
+                 "the open collection row must stay selectable");
+
+        // Pick the OPEN collection, complete the mint, and assert the group_id flowed through.
+        combo->setCurrentIndex(1);
+        name->setText("Card #1");
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        QString hashHex;
+        const QString png = writePngWithHash(tmp.path(), "card.png", Qt::magenta, hashHex);
+        dlg->testPickFile(png);
+        QVERIFY(pumpUntil([&]{ return create->isEnabled(); }));
+
+        rpc->testSetNextMintResult("txcard", "tokcard");
+        create->click();
+        QVERIFY2(pumpUntil([&]{ return create->text() == QString("Done"); }),
+                 qPrintable("Create did not retire to Done: " + create->text()));
+        // THE assertion: the chosen collection's group_id was forwarded to the RPC.
+        QCOMPARE(rpc->testLastMintGroupId(), QString("groupOPEN"));
+
+        dlg->close();
+        w->deleteLater();
+        QStandardPaths::setTestModeEnabled(false);
+    }
+
+    // -- MINT STANDALONE: leaving the picker on the sentinel forwards an EMPTY group_id
+    //    (identical to a plain standalone mint — no collection joined).
+    void collectionMint_standaloneForwardsEmptyGroupId() {
+        QTemporaryDir appDir; QVERIFY(appDir.isValid());
+        qputenv("XDG_DATA_HOME", appDir.path().toUtf8());
+        QStandardPaths::setTestModeEnabled(true);
+        ContentEngine engine(nullptr);
+
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+        rpc->testSetNextCollectionList(QVector<CollectionRow>());   // user owns no collections
+
+        NftMintDialog* dlg = new NftMintDialog(&engine, rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* combo  = dlg->findChild<QComboBox*>("nftMintCollectionCombo");
+        auto* hint   = dlg->findChild<QLabel*>("nftMintCollectionHint");
+        auto* name   = dlg->findChild<QLineEdit*>("nftMintNameEdit");
+        auto* create = dlg->findChild<QPushButton*>("nftMintCreateButton");
+        QVERIFY(combo && hint && name && create);
+
+        // No collections -> the hint says so honestly; only the sentinel row exists.
+        QVERIFY2(pumpUntil([&]{ return hint->text().contains("don't own any", Qt::CaseInsensitive); }),
+                 qPrintable("no-collections hint must be honest: " + hint->text()));
+        QCOMPARE(combo->count(), 1);   // sentinel only
+
+        name->setText("Loner");
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        QString hashHex;
+        const QString png = writePngWithHash(tmp.path(), "loner.png", Qt::yellow, hashHex);
+        dlg->testPickFile(png);
+        QVERIFY(pumpUntil([&]{ return create->isEnabled(); }));
+
+        rpc->testSetNextMintResult("txloner", "tokloner");
+        create->click();
+        QVERIFY2(pumpUntil([&]{ return create->text() == QString("Done"); }),
+                 qPrintable("Create did not retire to Done: " + create->text()));
+        // Standalone => an EMPTY group_id was forwarded (the daemon omits group_id).
+        QCOMPARE(rpc->testLastMintGroupId(), QString());
+
+        dlg->close();
+        w->deleteLater();
+        QStandardPaths::setTestModeEnabled(false);
+    }
+
+    // -- BROWSE: opening a collection shows the collectioninfo header + AUTHORIZED members
+    //    only. The honesty line states only verified members are shown.
+    void collectionBrowse_showsOnlyAuthorizedMembers() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+
+        // The LIST loads first (one owned collection), then opening it loads the info
+        // header + the authorized members. The wrappers consume the seams in call order:
+        // listMyCollections -> collectionInfo -> listCollectionMembers.
+        QVector<CollectionRow> cols;
+        CollectionRow c; c.tokenId = "groupVIEW"; c.name = "Viewable Set";
+        c.balance = 2; c.hasMintBaton = true; c.totalMinted = 4;
+        cols.push_back(c);
+        rpc->testSetNextCollectionList(cols);
+
+        CollectionBrowseDialog* dlg = new CollectionBrowseDialog(rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* list   = dlg->findChild<QListWidget*>("collectionBrowseList");
+        auto* open   = dlg->findChild<QPushButton*>("collectionBrowseOpenButton");
+        auto* honest = dlg->findChild<QLabel*>("collectionBrowseSetHonesty");
+        QVERIFY(list && open && honest);
+
+        QVERIFY2(pumpUntil([&]{ return list->count() == 1; }),
+                 qPrintable(QString("the owned collection should list, count=%1").arg(list->count())));
+        QVERIFY2(list->item(0)->text().contains("Viewable Set", Qt::CaseInsensitive),
+                 qPrintable("collection row copy: " + list->item(0)->text()));
+        // The honesty line names the verified-members-only rule.
+        QVERIFY2(honest->text().contains("verified members", Qt::CaseInsensitive),
+                 qPrintable("the set honesty line must state verified-only: " + honest->text()));
+
+        // Install the info header + members for the OPEN step, then open the collection.
+        CollectionInfo info; info.tokenId = "groupVIEW"; info.name = "Viewable Set";
+        info.memberCount = 2; info.open = true; info.found = true;
+        rpc->testSetNextCollectionInfo(info);
+        QVector<CollectionMember> members;
+        CollectionMember m1; m1.tokenId = "child01"; m1.name = "Card A"; members.push_back(m1);
+        CollectionMember m2; m2.tokenId = "child02"; m2.name = "Card B"; members.push_back(m2);
+        rpc->testSetNextCollectionMembers(members);
+
+        list->setCurrentRow(0);
+        open->click();
+
+        auto* memberList = dlg->findChild<QListWidget*>("collectionBrowseMemberList");
+        auto* header     = dlg->findChild<QLabel*>("collectionBrowseSetHeader");
+        QVERIFY(memberList && header);
+        QVERIFY2(pumpUntil([&]{ return memberList->count() == 2; }),
+                 qPrintable(QString("both authorized members should list, count=%1")
+                                .arg(memberList->count())));
+        QVERIFY2(memberList->item(0)->text().contains("Card A", Qt::CaseInsensitive),
+                 qPrintable("member 0 copy: " + memberList->item(0)->text()));
+        // The header reflects the collectioninfo: member count + open/sealed.
+        QVERIFY2(pumpUntil([&]{ return header->text().contains("verified member", Qt::CaseInsensitive); }),
+                 qPrintable("header must show the verified member count: " + header->text()));
+        QVERIFY2(header->text().contains("open", Qt::CaseInsensitive),
+                 qPrintable("an open collection header must say 'open': " + header->text()));
+        QCOMPARE(dlg->openedGroupId(), QString("groupVIEW"));
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- BROWSE: an empty collection shows the honest "no cards yet" state, not a spinner.
+    void collectionBrowse_emptyCollectionIsHonestState() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+
+        QVector<CollectionRow> cols;
+        CollectionRow c; c.tokenId = "groupEMPTY"; c.name = "Empty Set";
+        c.balance = 10; c.hasMintBaton = true; c.totalMinted = 10;
+        cols.push_back(c);
+        rpc->testSetNextCollectionList(cols);
+
+        CollectionBrowseDialog* dlg = new CollectionBrowseDialog(rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* list = dlg->findChild<QListWidget*>("collectionBrowseList");
+        auto* open = dlg->findChild<QPushButton*>("collectionBrowseOpenButton");
+        QVERIFY(list && open);
+        QVERIFY(pumpUntil([&]{ return list->count() == 1; }));
+
+        CollectionInfo info; info.tokenId = "groupEMPTY"; info.name = "Empty Set";
+        info.memberCount = 0; info.open = true; info.found = true;
+        rpc->testSetNextCollectionInfo(info);
+        rpc->testSetNextCollectionMembers(QVector<CollectionMember>());   // no members
+
+        list->setCurrentRow(0);
+        open->click();
+
+        auto* state = dlg->findChild<QLabel*>("collectionBrowseMemberState");
+        QVERIFY(state);
+        QVERIFY2(pumpUntil([&]{ return !state->isHidden()
+                                        && state->text().contains("No cards", Qt::CaseInsensitive); }),
+                 qPrintable("an empty collection must show the honest no-cards line: " + state->text()));
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // ======================================================================
     // BUG #1 — NFT-CAPABILITY gating (the user attached to an OLDER node that
     // lacks the NFT RPCs, so minting 404'd with a cryptic "method not found").
     // ======================================================================
@@ -3279,12 +4122,20 @@ private slots:
         // everything on it — isHidden() reflects the gating decision regardless.
         QVERIFY2(!panel->isHidden(), "unsupported node => guidance panel must be shown");
         QVERIFY2(view->isHidden(),   "unsupported node => the empty grid must be hidden");
-        // The guidance is HONEST + actionable (and ZCL, never ZEC) — and never the
-        // raw RPC error.
-        QVERIFY2(label->text().contains("built-in node", Qt::CaseInsensitive),
-                 qPrintable("guidance must point at the built-in node: " + label->text()));
-        QVERIFY2(label->text().contains("beta7", Qt::CaseInsensitive),
-                 qPrintable("guidance must name the version that works: " + label->text()));
+        // The guidance is HONEST + actionable (and ZCL, never ZEC) — and never the raw RPC
+        // error. For a FOREIGN unsupported node (the default in this test: ezclassicd==nullptr)
+        // the IDIOTPROOF NODE-SWAP makes the panel point at the built-in node via the PRIMARY
+        // "Use this wallet's built-in node" BUTTON (not a dead-end "quit it yourself"); the
+        // honest line names the problem + that this wallet has a newer node.
+        QVERIFY2(label->text().contains("older ZClassic node", Qt::CaseInsensitive),
+                 qPrintable("foreign-node copy must name the problem: " + label->text()));
+        QVERIFY2(label->text().contains("newer", Qt::CaseInsensitive),
+                 qPrintable("foreign-node copy must offer the newer built-in node: " + label->text()));
+        auto* swapBtn = w->findChild<QPushButton*>("nftUseBuiltInBtn");
+        QVERIFY2(swapBtn && !swapBtn->isHidden(),
+                 "foreign + unsupported => the primary built-in-node swap button must be the next action");
+        QVERIFY2(swapBtn->text().contains("built-in node", Qt::CaseInsensitive),
+                 qPrintable("the swap button must point at the built-in node: " + swapBtn->text()));
         QVERIFY2(!label->text().contains("method not found", Qt::CaseInsensitive),
                  "guidance must NEVER surface the raw 'method not found'");
 
@@ -3396,6 +4247,257 @@ private slots:
     }
 
     // ======================================================================
+    // IDIOTPROOF NODE-SWAP — the user attached to an OLDER FOREIGN node; the
+    // Collections panel must offer a real next action (swap to the built-in node),
+    // NEVER a dead-end "quit it yourself". Tests cover: the button shows ONLY for a
+    // foreign+unsupported node, the swap state machine transitions + honest copy,
+    // and the systemd-service guidance (don't fight an auto-restart service).
+    // ======================================================================
+
+    // (d) The "Use this wallet's built-in node" button is shown ONLY when the
+    //     unsupported node is FOREIGN (we didn't spawn it: rpc->isEmbedded()==false).
+    //     For an EMBEDDED node there is nothing to swap to, so the button is hidden.
+    void nodeSwap_builtInButtonOnlyWhenForeignAndUnsupported() {
+        Settings::getInstance()->setShowNFTGallery(true);
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+        QVERIFY2(w->isNFTGalleryActive(), "gallery tab must be built for this test");
+
+        auto* btn   = w->findChild<QPushButton*>("nftUseBuiltInBtn");
+        auto* label = w->findChild<QLabel*>("nftUnsupportedLabel");
+        QVERIFY2(btn && label, "panel must expose the built-in-node button + honest label");
+        // The guidance message must be SELECTABLE so the user can copy the exact wording.
+        QVERIFY2(label->textInteractionFlags().testFlag(Qt::TextSelectableByMouse),
+                 "the unsupported-node guidance must be selectable (copy-pasteable)");
+
+        // FOREIGN (default: ezclassicd==nullptr) + UNSUPPORTED -> button SHOWN.
+        rpc->testSetNodeSupportsNFT(false);
+        w->onNFTCapabilityResolved();
+        QVERIFY2(!btn->isHidden(),
+                 "foreign + unsupported node => the built-in-node swap button must be shown");
+        // The honest line names the problem AND that this wallet has a newer node — never
+        // the dead-end "quit it yourself", never ZEC/Zcash.
+        QVERIFY2(label->text().contains("older ZClassic node", Qt::CaseInsensitive),
+                 qPrintable("foreign copy must name the problem: " + label->text()));
+        QVERIFY2(label->text().contains("newer", Qt::CaseInsensitive),
+                 qPrintable("foreign copy must offer the newer built-in node: " + label->text()));
+        QVERIFY2(!label->text().contains("ZEC") && !label->text().contains("Zcash"),
+                 qPrintable("user copy must say ZClassic/ZCL, never ZEC/Zcash: " + label->text()));
+        // The button itself carries an actionable verb + the funds-safe reassurance.
+        QVERIFY2(btn->text().contains("built-in node", Qt::CaseInsensitive),
+                 qPrintable("button must name the built-in node: " + btn->text()));
+        QVERIFY2(btn->toolTip().contains("unaffected", Qt::CaseInsensitive)
+                     || btn->toolTip().contains("safe", Qt::CaseInsensitive),
+                 qPrintable("button tooltip must reassure funds are safe: " + btn->toolTip()));
+
+        // SUPPORTED -> button hidden (page returns to normal).
+        rpc->testSetNodeSupportsNFT(true);
+        w->onNFTCapabilityResolved();
+        QVERIFY2(btn->isHidden(), "supported node => no swap button");
+
+        // EMBEDDED + UNSUPPORTED -> button HIDDEN (nothing to swap to). Adopt a dummy
+        // QProcess so rpc->isEmbedded() is true, then re-gate.
+        QProcess* dummy = new QProcess(w);   // never started; just flips isEmbedded()
+        rpc->setEZClassicd(dummy);
+        QVERIFY2(rpc->isEmbedded(), "dummy process must make isEmbedded() true");
+        rpc->testSetNodeSupportsNFT(false);
+        w->onNFTCapabilityResolved();
+        QVERIFY2(btn->isHidden(),
+                 "embedded (we own the node) => no built-in-node swap button (nothing to swap to)");
+        rpc->setEZClassicd(nullptr);   // detach so teardown is clean
+
+        w->deleteLater();
+    }
+
+    // (e) The swap STATE MACHINE transitions + honest progress copy, driven via the
+    //     test seam (no daemon, no real stop/start). Asserts each phase pushes the
+    //     right honest line into the panel and the panel offers a real next action.
+    void nodeSwap_stateMachineTransitionsAndCopy() {
+        Settings::getInstance()->setShowNFTGallery(true);
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+
+        // Put the page in the foreign+unsupported state (so the panel is the surface).
+        rpc->testSetNodeSupportsNFT(false);
+        w->onNFTCapabilityResolved();
+
+        auto* progress = w->findChild<QLabel*>("nftSwapProgressLabel");
+        auto* svcCmd   = w->findChild<QLabel*>("nftSwapServiceCmdLabel");
+        auto* retry    = w->findChild<QPushButton*>("nftSwapRetryBtn");
+        QVERIFY2(progress && svcCmd && retry, "panel must expose the swap progress/cmd/retry widgets");
+
+        // A fresh loader in TEST MODE: startNodeSwap() steps into Stopping without real I/O.
+        ConnectionLoader* cl = new ConnectionLoader(w, rpc);
+        cl->setSwapTestMode(true);
+        cl->startNodeSwap();
+        QCOMPARE(int(cl->swapState()), int(NodeSwapState::Stopping));
+        QVERIFY2(progress->text().contains("Stopping", Qt::CaseInsensitive),
+                 qPrintable("Stopping state must show honest progress: " + progress->text()));
+
+        // -> StartingBuiltIn: "Starting the built-in node…"
+        cl->testStepSwap(NodeSwapState::StartingBuiltIn);
+        QCOMPARE(int(cl->swapState()), int(NodeSwapState::StartingBuiltIn));
+        QVERIFY2(progress->text().contains("Starting", Qt::CaseInsensitive),
+                 qPrintable("StartingBuiltIn state must show honest progress: " + progress->text()));
+
+        // -> Failed: honest + RETRYABLE (a real next action, never a spinner-forever).
+        cl->testStepSwap(NodeSwapState::Failed);
+        QCOMPARE(int(cl->swapState()), int(NodeSwapState::Failed));
+        QVERIFY2(!retry->isHidden(), "a failed swap must offer Retry (never a dead-end)");
+        QVERIFY2(progress->text().contains("try again", Qt::CaseInsensitive),
+                 qPrintable("a failed swap must be honest + retryable: " + progress->text()));
+        QVERIFY2(progress->text().contains("safe", Qt::CaseInsensitive),
+                 qPrintable("a failed swap must reassure the funds are safe: " + progress->text()));
+
+        // -> Supported (test mode): the page returns to normal (panel hidden). We must
+        //    flip the probe Supported so onNFTCapabilityResolved() lights the page back up.
+        rpc->testSetNodeSupportsNFT(true);
+        cl->testStepSwap(NodeSwapState::Supported);
+        QCOMPARE(int(cl->swapState()), int(NodeSwapState::Supported));
+        auto* panel = w->findChild<QWidget*>("nftUnsupportedPanel");
+        QVERIFY2(panel && panel->isHidden(), "a supported swap returns the gallery (panel hidden)");
+
+        delete cl;
+        w->deleteLater();
+    }
+
+    // (f) SYSTEMD SERVICE node: the swap must NOT fight an auto-restart service. It shows
+    //     the exact `systemctl stop` command + Retry, and never sends a stop that would
+    //     just respawn. Driven via the pure detector + the ServiceGuidance state.
+    void nodeSwap_systemServiceShowsCommandNotFight() {
+        Settings::getInstance()->setShowNFTGallery(true);
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+        rpc->testSetNodeSupportsNFT(false);
+        w->onNFTCapabilityResolved();
+
+        auto* progress = w->findChild<QLabel*>("nftSwapProgressLabel");
+        auto* svcCmd   = w->findChild<QLabel*>("nftSwapServiceCmdLabel");
+        auto* retry    = w->findChild<QPushButton*>("nftSwapRetryBtn");
+        QVERIFY(progress && svcCmd && retry);
+
+        // The pure detector classifies a system.slice/.service node as a SERVICE.
+        QString unit;
+        QVERIFY2(classifyForeignServiceFromProc(
+                     QStringLiteral("0::/system.slice/zclassicd.service\n"),
+                     QStringLiteral("/usr/bin/zclassicd"), &unit),
+                 "a system.slice/.service node must be classified a SERVICE (do not fight it)");
+        QVERIFY2(unit.contains("zclassicd"), qPrintable("service unit must be named: " + unit));
+
+        // Drive the panel to the ServiceGuidance state (what startNodeSwap() does when it
+        // detects a service). We use the public command builder so the panel copy is the
+        // SAME string the GUI shows.
+        const QString cmd = ConnectionLoader::serviceStopCommandFor(unit);
+        w->setNodeSwapProgress(
+            QObject::tr("Your node runs as a background service, so this wallet can't stop "
+                        "it for you. In a terminal, run:"),
+            /*retry=*/true, /*serviceCmd=*/cmd);
+
+        QVERIFY2(!svcCmd->isHidden(), "service node => the exact stop command must be shown");
+        QVERIFY2(svcCmd->text().contains("systemctl stop"),
+                 qPrintable("service guidance must show the systemctl-stop command: " + svcCmd->text()));
+        QVERIFY2(svcCmd->text().contains(unit),
+                 qPrintable("service guidance must name the unit to stop: " + svcCmd->text()));
+        QVERIFY2(!retry->isHidden(), "service guidance must offer Retry (a real next action)");
+        QVERIFY2(progress->text().contains("background service", Qt::CaseInsensitive),
+                 qPrintable("service guidance must be honest about what's happening: " + progress->text()));
+        QVERIFY2(!progress->text().contains("ZEC") && !progress->text().contains("Zcash"),
+                 qPrintable("user copy must say ZClassic/ZCL, never ZEC/Zcash: " + progress->text()));
+
+        w->deleteLater();
+    }
+
+    // (g) The swap E2E state markers are distinct + honest (asserted via the static map,
+    //     which is also what the production transition emits to stderr for the harness).
+    void nodeSwap_e2eMarkersDistinctAndHonest() {
+        const QString stopping = ConnectionLoader::swapMarkerForState(NodeSwapState::Stopping);
+        const QString start    = ConnectionLoader::swapMarkerForState(NodeSwapState::StartingBuiltIn);
+        const QString sup      = ConnectionLoader::swapMarkerForState(NodeSwapState::Supported);
+        const QString svc      = ConnectionLoader::swapMarkerForState(NodeSwapState::ServiceGuidance);
+        const QString fail     = ConnectionLoader::swapMarkerForState(NodeSwapState::Failed);
+        QCOMPARE(stopping, QStringLiteral("ZQW-E2E swap: stopping"));
+        QCOMPARE(start,    QStringLiteral("ZQW-E2E swap: starting-builtin"));
+        QCOMPARE(sup,      QStringLiteral("ZQW-E2E swap: supported"));
+        QCOMPARE(svc,      QStringLiteral("ZQW-E2E swap: service-guidance"));
+        QCOMPARE(fail,     QStringLiteral("ZQW-E2E swap: failed"));
+        // Idle has no marker (not a live phase).
+        QVERIFY(ConnectionLoader::swapMarkerForState(NodeSwapState::Idle).isEmpty());
+    }
+
+    // (h) NEVER-STUCK watchdog: the swap launched the built-in node and is awaiting the post-start
+    //     probe, but it never comes online -> the probe never lands. The watchdog must end that
+    //     with an honest, RETRYABLE failure (never a spinner-forever). Driven via the handler
+    //     directly (no 135s wait), exactly as the production singleShot would invoke it.
+    void nodeSwap_watchdogForcesRetryableFailure() {
+        Settings::getInstance()->setShowNFTGallery(true);
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+        rpc->testSetNodeSupportsNFT(false);
+        w->onNFTCapabilityResolved();   // foreign + unsupported -> panel is the surface
+
+        auto* progress = w->findChild<QLabel*>("nftSwapProgressLabel");
+        auto* retry    = w->findChild<QPushButton*>("nftSwapRetryBtn");
+        QVERIFY2(progress && retry, "panel must expose the swap progress + retry widgets");
+
+        // Awaiting the post-start probe (this arms the watchdog)...
+        w->noteNodeSwapAwaitingProbe();
+        // ...which never resolves. The watchdog fires:
+        w->onNodeSwapWatchdogTimeout();
+
+        QVERIFY2(!retry->isHidden(), "a timed-out swap must offer Retry (never a spinner forever)");
+        QVERIFY2(progress->text().contains("try again", Qt::CaseInsensitive),
+                 qPrintable("timed-out swap must be honest + retryable: " + progress->text()));
+        QVERIFY2(progress->text().contains("safe", Qt::CaseInsensitive),
+                 qPrintable("timed-out swap must reassure funds are safe: " + progress->text()));
+        QVERIFY2(!progress->text().contains("ZEC") && !progress->text().contains("Zcash"),
+                 qPrintable("user copy must say ZClassic/ZCL, never ZEC/Zcash: " + progress->text()));
+
+        // IDEMPOTENT: a late real probe, or a second watchdog fire, must be a no-op once resolved.
+        const QString settled = progress->text();
+        w->onNodeSwapWatchdogTimeout();
+        QCOMPARE(progress->text(), settled);
+
+        w->deleteLater();
+    }
+
+    // (i) Live swap progress must SURVIVE a background capability re-gate (#6). While a swap is in
+    //     flight, a background setNFTItems()/applyNFTSupportGating() must not wipe the
+    //     "Stopping…/Starting…" line the user is watching, nor pop the primary button back over it.
+    //     Only a resolved/retryable end state hands the panel back to normal re-gating.
+    void nodeSwap_progressSurvivesBackgroundRegate() {
+        Settings::getInstance()->setShowNFTGallery(true);
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+        rpc->testSetNodeSupportsNFT(false);
+        w->onNFTCapabilityResolved();   // foreign + unsupported
+
+        auto* progress = w->findChild<QLabel*>("nftSwapProgressLabel");
+        auto* btn      = w->findChild<QPushButton*>("nftUseBuiltInBtn");
+        QVERIFY(progress && btn);
+
+        // Active progress (retry=false => the swap is in-flight).
+        w->setNodeSwapProgress(QStringLiteral("Stopping the older node…"), /*retry=*/false, QString());
+        QVERIFY2(!progress->isHidden() && progress->text().contains("Stopping"),
+                 qPrintable("progress must be visible mid-swap: " + progress->text()));
+        QVERIFY2(btn->isHidden(), "the primary button must be hidden while the swap runs");
+
+        // A background capability re-gate (still unsupported) must NOT wipe the live progress, nor
+        // re-show the primary button over it.
+        w->onNFTCapabilityResolved();
+        QVERIFY2(progress->text().contains("Stopping"),
+                 qPrintable("live swap progress must survive a background re-gate: " + progress->text()));
+        QVERIFY2(btn->isHidden(), "a background re-gate must not re-show the button mid-swap");
+
+        // After a user-actionable end state (retry=true), a re-gate may manage the panel again.
+        w->setNodeSwapProgress(QStringLiteral("Couldn't switch. You can try again."), /*retry=*/true, QString());
+        w->onNFTCapabilityResolved();   // re-gate now allowed to reset the swap copy
+        QVERIFY2(progress->text().isEmpty() || progress->isHidden(),
+                 "after a retryable end state, a background re-gate may clear the swap copy");
+
+        w->deleteLater();
+    }
+
+    // ======================================================================
     // BUG #2 — responsive sizing. The mint + detail dialogs must fit a SMALL
     // screen (1280x720 with chrome, and the height stays <= ~640 so it fits
     // 1024x600 after the user shrinks it). We assert minimumSizeHint() — the
@@ -3480,6 +4582,340 @@ private slots:
             dlg->close();
         }
 
+        w->deleteLater();
+    }
+
+    // ======================================================================
+    // NAMES pillar (ZNAM) L1 tests. Driven via the RPC test seams
+    // (testSetNextNameRegisterResult / NameTransferResult / NameResolve /
+    // NameListMine + the shared testNextNftError) under ZCL_WIDGET_TEST +
+    // offscreen QPA. No daemon. A QTimer::singleShot(0) dismisser handles any
+    // modal (mirrors armModalDismisser / e2_publicWarning).
+    // ----------------------------------------------------------------------
+
+    // -- REGISTER: a valid name + installed success result retires to Done w/ the
+    //    honest 0-conf "confirming" copy, and exposes the txid.
+    void names_registerSuccessReturnsTxid() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+        auto* dlg = new NameRegisterDialog(rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* name   = dlg->findChild<QLineEdit*>("nameRegisterNameEdit");
+        auto* reg    = dlg->findChild<QPushButton*>("nameRegisterButton");
+        auto* result = dlg->findChild<QLabel*>("nameRegisterResultLine");
+        QVERIFY(name && reg && result);
+
+        name->setText("alice");
+        QVERIFY2(pumpUntil([&]{ return reg->isEnabled(); }),
+                 "Register must enable for a valid name");
+
+        rpc->testSetNextNameRegisterResult("txname01", "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi");
+        reg->click();
+
+        QVERIFY2(pumpUntil([&]{ return reg->text() == QString("Done"); }),
+                 qPrintable("Register did not retire to Done: " + reg->text()));
+        QVERIFY2(result->text().contains("confirm", Qt::CaseInsensitive),
+                 qPrintable("result line missing the honest confirming copy: " + result->text()));
+        QCOMPARE(dlg->lastTxid(), QString("txname01"));
+        QVERIFY2(dlg->result() != QDialog::Accepted,
+                 "dialog must NOT auto-accept on success (user reads the confirmation first)");
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- REGISTER: an INVALID name blocks BEFORE any RPC — Register stays disabled and
+    //    no seam is consumed (we prove the installed result survives untouched).
+    void names_registerInvalidNameBlocksBeforeRPC() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+        auto* dlg = new NameRegisterDialog(rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* name   = dlg->findChild<QLineEdit*>("nameRegisterNameEdit");
+        auto* status = dlg->findChild<QLabel*>("nameRegisterNameStatus");
+        auto* reg    = dlg->findChild<QPushButton*>("nameRegisterButton");
+        QVERIFY(name && status && reg);
+
+        // Uppercase is invalid per znamIsValidName (lowercase/digits/hyphen only).
+        name->setText("BadName!");
+        QVERIFY2(!reg->isEnabled(), "Register must stay DISABLED for an invalid name");
+        QVERIFY2(!status->text().isEmpty(), "an invalid name must show a red reason");
+
+        // Install a success result; since Register is disabled, clicking it must NOT
+        // fire the RPC (the seam stays armed). Force a click anyway.
+        rpc->testSetNextNameRegisterResult("txshouldNOTfire", "");
+        reg->click();
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 25);
+        QVERIFY2(reg->text() != QString("Done"),
+                 "a disabled-Register click must never register an invalid name");
+        QVERIFY2(dlg->lastTxid().isEmpty(),
+                 "no txid should have been delivered for an invalid name");
+
+        // Now fix the name -> the SAME armed seam fires and succeeds, proving it was
+        // never consumed by the invalid attempt.
+        name->setText("good-name");
+        QVERIFY(pumpUntil([&]{ return reg->isEnabled(); }));
+        reg->click();
+        QVERIFY2(pumpUntil([&]{ return dlg->lastTxid() == QString("txshouldNOTfire"); }),
+                 "the armed success seam must still be intact after the invalid attempt");
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- REGISTER: a daemon failure (testNextNftError) shows the calm honest message and
+    //    relabels Register to "Try again" (never a scary dialog).
+    void names_registerCalmErrorOnDaemonFail() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+        auto* dlg = new NameRegisterDialog(rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* name   = dlg->findChild<QLineEdit*>("nameRegisterNameEdit");
+        auto* reg    = dlg->findChild<QPushButton*>("nameRegisterButton");
+        auto* result = dlg->findChild<QLabel*>("nameRegisterResultLine");
+        QVERIFY(name && reg && result);
+
+        name->setText("taken");
+        QVERIFY(pumpUntil([&]{ return reg->isEnabled(); }));
+
+        rpc->testSetNextNftError("That name is already registered.");
+        reg->click();
+
+        QVERIFY2(pumpUntil([&]{ return result->text().contains("already registered", Qt::CaseInsensitive); }),
+                 qPrintable("calm error not rendered: " + result->text()));
+        QVERIFY2(pumpUntil([&]{ return reg->text() == QString("Try again"); }),
+                 qPrintable("Register should offer Try again after a failure: " + reg->text()));
+        QVERIFY2(dlg->result() != QDialog::Accepted, "a failed register must not accept");
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- RESOLVE: a found name renders owner / status / primary into the results box.
+    void names_resolveFoundRendersFields() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+
+        ResolvedName r;
+        r.name   = "alice";
+        r.owner  = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        r.status = "active";
+        r.primaryType     = 3;   // TAddr
+        r.primaryTypeName = "ZCL transparent (t-addr)";
+        r.primaryValue    = "t1ResolvedTargetAddr0000000000000";
+        rpc->testSetNextNameResolve(true, r);
+
+        // Prefill triggers the lookup immediately in the ctor.
+        auto* dlg = new NameResolveDialog(rpc, "alice", w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* state = dlg->findChild<QLabel*>("nameResolveStateLine");
+        auto* box   = dlg->findChild<QWidget*>("nameResolveResultsBox");
+        QVERIFY(state && box);
+
+        QVERIFY2(pumpUntil([&]{ return state->text().contains("Registered", Qt::CaseInsensitive); }),
+                 qPrintable("state should report Registered: " + state->text()));
+
+        // The rendered rows live as child QLabels under the results box; assert the
+        // owner + the primary target text both appear somewhere in them.
+        QVERIFY2(pumpUntil([&]{
+            for (QLabel* l : box->findChildren<QLabel*>())
+                if (l->text().contains("t1ResolvedTargetAddr", Qt::CaseInsensitive))
+                    return true;
+            return false;
+        }), "the resolved primary target value must be rendered");
+        bool sawOwner = false;
+        for (QLabel* l : box->findChildren<QLabel*>())
+            if (l->text().contains("t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi"))
+                sawOwner = true;
+        QVERIFY2(sawOwner, "the resolved owner must be rendered");
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- RESOLVE: a null resolve renders the calm "available / not registered" state.
+    void names_resolveNullShowsAvailable() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+
+        rpc->testSetNextNameResolve(false, ResolvedName());
+        auto* dlg = new NameResolveDialog(rpc, "free-name", w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* state = dlg->findChild<QLabel*>("nameResolveStateLine");
+        QVERIFY(state);
+        QVERIFY2(pumpUntil([&]{ return state->text().contains("available", Qt::CaseInsensitive)
+                                     || state->text().contains("isn't registered", Qt::CaseInsensitive); }),
+                 qPrintable("null resolve should show the available state: " + state->text()));
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- MY-NAMES: a populated name_listmine fills namesModel rows and hides the empty state.
+    void names_listMinePopulatesModel() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+
+        QVector<NameRow> rows;
+        NameRow a; a.name = "alice"; a.status = "active"; a.expiryHeight = 12345; rows.push_back(a);
+        NameRow b; b.name = "bob";   b.status = "grace";  b.expiryHeight = 67890; rows.push_back(b);
+        rpc->testSetNextNameListMine(rows);
+
+        w->refreshMyNames();
+
+        QVERIFY2(w->namesModel != nullptr, "the Names tab + model must exist (default ON)");
+        QVERIFY2(pumpUntil([&]{ return w->namesModel->rowCount() == 2; }),
+                 qPrintable(QString("model should have 2 rows, has %1").arg(w->namesModel->rowCount())));
+        QCOMPARE(w->namesModel->item(0, 0)->text(), QString("alice"));
+        QCOMPARE(w->namesModel->item(1, 0)->text(), QString("bob"));
+        // The Names page is not the current tab, so effective isVisible() is always
+        // false for any widget on it (the D-series visibility caveat). Assert the
+        // label's OWN visible flag via !isHidden() instead.
+        QVERIFY2(w->namesEmptyLabel && w->namesEmptyLabel->isHidden(),
+                 "the empty-state label must hide once names are listed");
+
+        w->deleteLater();
+    }
+
+    // -- MY-NAMES: an EMPTY name_listmine keeps the honest empty state visible.
+    void names_listMineEmptyShowsEmptyState() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+
+        rpc->testSetNextNameListMine(QVector<NameRow>());
+        w->refreshMyNames();
+
+        QVERIFY(w->namesModel != nullptr);
+        QVERIFY2(pumpUntil([&]{ return w->namesModel->rowCount() == 0; }),
+                 "an empty list must leave the model empty");
+        // Off-current-page widget: assert the OWN visible flag (!isHidden()), since
+        // effective isVisible() is always false on a non-current tab (D-series caveat).
+        QVERIFY2(w->namesEmptyLabel && !w->namesEmptyLabel->isHidden(),
+                 "the empty-state label must be shown when no names are owned");
+
+        w->deleteLater();
+    }
+
+    // -- TRANSFER: a valid t-addr owner + installed success retires to Done w/ txid.
+    void names_transferSuccessReturnsTxid() {
+        const QString TADDR = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+
+        QStringList mine; mine << "alice" << "bob";
+        auto* dlg = new NameTransferDialog(rpc, mine, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* owner  = dlg->findChild<QLineEdit*>("nameTransferNewOwnerEdit");
+        auto* xfer   = dlg->findChild<QPushButton*>("nameTransferButton");
+        auto* result = dlg->findChild<QLabel*>("nameTransferResultLine");
+        QVERIFY(owner && xfer && result);
+
+        owner->setText(TADDR);
+        QVERIFY2(pumpUntil([&]{ return xfer->isEnabled(); }),
+                 "Transfer must enable for a name + a valid t-addr owner");
+
+        rpc->testSetNextNameTransferResult("txxfer01");
+        xfer->click();
+
+        QVERIFY2(pumpUntil([&]{ return xfer->text() == QString("Done"); }),
+                 qPrintable("Transfer did not retire to Done: " + xfer->text()));
+        QVERIFY2(result->text().contains("confirm", Qt::CaseInsensitive),
+                 qPrintable("result line missing the honest confirming copy: " + result->text()));
+        QCOMPARE(dlg->lastTxid(), QString("txxfer01"));
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- TRANSFER: a valid z-addr owner is REJECTED client-side (Transfer disabled,
+    //    honest "must be transparent" status), and the daemon is never asked.
+    void names_transferRejectsZAddrOwner() {
+        const QString ZSADDR =
+            "zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u";
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+
+        QStringList mine; mine << "alice";
+        auto* dlg = new NameTransferDialog(rpc, mine, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* owner  = dlg->findChild<QLineEdit*>("nameTransferNewOwnerEdit");
+        auto* status = dlg->findChild<QLabel*>("nameTransferOwnerStatus");
+        auto* xfer   = dlg->findChild<QPushButton*>("nameTransferButton");
+        QVERIFY(owner && status && xfer);
+
+        owner->setText(ZSADDR);
+        QVERIFY2(status->text().contains("transparent", Qt::CaseInsensitive),
+                 qPrintable("a z-addr owner must be rejected with the transparent-only copy: "
+                            + status->text()));
+        QVERIFY2(!xfer->isEnabled(), "a valid z-addr owner must NOT enable Transfer");
+
+        // Force a click: even so, no transfer fires (no seam consumed -> no Done).
+        rpc->testSetNextNameTransferResult("txshouldNOTfire");
+        xfer->click();
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 25);
+        QVERIFY2(xfer->text() != QString("Done"), "a z-addr owner must never complete a transfer");
+        QVERIFY2(dlg->lastTxid().isEmpty(), "no txid for a rejected z-addr owner");
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- TAB GATING: with options/shownamestab=false BEFORE the window is built, the
+    //    Names tab is never created (indexOf(namesTab) == -1, namesTab null).
+    void names_tabGatedOffHidesTab() {
+        QSettings().setValue("options/shownamestab", false);
+        QSettings().sync();
+
+        MainWindow* w = makeWindow();
+        QVERIFY2(w->namesTab == nullptr,
+                 "Names tab must not be built when options/shownamestab is false");
+        QVERIFY2(w->ui->tabWidget->indexOf(w->namesTab) == -1,
+                 "a disabled Names tab must not be in the tab widget");
+
+        QSettings().setValue("options/shownamestab", true);   // restore default
+        QSettings().sync();
+        w->deleteLater();
+    }
+
+    // -- PERPETUAL IN-FLIGHT: with NOTHING installed the register seam never resolves;
+    //    the [X]/close is swallowed while in flight (the UAF guard).
+    void names_perpetualInFlightSwallowsClose() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+        auto* dlg = new NameRegisterDialog(rpc, w);
+        dlg->show();   // NOT WA_DeleteOnClose: we assert it survives the close
+
+        auto* name = dlg->findChild<QLineEdit*>("nameRegisterNameEdit");
+        auto* reg  = dlg->findChild<QPushButton*>("nameRegisterButton");
+        QVERIFY(name && reg);
+        name->setText("inflight");
+        QVERIFY(pumpUntil([&]{ return reg->isEnabled(); }));
+
+        // Install NOTHING -> the seam returns without firing either callback.
+        reg->click();
+        QVERIFY2(pumpUntil([&]{ return reg->text() == QString("Registering…"); }),
+                 "Register should read Registering… while in flight");
+
+        dlg->close();
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 25);
+        QVERIFY2(dlg->isVisible(), "dialog must NOT close while the register RPC is in flight");
+        QVERIFY2(dlg->result() != QDialog::Accepted, "must not have accepted while in flight");
+
+        delete dlg;   // test owns it (no WA_DeleteOnClose); explicit teardown
         w->deleteLater();
     }
 
@@ -3973,6 +5409,29 @@ private:
                 else dlg->close();
             }
             if (tries > 0) armInfoCounter(tries - 1);  // keep watching for more
+        });
+    }
+
+    // Answer a "...?" confirm with YES. Self-rearming generation-guarded poll (mirrors
+    // armModalDismisser): when a QMessageBox is up it does(Yes), so a QMessageBox::question
+    // returns Yes and the caller's confirmed action proceeds. Used by the My-Listings
+    // cancel tests (the "Cancel this listing?" confirm).
+    void armQuestionYes(int tries = 200) {
+        const int gen = (tries == 200) ? ++_modalGen : _modalGen;
+        QTimer::singleShot(tries == 200 ? 0 : 3, [this, gen, tries]() {
+            if (gen != _modalGen) return;            // superseded -> stop
+            QWidget* dlg = QApplication::activeModalWidget();
+            if (auto* mb = qobject_cast<QMessageBox*>(dlg)) {
+                // CLICK the Yes button (not done()) so QMessageBox::question maps the
+                // result back to QMessageBox::Yes via clickedButton().
+                if (QAbstractButton* yes = mb->button(QMessageBox::Yes)) {
+                    yes->click();
+                    return;
+                }
+                mb->done(QMessageBox::Yes);
+                return;
+            }
+            if (tries > 0) armQuestionYes(tries - 1);  // keep watching until the confirm is up
         });
     }
 

@@ -63,8 +63,16 @@ SOURCES += \
     ../../src/nftsenddialog.cpp \
     ../../src/nftselldialog.cpp \
     ../../src/nftbuydialog.cpp \
+    ../../src/nftlistingsdialog.cpp \
+    ../../src/nftmarketdialog.cpp \
+    ../../src/collectioncreatedialog.cpp \
+    ../../src/collectionbrowsedialog.cpp \
     ../../src/shieldsenddialog.cpp \
     ../../src/shieldreceivedialog.cpp \
+    ../../src/namescommon.cpp \
+    ../../src/nameregisterdialog.cpp \
+    ../../src/nameresolvedialog.cpp \
+    ../../src/nametransferdialog.cpp \
     ../../src/3rdparty/qrcode/BitBuffer.cpp \
     ../../src/3rdparty/qrcode/QrCode.cpp \
     ../../src/3rdparty/qrcode/QrSegment.cpp \
@@ -98,8 +106,15 @@ HEADERS += \
     ../../src/nftsenddialog.h \
     ../../src/nftselldialog.h \
     ../../src/nftbuydialog.h \
+    ../../src/nftlistingsdialog.h \
+    ../../src/nftmarketdialog.h \
+    ../../src/collectioncreatedialog.h \
+    ../../src/collectionbrowsedialog.h \
     ../../src/shieldsenddialog.h \
     ../../src/shieldreceivedialog.h \
+    ../../src/nameregisterdialog.h \
+    ../../src/nameresolvedialog.h \
+    ../../src/nametransferdialog.h \
     ../../src/qrcodelabel.h \
     ../../src/fillediconlabel.h \
     ../../src/addresscombo.h \

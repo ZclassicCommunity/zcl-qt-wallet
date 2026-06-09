@@ -38,6 +38,7 @@
 #include "nftimagecache.h"           // Phase C0: threaded decode/verify pipeline
 #include "contentengine.h"           // Phase C1: streaming hash / chunked Merkle engine
 #include "nftdatachannel.h"          // SHIELD: pure data-channel helpers (magic sniff / error map / cap)
+#include "nodeswapdetect.h"          // NODE-SWAP: pure service-detection parser (header-only)
 #include <QSet>
 #include <QVector>
 #include <QRegularExpression>
@@ -293,6 +294,15 @@ private slots:
 
     // --- First-run trust: send-gate staleness predicate (pure) ---
     void sendgate_staleWhenPollStops();               // Settings::syncGateIsStale boundary
+
+    // --- IDIOTPROOF NODE-SWAP: pure service-detection parser (nodeswapdetect.h) ---
+    void nodeSwap_serviceDetection_data();            // /proc cgroup+exe -> service vs user
+    void nodeSwap_serviceDetection();
+    void nodeSwap_serviceStopCommandHonest();         // copy-pasteable, names the unit
+    void nodeSwap_swapStateMarkersHonest();           // E2E markers exist + honest (source guard)
+    void nodeSwap_dataDirPlan_data();                 // safety #4: parse -datadir, adopt vs refuse
+    void nodeSwap_dataDirPlan();
+    void nodeSwap_refuseUnverifiedDatadir();          // safety #4: no-pidfile -> refuse unverifiable datadir
 
 private:
     QString sandboxAppData() const {
@@ -2105,6 +2115,241 @@ void TestLogic::shieldErrorStateMapping() {
         QVERIFY2(!copy.contains("try again", Qt::CaseInsensitive),
                  "a hard refusal must NOT invite a retry");
     }
+}
+
+// =====================================================================
+// IDIOTPROOF NODE-SWAP — pure service-detection parser (nodeswapdetect.h).
+// The parser decides whether the FOREIGN node we'd swap away from is a systemd
+// system SERVICE (would auto-restart, so don't fight it — show the command) vs a
+// plain user process (safe to graceful-stop + swap). Fed sample /proc cgroup +
+// exe strings, exactly as the GUI feeds the real /proc/<pid>/{cgroup,exe}.
+// =====================================================================
+void TestLogic::nodeSwap_serviceDetection_data() {
+    QTest::addColumn<QString>("cgroup");
+    QTest::addColumn<QString>("exePath");
+    QTest::addColumn<bool>("expectService");
+    QTest::addColumn<QString>("expectUnitContains");
+
+    // systemd v1 system.slice with a named .service unit.
+    QTest::newRow("v1-system-slice-service")
+        << QString("9:cpuset:/\n1:name=systemd:/system.slice/zclassicd.service\n")
+        << QString("/usr/bin/zclassicd")
+        << true << QString("zclassicd.service");
+    // systemd v2 unified hierarchy, system.slice + .service.
+    QTest::newRow("v2-system-slice-service")
+        << QString("0::/system.slice/zclassicd.service\n")
+        << QString("/home/bob/.cache/zcl/zqw-zclassicd")   // exe NOT under /usr -> classified via cgroup
+        << true << QString("zclassicd.service");
+    // system.slice but unit name opaque (no .service component) -> still a service, default unit.
+    QTest::newRow("system-slice-no-unit")
+        << QString("0::/system.slice/some-scope\n")
+        << QString("/opt/zclassicd")
+        << true << QString("zclassicd");
+    // Packaged /usr/bin exe with an EMPTY/opaque cgroup -> classified a service by the exe path.
+    QTest::newRow("packaged-usr-bin-exe")
+        << QString("0::/\n")
+        << QString("/usr/bin/zclassicd")
+        << true << QString("zclassicd");
+    // A self-built node under /usr/local (the FHS user-install prefix) with an opaque cgroup is
+    // NOT, by itself, a service: it MUST stay graceful-stoppable (never routed to the
+    // systemctl-stop dead-end). /usr/local is deliberately EXCLUDED from the packaged heuristic;
+    // a real service there is still caught by the cgroup checks / the swap's rebind fallback.
+    QTest::newRow("usr-local-not-service")
+        << QString("0::/\n")
+        << QString("/usr/local/bin/zclassicd")
+        << false << QString();
+    // A plain USER-session process (tray wallet's own daemon): user.slice, exe in cache.
+    // This MUST be classified NOT-a-service (safe to graceful-stop + swap). The ONLY
+    // ".service" in the path is the session manager "user@1000.service"; the leaf is a
+    // ".scope" — so it must NOT be mistaken for a system service (that false positive would
+    // wrongly route a stoppable node to the systemctl-stop dead-end).
+    QTest::newRow("user-session-tray-daemon")
+        << QString("0::/user.slice/user-1000.slice/user@1000.service/app.slice/zcl.scope\n")
+        << QString("/home/bob/.cache/zcl-qt-wallet/zclassic-node/abcd/zqw-zclassicd")
+        << false << QString();
+    // A user-installed `systemctl --user` service: under user.slice but the LEAF is a real
+    // ".service" (not the user@ manager). Such a unit DOES auto-restart, so it must be
+    // classified a service (and we surface that unit name to stop).
+    QTest::newRow("user-systemd-service")
+        << QString("0::/user.slice/user-1000.slice/user@1000.service/app.slice/zclassicd.service\n")
+        << QString("/home/bob/.cache/zcl-qt-wallet/zclassic-node/abcd/zqw-zclassicd")
+        << true << QString("zclassicd.service");
+    // Empty /proc reads (cross-user EACCES) -> default NOT-a-service (offer graceful stop).
+    QTest::newRow("empty-proc")
+        << QString() << QString() << false << QString();
+}
+
+void TestLogic::nodeSwap_serviceDetection() {
+    QFETCH(QString, cgroup);
+    QFETCH(QString, exePath);
+    QFETCH(bool,    expectService);
+    QFETCH(QString, expectUnitContains);
+
+    QString unit;
+    bool isService = classifyForeignServiceFromProc(cgroup, exePath, &unit);
+    QCOMPARE(isService, expectService);
+    if (expectService) {
+        QVERIFY2(!unit.isEmpty(), "a detected service must yield a unit name to stop");
+        QVERIFY2(unit.contains(expectUnitContains),
+                 qPrintable("unit '" + unit + "' should contain '" + expectUnitContains + "'"));
+    } else {
+        QVERIFY2(unit.isEmpty(), "a user-session process must NOT yield a service unit");
+    }
+}
+
+// The systemctl-stop command we surface for a service must be honest + copy-pasteable.
+void TestLogic::nodeSwap_serviceStopCommandHonest() {
+    QString cmd = nodeSwapServiceStopCommand(QStringLiteral("zclassicd.service"));
+    QVERIFY2(cmd.contains("systemctl stop"), qPrintable("must name the systemctl stop verb: " + cmd));
+    QVERIFY2(cmd.contains("zclassicd.service"), qPrintable("must name the unit to stop: " + cmd));
+    QVERIFY2(cmd.contains("sudo"), qPrintable("stopping a system unit needs privilege: " + cmd));
+    // Empty unit -> a sensible default, never a broken bare command.
+    QString def = nodeSwapServiceStopCommand(QString());
+    QVERIFY2(def.contains("systemctl stop zclassicd"),
+             qPrintable("empty unit must fall back to a usable command: " + def));
+    // Coin is ZCL, never ZEC/Zcash.
+    QVERIFY2(!cmd.contains("ZEC") && !cmd.contains("Zcash"),
+             qPrintable("command copy must say ZClassic/ZCL, never ZEC/Zcash: " + cmd));
+}
+
+// IDIOTPROOF NODE-SWAP — DATADIR-PIN safety (safety point #4). A foreign node started with
+// a command-line `-datadir=/Y` that DIFFERS from the conf datadir must NOT cause the embedded
+// node to launch on the conf/default datadir (a DIFFERENT wallet.dat = funds invisible). The
+// pure planner parses the foreign cmdline and decides: ADOPT the foreign datadir (pin it) when
+// it matches / the conf has none, or REFUSE the in-app swap when it diverges. Fed sample
+// cmdlines exactly as the GUI feeds swapForeign.cmdline from /proc/<pid>/cmdline.
+void TestLogic::nodeSwap_dataDirPlan_data() {
+    QTest::addColumn<QString>("cmdline");       // foreign node's space-joined /proc cmdline
+    QTest::addColumn<QString>("confDataDir");   // datadir resolved from the conf the GUI reads
+    QTest::addColumn<bool>("expectRefuse");     // true == divergent-datadir guard fires
+    QTest::addColumn<QString>("expectPin");     // -datadir to pin onto the embedded launch
+
+    // No -datadir on the cmdline: the foreign node used the conf/default datadir our embedded
+    // node resolves too. Nothing to pin, allow the swap.
+    QTest::newRow("no-datadir-allow")
+        << QString("/usr/bin/zclassicd -rpcport=8232 -server")
+        << QString("/home/bob/.zclassic")
+        << false << QString();
+    // Foreign -datadir EQUALS the conf datadir: adopt + pin it explicitly (same wallet.dat).
+    QTest::newRow("matching-datadir-pin")
+        << QString("/usr/bin/zclassicd -datadir=/home/bob/.zclassic -server")
+        << QString("/home/bob/.zclassic")
+        << false << QString("/home/bob/.zclassic");
+    // Matching but with a trailing slash: cleanPath equality still holds -> adopt.
+    QTest::newRow("matching-trailing-slash-pin")
+        << QString("/usr/bin/zclassicd -datadir=/home/bob/.zclassic/ -server")
+        << QString("/home/bob/.zclassic")
+        << false << QString("/home/bob/.zclassic/");   // pinned VERBATIM (daemon cleans it)
+    // THE BLOCKER CASE: foreign -datadir=/Y DIVERGES from the conf datadir=/X. Launching the
+    // embedded node on /X would hide the user's funds. The planner MUST refuse (no pin).
+    QTest::newRow("divergent-datadir-refuse")
+        << QString("/home/bob/.cache/zqw-zclassicd -datadir=/mnt/big/zcldata -rpcport=8232")
+        << QString("/home/bob/.zclassic")
+        << true << QString();
+    // Divergent even when only the leaf differs.
+    QTest::newRow("divergent-leaf-refuse")
+        << QString("/usr/bin/zclassicd -datadir=/data/zcl-mainnet")
+        << QString("/data/zcl-testchain")
+        << true << QString();
+    // Foreign -datadir present but the conf yielded NO datadir: adopt the only one we know.
+    QTest::newRow("no-conf-datadir-adopt-foreign")
+        << QString("/usr/bin/zclassicd -datadir=/srv/zcl")
+        << QString()
+        << false << QString("/srv/zcl");
+    // Multiple -datadir tokens: last-wins (daemon arg convention). The last one diverges.
+    QTest::newRow("last-datadir-wins-refuse")
+        << QString("/usr/bin/zclassicd -datadir=/home/bob/.zclassic -datadir=/mnt/other")
+        << QString("/home/bob/.zclassic")
+        << true << QString();
+}
+
+void TestLogic::nodeSwap_dataDirPlan() {
+    QFETCH(QString, cmdline);
+    QFETCH(QString, confDataDir);
+    QFETCH(bool,    expectRefuse);
+    QFETCH(QString, expectPin);
+
+    const QString foreign = foreignDataDirFromCmdline(cmdline);
+    const NodeSwapDataDirPlan plan = nodeSwapDataDirPlan(foreign, confDataDir);
+
+    QCOMPARE(plan.refuse, expectRefuse);
+    QCOMPARE(plan.pin, expectPin);
+    // SAFETY INVARIANTS: a refusal never also pins (we don't launch on a guessed datadir),
+    // and an allowed swap with a pin must pin a NON-empty path.
+    if (plan.refuse)
+        QVERIFY2(plan.pin.isEmpty(), "a refused swap must not also carry a datadir to launch on");
+    if (!plan.pin.isEmpty())
+        QVERIFY2(!plan.refuse, "a pinned datadir means the swap is allowed, not refused");
+}
+
+// IDIOTPROOF NODE-SWAP — DATADIR-VERIFY gate (safety #4, the NO-PIDFILE case). When the foreign
+// node could NOT be identified (no readable pidfile -> pid<=0) we can't read its -datadir, so the
+// embedded node would fall back to the conf/default datadir. The pure gate refuses ONLY when we
+// also can't confirm that datadir holds a live chain — otherwise the embedded node could serve a
+// different/empty wallet.dat (invisible funds). A node we COULD identify (pid>0) is handled by the
+// cmdline -datadir pin/refuse path, so the gate never fires for it.
+void TestLogic::nodeSwap_refuseUnverifiedDatadir() {
+    // Identified node (pid>0): never refuse here regardless of chain presence — the pin/refuse
+    // path (nodeSwapDataDirPlan) owns that decision.
+    QVERIFY2(!nodeSwapRefuseUnverifiedDatadir(1234, /*hasChain=*/true),  "pid>0 must not refuse here");
+    QVERIFY2(!nodeSwapRefuseUnverifiedDatadir(1234, /*hasChain=*/false), "pid>0 must not refuse here");
+    // Unidentified node (pid<=0) BUT the conf/default datadir holds a chain -> safe to adopt it.
+    QVERIFY2(!nodeSwapRefuseUnverifiedDatadir(0,  /*hasChain=*/true),  "live datadir -> allow");
+    // THE PROTECTED CASE: unidentified node AND no chain at the conf/default datadir -> the node
+    // is running on a datadir we can't see; REFUSE rather than launch on a wrong/empty wallet.dat.
+    QVERIFY2(nodeSwapRefuseUnverifiedDatadir(0,  /*hasChain=*/false), "unidentified + no chain -> REFUSE");
+    QVERIFY2(nodeSwapRefuseUnverifiedDatadir(-1, /*hasChain=*/false), "unidentified + no chain -> REFUSE");
+}
+
+// SOURCE-TEXT guard (same style as the conf/notify guards): the swap state machine
+// must emit each honest E2E marker, and the panel copy must be honest + actionable +
+// ZCL-only. The state machine itself runs Qt process/RPC plumbing the L0 binary does
+// not link, so we assert the wiring is present in the source so a regression fails CI.
+void TestLogic::nodeSwap_swapStateMarkersHonest() {
+    const QString conn = readStrippedSrc("connection.cpp");
+    QVERIFY2(!conn.isEmpty(), "could not locate src/connection.cpp for the node-swap guard");
+    // Every documented swap state marker must be present.
+    for (const char* marker : { "ZQW-E2E swap: stopping",
+                                "ZQW-E2E swap: starting-builtin",
+                                "ZQW-E2E swap: service-guidance",
+                                "ZQW-E2E swap: failed" }) {
+        QVERIFY2(conn.contains(marker),
+                 qPrintable(QString("connection.cpp must emit the swap marker: ") + marker));
+    }
+    // The "supported" end marker is emitted by MainWindow (the loader is deleted before
+    // the post-reconnect probe lands), so assert it there.
+    const QString mw = readStrippedSrc("mainwindow.cpp");
+    QVERIFY2(!mw.isEmpty(), "could not locate src/mainwindow.cpp for the node-swap guard");
+    QVERIFY2(mw.contains("ZQW-E2E swap: supported"),
+             "mainwindow.cpp must emit the swap 'supported' end marker");
+    // The swap MUST be graceful: a "stop" RPC, NEVER kill -9 in the swap path.
+    QVERIFY2(conn.contains("\"stop\""),
+             "the swap must use the graceful 'stop' RPC, not a kill");
+    // DATADIR-PIN safety (#4): the swap must consult the pure planner on the foreign cmdline
+    // and pin the foreign -datadir onto the embedded launch (so it never launches on a
+    // different wallet.dat). A regression that drops the guard fails here.
+    QVERIFY2(conn.contains("nodeSwapDataDirPlan") && conn.contains("foreignDataDirFromCmdline"),
+             "the swap must run the divergent-datadir planner on the foreign node's cmdline");
+    QVERIFY2(conn.contains("-datadir=") && conn.contains("swapPinDataDir"),
+             "the swap must pin the foreign node's -datadir onto the embedded launch");
+    // The honest, actionable, ZCL-only swap copy.
+    QVERIFY2(mw.contains("built-in node"),
+             "the swap button/copy must name the built-in node");
+    QVERIFY2(mw.contains("Stopping the older node") || conn.contains("Stopping the older node"),
+             "the swap must show honest progress ('Stopping the older node…')");
+    QVERIFY2(mw.contains("funds are unaffected") || mw.contains("coins are safe"),
+             "the swap copy must reassure the user their funds are safe");
+    // The test seam must exist (auto-invoke without a click) and be env-gated.
+    QVERIFY2(mw.contains("ZQW_UITEST_SWITCH"),
+             "the headless auto-swap test seam (ZQW_UITEST_SWITCH) must be present");
+    // SAFETY (#4, no-pidfile): the swap must run the datadir-verify gate — refuse launching the
+    // embedded node on an UNVERIFIABLE datadir (foreign node unidentifiable + no on-disk chain).
+    QVERIFY2(conn.contains("nodeSwapRefuseUnverifiedDatadir") && conn.contains("blocksDirSizeBytes"),
+             "the swap must refuse an unverifiable datadir when the foreign node can't be identified");
+    // NEVER-STUCK: a watchdog must end a hung embedded-node start with a retryable failure, not a
+    // spinner-forever. The 'supported'/'failed' end markers are owned by MainWindow (loader gone).
+    QVERIFY2(mw.contains("onNodeSwapWatchdogTimeout"),
+             "the swap must have a never-stuck watchdog (onNodeSwapWatchdogTimeout)");
 }
 
 QTEST_MAIN(TestLogic)

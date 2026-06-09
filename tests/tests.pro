@@ -67,6 +67,16 @@ SOURCES += \
     shim/addressbook_stub.cpp \
     tst_logic.cpp
 
+# The L0 suite pulls a handful of REAL product headers (the NFT model/cache TUs and, through
+# them, the real rpc.h) that `#include "ui_mainwindow.h"`. Generate that UI header here (uic
+# writes it to UI_DIR=bin, which qmake auto-adds to INCLUDEPATH) so the suite builds
+# deterministically EVEN WHEN the app's pre-generated src/ui_*.h have been cleaned. Without
+# this the build silently fell back to a stale tst_logic binary. These are header-only
+# setupUi structs (rpc.h -> ui_mainwindow.h; rpc.h -> connection.h -> ui_connection.h), so
+# listing the forms adds no link-time GUI dependency.
+FORMS += ../src/mainwindow.ui
+FORMS += ../src/connection.ui
+
 # Static-Qt offscreen platform plugin import (no X server in the chroot).
 static {
     QTPLUGIN.platforms = qoffscreen

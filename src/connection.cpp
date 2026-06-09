@@ -20,6 +20,7 @@
 #include <QStringList>
 #include <QCryptographicHash>
 #include <QDirIterator>
+#include <QPointer>     // UAF-safe async guards on MainWindow (node-swap callbacks)
 
 using json = nlohmann::json;
 
@@ -667,11 +668,29 @@ bool ConnectionLoader::startEmbeddedZClassicd(const QStringList& extraArgs) {
     QDir appPath(QCoreApplication::applicationDirPath());
     QString zclassicdProgram;
 #ifdef Q_OS_LINUX
+    // Resolution: our OWN extracted name first; then — for a SINGLE-FILE bundle (one that
+    // carries an embedded daemon payload) — PREFER that embedded daemon over any foreign
+    // `zclassicd` sibling. A stray system `zclassicd` next to the bundle is almost always the
+    // user's OLD node (no collectibles/NFT RPCs); picking it makes the built-in node look
+    // broken ("this wallet's built-in node doesn't support collectibles"). The embedded payload
+    // is the daemon we built, hash-verified and tested. Only a NON-bundle build (dev tree / .deb,
+    // with no embedded payload) falls back to the `zclassicd` sibling — there, that sibling IS
+    // the intended daemon.
     zclassicdProgram = appPath.absoluteFilePath("zqw-zclassicd");
-    if (!QFile(zclassicdProgram).exists())
-        zclassicdProgram = appPath.absoluteFilePath("zclassicd");
-    if (!QFile(zclassicdProgram).exists())
-        zclassicdProgram = ensureDaemonExtracted();
+    if (!QFile(zclassicdProgram).exists()) {
+        if (hasEmbeddedDaemon()) {
+            zclassicdProgram = ensureDaemonExtracted();                 // our bundled daemon
+            if (zclassicdProgram.isEmpty() &&                          // extract failed -> last resort
+                QFile(appPath.absoluteFilePath("zclassicd")).exists())
+                zclassicdProgram = appPath.absoluteFilePath("zclassicd");
+        } else {
+            zclassicdProgram = appPath.absoluteFilePath("zclassicd");   // dev tree / .deb sibling
+        }
+    }
+    main->logger->write("Daemon binary selected: " +
+                        (zclassicdProgram.isEmpty() ? QStringLiteral("(none)") : zclassicdProgram) +
+                        (hasEmbeddedDaemon() ? QStringLiteral(" [single-file bundle]")
+                                             : QStringLiteral(" [no embedded payload]")));
 #elif defined(Q_OS_DARWIN)
     // No runtime extraction on macOS: a hardened-runtime / code-signed build must
     // not exec a binary written at runtime, so the signed daemon ships as a sibling
@@ -776,6 +795,16 @@ bool ConnectionLoader::startEmbeddedZClassicd(const QStringList& extraArgs) {
             }
         }
     }
+    // DATADIR-PIN (safety point #4): on a NODE-SWAP launch, pin the foreign node's exact
+    // command-line -datadir so the embedded node adopts the IDENTICAL wallet.dat (funds stay
+    // visible). swapPinDataDir is set ONLY by startNodeSwap() after the divergent-datadir guard
+    // passes; it is EMPTY on every normal startup / repair launch, so this is a no-op there and
+    // the daemon resolves its datadir from the conf/default exactly as before. Pinned FIRST so a
+    // duplicate from extraArgs (none today) would last-win, never the other way round.
+    if (!swapPinDataDir.isEmpty()) {
+        main->logger->write("Embedded launch: pinning -datadir for node-swap (same wallet.dat)");
+        launchArgs << (QStringLiteral("-datadir=") + swapPinDataDir);
+    }
     launchArgs << "-dbcache=450"          // bigger chainstate cache
                << "-par=0"                // auto-detect cores: parallel script
                                           // verification (startup verify + IBD;
@@ -830,6 +859,25 @@ bool ConnectionLoader::startEmbeddedZClassicd(const QStringList& extraArgs) {
 //   [ ...GUI ELF... ][ daemon bytes ][ sha256(daemon) :32 ][ daemon len :8 LE ][ magic :8 ]
 // Returns the absolute path of the verified, executable daemon, or an empty
 // string to make the caller fall back (no payload / mismatch / macOS).
+// True iff THIS executable carries an appended embedded-daemon payload (single-file release):
+// the trailing 8-byte "ZQWDMON1" magic. Cheap (reads 8 bytes). Lets daemon resolution prefer
+// our bundled daemon over a foreign `zclassicd` sibling. Always false on macOS (never embeds).
+bool ConnectionLoader::hasEmbeddedDaemon() {
+#ifdef Q_OS_DARWIN
+    return false;
+#else
+    static const QByteArray MAGIC = QByteArrayLiteral("ZQWDMON1");   // 8 bytes
+    QFile self(QCoreApplication::applicationFilePath());
+    if (!self.open(QIODevice::ReadOnly))
+        return false;
+    const qint64 sz = self.size();
+    if (sz < MAGIC.size())
+        return false;
+    self.seek(sz - MAGIC.size());
+    return self.read(MAGIC.size()) == MAGIC;
+#endif
+}
+
 QString ConnectionLoader::ensureDaemonExtracted() {
 #ifdef Q_OS_DARWIN
     return QString();   // never extract+exec on macOS (hardened-runtime / signed build)
@@ -2724,6 +2772,380 @@ QString ConnectionLoader::discoverCredsFromRunningDaemon(const std::shared_ptr<C
     Q_UNUSED(cfg);
     return QString();   // /proc is Linux-only; macOS/Windows fall through to QSettings/prompt
 #endif
+}
+
+// ============================================================================
+// IDIOTPROOF NODE-SWAP. The user attached to a FOREIGN ZClassic node too old for
+// collectibles; the Collections panel's "Use this wallet's built-in node" button lands
+// here on a FRESH ConnectionLoader (the connect-time one is gone post-handoff). HONESTY +
+// SAFETY: graceful "stop" RPC only (never kill -9, never corrupt the datadir), don't fight
+// a systemd auto-restart service, every failure ends on a retryable message.
+// ============================================================================
+
+// SERVICE DETECTION (pure, L0-testable) lives in nodeswapdetect.h (classifyForeignServiceFromProc).
+// The command we surface for a detected service delegates to that header so the L0 test
+// asserts the SAME string the GUI shows.
+QString ConnectionLoader::serviceStopCommandFor(const QString& unit) {
+    return nodeSwapServiceStopCommand(unit);
+}
+
+// stderr E2E marker per state (also the basis of the panel/test copy assertions).
+QString ConnectionLoader::swapMarkerForState(NodeSwapState s) {
+    switch (s) {
+        case NodeSwapState::Stopping:        return QStringLiteral("ZQW-E2E swap: stopping");
+        case NodeSwapState::StartingBuiltIn: return QStringLiteral("ZQW-E2E swap: starting-builtin");
+        case NodeSwapState::Supported:       return QStringLiteral("ZQW-E2E swap: supported");
+        case NodeSwapState::ServiceGuidance: return QStringLiteral("ZQW-E2E swap: service-guidance");
+        case NodeSwapState::Failed:          return QStringLiteral("ZQW-E2E swap: failed");
+        case NodeSwapState::Idle:            return QString();
+    }
+    return QString();
+}
+
+// Detect the foreign node on our RPC port: pid via the standard pidfile, cmdline + exe via
+// /proc, and the system-service classification. Best-effort; never logs the cmdline.
+ForeignNodeInfo ConnectionLoader::detectForeignNode(const std::shared_ptr<ConnectionConfig>& cfg) {
+    ForeignNodeInfo info;
+#ifdef Q_OS_LINUX
+    if (!cfg)
+        return info;
+    QString base = !cfg->dataDirOverride.isEmpty() ? cfg->dataDirOverride : cfg->zclassicDir;
+    if (base.isEmpty())
+        return info;
+
+    // pidfile -> pid (same anchors as discoverCredsFromRunningDaemon).
+    QStringList pidCandidates;
+    pidCandidates << QDir::cleanPath(QDir(base).filePath(QStringLiteral("zclassicd.pid")));
+    if (Settings::getInstance()->isTestnet())
+        pidCandidates << QDir::cleanPath(QDir(base).filePath(QStringLiteral("testnet3/zclassicd.pid")));
+    for (const QString& pidPath : pidCandidates) {
+        QFile pf(pidPath);
+        if (!pf.open(QIODevice::ReadOnly | QIODevice::Text))
+            continue;
+        bool ok = false;
+        qint64 v = QTextStream(&pf).readLine().trimmed().toLongLong(&ok);
+        pf.close();
+        if (ok && v > 0) { info.pid = v; break; }
+    }
+    if (info.pid <= 0)
+        return info;   // no pid -> still offer the graceful-stop path (never a dead-end)
+
+    // cmdline (NUL-separated). Verify the basename to reject a recycled PID.
+    QFile cf(QStringLiteral("/proc/%1/cmdline").arg(info.pid));
+    if (cf.open(QIODevice::ReadOnly)) {
+        QByteArray raw = cf.readAll();
+        cf.close();
+        QStringList args;
+        for (const QByteArray& a : raw.split('\0'))
+            if (!a.isEmpty()) args << QString::fromLocal8Bit(a);
+        if (!args.isEmpty() &&
+            QFileInfo(args.first()).fileName().contains(QStringLiteral("zclassicd"), Qt::CaseInsensitive)) {
+            info.cmdline = args.join(QLatin1Char(' '));   // SECRET: never logged
+            // DATADIR-PIN (#4): capture -datadir from the RAW args (space-safe; last-wins is the
+            // daemon arg convention) so the swap can adopt the IDENTICAL datadir or refuse a
+            // divergent one. SECRET-adjacent: never logged (path may reveal layout).
+            for (const QString& a : args) {
+                if (a.startsWith(QStringLiteral("-datadir="))) {
+                    QString v = a.mid(QStringLiteral("-datadir=").size());
+                    if (!v.isEmpty())
+                        info.cmdDataDir = v;
+                }
+            }
+        } else {
+            info.pid = 0;   // wrong/recycled process
+            return info;
+        }
+    }
+
+    // exe target (may be unreadable cross-user -> empty).
+    info.exePath = QFile::symLinkTarget(QStringLiteral("/proc/%1/exe").arg(info.pid));
+
+    // cgroup -> system-service classification.
+    QString cgroup;
+    QFile cg(QStringLiteral("/proc/%1/cgroup").arg(info.pid));
+    if (cg.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        cgroup = QString::fromLocal8Bit(cg.readAll());
+        cg.close();
+    }
+    QString unit;
+    info.isSystemService = classifyForeignServiceFromProc(cgroup, info.exePath, &unit);
+    info.serviceUnit = unit;
+#else
+    Q_UNUSED(cfg);
+#endif
+    return info;
+}
+
+// True iff the foreign RPC port now REFUSES (its node is gone) AND the datadir lock is free.
+bool ConnectionLoader::swapPortAndLockFree() {
+    // Port: a refused connect == free (mirrors portsFree()'s probe).
+    quint16 port = swapRpcPort.toUShort();
+    if (port != 0) {
+        QTcpSocket probe;
+        probe.connectToHost(QStringLiteral("127.0.0.1"), port);
+        bool connected = probe.waitForConnected(150);
+        probe.abort();
+        if (connected)
+            return false;   // something still answering on the RPC port
+    }
+    // Datadir lock: bitcoin-core writes a ".lock" in the blocks dir while the node holds the
+    // datadir. We can't portably test an flock from another process, but its mere presence
+    // does NOT mean held (it lingers after exit). The authoritative signal is the refused
+    // RPC port above; treat the lock check as advisory-pass so we never wedge on a stale
+    // .lock. (resolveDataSubdir() already picks root vs testnet3/.)
+    return true;
+}
+
+// Centralised transition: latch state, emit the E2E marker, push honest copy to the panel.
+void ConnectionLoader::setSwapState(NodeSwapState s) {
+    swapStateValue = s;
+
+    QString marker = swapMarkerForState(s);
+    if (!marker.isEmpty()) {
+        fprintf(stderr, "%s\n", marker.toUtf8().constData());
+        fflush(stderr);
+    }
+
+    // UAF-safe: main is a QObject; guard the panel update even though this is sync.
+    QPointer<MainWindow> mw(main);
+    if (!mw)
+        return;
+
+    switch (s) {
+        case NodeSwapState::Stopping:
+            mw->setNodeSwapProgress(QObject::tr("Stopping the older node…"),
+                                    /*retry=*/false, /*serviceCmd=*/QString());
+            break;
+        case NodeSwapState::StartingBuiltIn:
+            mw->setNodeSwapProgress(QObject::tr("Starting the built-in node…"),
+                                    /*retry=*/false, /*serviceCmd=*/QString());
+            break;
+        case NodeSwapState::Supported:
+            // The gallery returns. Route through the PUBLIC capability re-gate so the
+            // (now NFT-capable) node lights the page back up exactly as a fresh probe would.
+            mw->onNFTCapabilityResolved();
+            break;
+        case NodeSwapState::ServiceGuidance: {
+            QString cmd = serviceStopCommandFor(swapForeign.serviceUnit);
+            mw->setNodeSwapProgress(
+                QObject::tr("Your node runs as a background service, so this wallet can't "
+                            "stop it for you. In a terminal, run:"),
+                /*retry=*/true, /*serviceCmd=*/cmd);
+            break;
+        }
+        case NodeSwapState::Failed:
+            mw->setNodeSwapProgress(
+                QObject::tr("Couldn't switch to the built-in node. The older node is still "
+                            "serving your wallet — your coins are safe. You can try again."),
+                /*retry=*/true, /*serviceCmd=*/QString());
+            break;
+        case NodeSwapState::Idle:
+            break;
+    }
+
+    // LIFETIME: ServiceGuidance and Failed are TERMINAL for THIS loader. Unlike the success
+    // path (StartingBuiltIn -> doAutoConnect -> doRPCSetConnection's deferred 'delete this'),
+    // nothing downstream frees it, so without this each Retry click would leak a loader. Free
+    // it the same deferred way doRPCSetConnection does (singleShot(0) on `main`, which outlives
+    // the swap). Deferred, so the rest of the synchronous caller (which may push custom panel
+    // copy right after) still runs against a live `this`. Skip in test mode: the L1 test owns
+    // the loader and steps it through several states. ~ConnectionLoader sets *ezAlive=false,
+    // neutralising any (none, on these paths) in-flight ezAlive-guarded lambda.
+    if (!swapTestMode &&
+        (s == NodeSwapState::ServiceGuidance || s == NodeSwapState::Failed)) {
+        std::shared_ptr<bool> alive = ezAlive;
+        QTimer::singleShot(0, main, [this, alive]() {
+            if (alive && *alive) delete this;   // dtor clears *alive
+        });
+    }
+}
+
+// Entry point. User-initiated; the connect-time loader is gone, so this is a fresh loader
+// (see MainWindow::switchToBuiltInNode). Detect -> consent/service-gate -> graceful stop ->
+// wait -> start built-in -> re-probe. UAF-safe via ezAlive + QPointer.
+void ConnectionLoader::startNodeSwap() {
+    // The conf the GUI is using = the foreign node's datadir + RPC port. ezDataDir/
+    // swapRpcPort below drive both the graceful stop target AND our subsequent embedded
+    // launch (SAME datadir == wallet/funds unaffected).
+    auto cfg = autoDetectZClassicConf();
+    if (ezDataDir.isEmpty() && cfg && !cfg->zclassicDir.isEmpty())
+        ezDataDir = cfg->zclassicDir;
+    if (cfg && !cfg->dataDirOverride.isEmpty())
+        ezDataDir = cfg->dataDirOverride;
+    swapRpcPort = cfg ? cfg->port : QString();
+    swapPinDataDir.clear();   // fresh decision each attempt; never carry a stale pin
+
+    // Identify the old node (pid/cmdline/exe/service).
+    swapForeign = detectForeignNode(cfg);
+
+    // SERVICE GATE: a systemd/auto-restart node would just respawn after a stop. Don't
+    // fight it — show the exact command + Retry. (b)
+    if (swapForeign.isSystemService) {
+        setSwapState(NodeSwapState::ServiceGuidance);
+        return;   // user runs the command, then Retry (a fresh swap)
+    }
+
+    // DATADIR-PIN GATE (safety point #4). The foreign node may have been launched with a
+    // command-line `-datadir=/Y` that differs from the datadir we resolved out of the conf.
+    // Our embedded node, started with no datadir pin, would adopt the conf/default datadir =
+    // a DIFFERENT wallet.dat, confronting the user with an apparently-empty wallet (funds
+    // untouched but invisible — forbidden). Resolve the conf datadir EXACTLY as
+    // detectForeignNode/cookieFilePathForConf do, then ask the pure planner.
+    {
+        const QString confDataDir = cfg ? (!cfg->dataDirOverride.isEmpty() ? cfg->dataDirOverride
+                                                                           : cfg->zclassicDir)
+                                        : QString();
+        // Prefer the space-safe field parsed from the RAW /proc args; fall back to the pure
+        // parser on the joined cmdline (which also keeps that parser exercised in product code).
+        QString foreignDataDir = swapForeign.cmdDataDir;
+        if (foreignDataDir.isEmpty())
+            foreignDataDir = foreignDataDirFromCmdline(swapForeign.cmdline);
+        const NodeSwapDataDirPlan plan = nodeSwapDataDirPlan(foreignDataDir, confDataDir);
+        if (plan.refuse) {
+            // DIVERGENT datadir: do NOT guess. Refuse the in-app swap and give an honest,
+            // retryable next action — quit the other node, then point this wallet at the SAME
+            // datadir (its funds are safe and untouched; only the datadir paths disagree).
+            // We never log the foreign datadir bytes (cmdline may also carry creds).
+            setSwapState(NodeSwapState::ServiceGuidance);   // retryable, never a dead-end
+            QPointer<MainWindow> mw(main);
+            if (mw) {
+                mw->setNodeSwapProgress(
+                    QObject::tr("The node serving this wallet uses a different data folder than "
+                                "the built-in node would. Your coins are safe and untouched. To "
+                                "switch, fully quit that node, then restart this wallet so it "
+                                "uses the built-in node on the same data folder."),
+                    /*retry=*/true, /*serviceCmd=*/QString());
+            }
+            return;
+        }
+        // ADOPT: pin the foreign node's datadir onto the embedded launch (empty == nothing to
+        // pin, i.e. the foreign node used the conf/default datadir our node resolves too). This
+        // guarantees the swap serves the IDENTICAL wallet.dat — funds stay visible. (#4)
+        swapPinDataDir = plan.pin;
+        if (!swapPinDataDir.isEmpty())
+            main->logger->write("Node-swap: pinning embedded -datadir to the foreign node's datadir");
+    }
+
+    // TEST MODE: skip all real I/O; the L1 test steps the machine via testStepSwap().
+    if (swapTestMode) {
+        setSwapState(NodeSwapState::Stopping);
+        return;
+    }
+
+    // GRACEFUL STOP (c). Build a short-lived connection to the foreign node and send the
+    // version-agnostic "stop" RPC — clean shutdown, never kill -9.
+    if (!cfg) {
+        setSwapState(NodeSwapState::Failed);
+        return;
+    }
+
+    // DATADIR-VERIFY GATE (safety point #4, the NO-PIDFILE case). If we could NOT identify the
+    // foreign node (no readable pidfile -> swapForeign.pid<=0), we also could not read its
+    // `-datadir`, so swapPinDataDir is empty and the embedded node would fall back to the
+    // conf/default datadir. That is only safe if the foreign node is actually running there;
+    // otherwise launching the embedded node would serve a DIFFERENT (likely empty) wallet.dat =
+    // invisible funds. Refuse with honest, retryable guidance BEFORE stopping anything. A node
+    // we COULD identify (pid>0) carries its `-datadir` on the cmdline and is covered by the
+    // pin/refuse path above, so this never fires for it (incl. bob's pidfile case).
+    {
+        const QString confBase = !cfg->dataDirOverride.isEmpty() ? cfg->dataDirOverride
+                                                                 : cfg->zclassicDir;
+        if (nodeSwapRefuseUnverifiedDatadir(swapForeign.pid, blocksDirSizeBytes(confBase) >= 0)) {
+            setSwapState(NodeSwapState::ServiceGuidance);   // retryable; also frees this loader (#4)
+            QPointer<MainWindow> mw(main);
+            if (mw) {
+                mw->setNodeSwapProgress(
+                    QObject::tr("This wallet couldn't confirm where the other node keeps its "
+                                "data, so it won't risk starting the built-in node on the wrong "
+                                "wallet. Your coins are safe. Fully quit the other node, then "
+                                "restart this wallet to use the built-in node."),
+                    /*retry=*/true, /*serviceCmd=*/QString());
+            }
+            return;
+        }
+    }
+
+    // The user explicitly chose the built-in node, so ensure embedded mode is ON for this
+    // session before we (later) launch it — an external-node setting would otherwise make
+    // startEmbeddedZClassicd() a no-op. (useEmbedded is a per-launch flag, default ON; this
+    // just covers the rare -no-embedded launch that nonetheless attached to a foreign node.)
+    Settings::getInstance()->setUseEmbedded(true);
+
+    setSwapState(NodeSwapState::Stopping);
+
+    Connection* stopConn = makeConnection(cfg);
+    json payload = { {"jsonrpc", "1.0"}, {"id", "someid"}, {"method", "stop"} };
+    std::shared_ptr<bool> alive = ezAlive;
+    // Best-effort: a daemon mid-warmup may refuse / reply RPC_IN_WARMUP; either way we
+    // then poll the port. Errors are NOT a dead-end here — the poll decides the outcome.
+    stopConn->doRPCIgnoreError(payload, [=](json) {
+        if (!alive || !*alive) return;
+    });
+    // Tear the short-lived connection down once the reply (or error) has been queued:
+    // shutdown() latches its no-op flag so a late reply can't touch freed state, then we
+    // free it (its dtor deletes the QNetworkAccessManager + request). Parented timer target
+    // is `main`, which outlives the swap, so this fires even if THIS loader is gone.
+    QTimer::singleShot(2500, main, [stopConn]() {
+        stopConn->shutdown();
+        delete stopConn;
+    });
+
+    // Begin the bounded stop-wait poll.
+    swapPollTimer.start();
+    swapRebindPolls = 0;
+    QTimer::singleShot(500, [=]() { if (alive && *alive) swapPollForFree(); });
+}
+
+// Bounded (<=~25s) stop-wait. Free -> start the built-in node; re-bound -> service guidance;
+// timeout -> retryable Failed. (d)/(e)/(f)
+void ConnectionLoader::swapPollForFree() {
+    if (!ezAlive || !*ezAlive)
+        return;
+    QPointer<MainWindow> mw(main);
+
+    if (swapPortAndLockFree()) {
+        // (e) Free: launch OUR node on the SAME datadir, warm up, then connect.
+        setSwapState(NodeSwapState::StartingBuiltIn);
+        if (!startEmbeddedZClassicd()) {
+            setSwapState(NodeSwapState::Failed);
+            return;
+        }
+        ezWarmupTimer.start();
+        std::shared_ptr<bool> alive = ezAlive;
+        // doAutoConnect drives the normal warmup/connect loop; on a live getinfo it calls
+        // doRPCSetConnection (which deletes THIS loader) -> rpc->setConnection re-probes NFT
+        // capability -> MainWindow::onNFTCapabilityResolved gates the gallery back on AND
+        // emits the swap "supported"/"failed" end marker (it knows a swap is in flight via
+        // the flag we set on MainWindow here). The marker can't live in this loader: it is
+        // deleted by doRPCSetConnection before the probe resolves.
+        if (mw)
+            mw->noteNodeSwapAwaitingProbe();
+        QTimer::singleShot(0, [=]() { if (alive && *alive) doAutoConnect(); });
+        return;
+    }
+
+    // (d) RE-BIND detection. swapRebindPolls counts CONSECUTIVE polls in which the port is
+    // STILL answering. The graceful "stop" should take the foreign node down within a few
+    // seconds; if the port keeps answering well past that, this is an auto-restart we did
+    // NOT classify as a service. Don't fight it — fall back to the service-style guidance
+    // (the exact systemctl-stop command + Retry) rather than killing it or spinning. We use
+    // a generous threshold (~7s of answering = 10 polls) so a node that's merely slow to
+    // release its socket isn't misread as auto-restarting.
+    if (++swapRebindPolls >= 10) {
+        setSwapState(NodeSwapState::ServiceGuidance);
+        return;
+    }
+
+    // Timeout guard: never spin forever. ~25s hard cap -> retryable Failed (or service
+    // guidance if a node is clearly still serving).
+    if (swapPollTimer.hasExpired(25000)) {
+        setSwapState(swapPortAndLockFree() ? NodeSwapState::Failed
+                                           : NodeSwapState::ServiceGuidance);
+        return;
+    }
+
+    std::shared_ptr<bool> alive = ezAlive;
+    QTimer::singleShot(700, [=]() { if (alive && *alive) swapPollForFree(); });
 }
 
 // PROACTIVE one-time migration of a legacy GUI-owned conf to cookie auth. Strips ONLY

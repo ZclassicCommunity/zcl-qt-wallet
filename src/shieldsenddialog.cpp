@@ -6,6 +6,8 @@
 #include "nftdatachannel.h"   // ZDC_MAX_FILE_BYTES (the 40000-byte cap)
 #include "rpc.h"
 #include "settings.h"
+#include "guiutil.h"
+#include <QTimer>
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -153,6 +155,9 @@ ShieldSendDialog::ShieldSendDialog(RPC* rpc, QWidget* parent)
     connect(m_sendBtn,   &QPushButton::clicked, this, &ShieldSendDialog::onSendClicked);
     connect(m_toEdit,    &QLineEdit::textChanged, this, &ShieldSendDialog::onRecipientChanged);
     connect(m_consent,   &QCheckBox::toggled,     this, &ShieldSendDialog::onConsentToggled);
+
+    makeLabelsSelectable(this);                                     // copyable text (incl. errors)
+    QTimer::singleShot(0, this, [this]{ makeButtonsFit(this); });   // no clipped button labels
 
     onRecipientChanged(QString());   // seed the disabled/status state
 }

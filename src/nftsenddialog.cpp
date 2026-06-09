@@ -5,6 +5,8 @@
 #include "nftcommon.h"
 #include "rpc.h"
 #include "settings.h"
+#include "guiutil.h"
+#include <QTimer>
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -102,6 +104,9 @@ NFTSendDialog::NFTSendDialog(const NFTItem& item, RPC* rpc, QWidget* parent)
     connect(m_cancelBtn, &QPushButton::clicked, this, &QDialog::reject);
     connect(m_sendBtn,   &QPushButton::clicked, this, &NFTSendDialog::onSendClicked);
     connect(m_recipient, &QLineEdit::textChanged, this, &NFTSendDialog::onRecipientChanged);
+
+    makeLabelsSelectable(this);                                     // copyable text (incl. errors)
+    QTimer::singleShot(0, this, [this]{ makeButtonsFit(this); });   // no clipped button labels
 
     onRecipientChanged(QString());   // seed the disabled/status state
 }

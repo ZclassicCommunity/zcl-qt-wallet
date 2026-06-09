@@ -18,10 +18,18 @@
 #include "nftdetaildialog.h"
 #include "nftmintdialog.h"
 #include "nftbuydialog.h"
+#include "nftlistingsdialog.h"
+#include "nftmarketdialog.h"
 #include "nftcommon.h"
 #include "beta7releaseflags.h"
+#include "collectioncreatedialog.h"
+#include "collectionbrowsedialog.h"
 #include "shieldsenddialog.h"
 #include "shieldreceivedialog.h"
+#include "namescommon.h"
+#include "nameregisterdialog.h"
+#include "nameresolvedialog.h"
+#include "nametransferdialog.h"
 #include "flowlayout.h"
 #include "settings.h"
 #include "version.h"
@@ -35,6 +43,8 @@
 #include <QFontMetrics>   // narrow-window fix: elidedText for the 40pt hero number
 #include <QtNetwork/QTcpSocket>
 #include <QFrame>
+#include <QShowEvent>
+#include "guiutil.h"     // makeLabelsSelectable / makeButtonsFit (copyable text + no clipped buttons)
 #include <QLabel>
 #include <QPushButton>
 #include <QToolButton>
@@ -45,6 +55,10 @@
 #include <QHBoxLayout>
 #include <QGridLayout>
 #include <QListView>      // Phase C0: the native Collections (NFT) gallery view
+#include <QStandardItemModel>   // NAMES pillar: the My-Names list model
+#include <QStandardItem>        // NAMES pillar: My-Names rows
+#include <QTreeView>            // NAMES pillar: the My-Names list view
+#include <QPointer>             // NAMES pillar: guard async refresh lambdas
 #include <QLineEdit>      // Item B: copyable zslpindex=1 hint line
 #include <QClipboard>     // Item B: Copy-line button
 #include <QApplication>   // Item B: QApplication::clipboard()
@@ -187,6 +201,12 @@ MainWindow::MainWindow(QWidget *parent) :
     // falls back to the pre-NFT layout. Pure GUI / fixtures, zero chain access.
     setupNFTTab();
 
+    // NAMES pillar (ZNAM): the native "Names" tab. Built right AFTER the Collections
+    // gallery (so its tab index sits just after it) and BEFORE the nav rail (so the
+    // rail can pick up its live tab index). Gated on Settings::getShowNamesTab(); when
+    // off nothing is added and the rail falls back to the pre-Names layout.
+    setupNamesTab();
+
     // Phase-3a redesign (Quiet+): replace the top tab bar with a modern left
     // nav rail. Built here, AFTER the tab pages are set up and the zclassicd tab
     // has been removed (above), so the rail's primary destinations map to the
@@ -229,9 +249,13 @@ MainWindow::MainWindow(QWidget *parent) :
     // syncs the nav-rail checked state so the rail highlight matches. NEVER active
     // in normal use (the env var is set only by the headless test harness).
     QTimer::singleShot(0, this, [this]() {
-        if (qgetenv("ZQW_UITEST_TAB") != "collections" || !nftTab)
+        const QByteArray want = qgetenv("ZQW_UITEST_TAB");
+        QWidget* target = nullptr;
+        if (want == "collections")  target = nftTab;
+        else if (want == "names")   target = namesTab;
+        if (!target)
             return;
-        int i = ui->tabWidget->indexOf(nftTab);
+        int i = ui->tabWidget->indexOf(target);
         if (i < 0)
             return;
         ui->tabWidget->setCurrentIndex(i);
@@ -1341,6 +1365,38 @@ void MainWindow::resizeEvent(QResizeEvent* event) {
     relayoutHero();
 }
 
+// FONT-FIT pass, run ONCE on the first show — i.e. AFTER the app stylesheet + the user's real
+// font/DPI are applied, so sizeHint()/fontMetrics reflect what will actually be rendered (doing
+// this in the ctor would measure the dev's default font, not the user's). Three guarantees:
+//   1) the nav rail grows to its widest label (a hardcoded 168px clipped e.g. "Collections" at
+//      larger fonts/DPI), 2) every other button is at least as wide as its text, and 3) all
+//      labels become copy-pasteable.
+void MainWindow::showEvent(QShowEvent* event) {
+    QMainWindow::showEvent(event);
+    if (guiFitDone)
+        return;
+    guiFitDone = true;
+
+    // Nav rail: size to the widest rail button's rendered width + the rail's side margins,
+    // floored at the original 168px so it never gets narrower than the design.
+    if (QFrame* rail = findChild<QFrame*>("navRail")) {
+        int widest = 0;
+        const QList<QAbstractButton*> railBtns = rail->findChildren<QAbstractButton*>();
+        for (QAbstractButton* b : railBtns)
+            if (b) widest = qMax(widest, b->sizeHint().width());
+        int sideMargins = 16;
+        if (rail->layout()) {
+            const QMargins cm = rail->layout()->contentsMargins();
+            sideMargins = cm.left() + cm.right();
+        }
+        if (widest > 0)
+            rail->setFixedWidth(qMax(168, widest + sideMargins));
+    }
+
+    makeButtonsFit(this);        // every button (tab actions, gear, etc.) fits its label
+    makeLabelsSelectable(this);  // all in-window text is selectable/copyable
+}
+
 void MainWindow::setupNavRail() {
     // 1) Hide the tab bar — pages stay; index selection still works.
     ui->tabWidget->tabBar()->hide();
@@ -1398,6 +1454,16 @@ void MainWindow::setupNavRail() {
         int nftIdx = ui->tabWidget->indexOf(nftTab);
         if (nftIdx >= 0)
             makeRailButton(tr("Collections"), nftIdx);
+    }
+
+    // NAMES pillar: the native Names tab. setupNamesTab() (called just before the rail)
+    // appended it after Collections, so resolve its live index via indexOf; add the rail
+    // button ONLY when the tab exists (gated on Settings::getShowNamesTab()), keeping the
+    // rail<->tab mapping consistent when the Names tab is disabled.
+    if (namesTab) {
+        int namesIdx = ui->tabWidget->indexOf(namesTab);
+        if (namesIdx >= 0)
+            makeRailButton(tr("Names"), namesIdx);
     }
 
     // Spacer pushes the demoted "Advanced" gear to the BOTTOM of the rail.
@@ -3210,17 +3276,44 @@ void MainWindow::setupNFTTab() {
     nftBuyBtn->setObjectName("nftBuyAnNftButton");
     nftBuyBtn->setToolTip(tr("Buy a collectible from an offer."));
     actionRow->addWidget(nftBuyBtn);
+    // Journey 4: browse/search the decentralized offer pool, then hand a found offer
+    // into the proven Buy verify/take flow. Honest about discovery being off by
+    // default (it flips on once the Tor offer-relay ships).
+    nftBrowseOffersBtn = new QPushButton(tr("Browse market"), nftTab);
+    nftBrowseOffersBtn->setObjectName("nftBrowseOffersButton");
+    nftBrowseOffersBtn->setToolTip(tr("Browse and search collectibles your node has heard "
+                                      "are for sale, then buy one."));
+    actionRow->addWidget(nftBrowseOffersBtn);
+    nftMyListingsBtn = new QPushButton(tr("My listings"), nftTab);
+    nftMyListingsBtn->setObjectName("nftMyListingsButton");
+    nftMyListingsBtn->setToolTip(tr("See the sell offers you created and cancel an open one."));
+    actionRow->addWidget(nftMyListingsBtn);
     nftMintBtn = new QPushButton(tr("Make"), nftTab);
     nftMintBtn->setObjectName("nftMakeButton");
-    nftMintBtn->setToolTip(tr("Make a new collectible."));
+    nftMintBtn->setToolTip(tr("Make a new collectible. You can optionally add it to one of "
+                              "your collections."));
     actionRow->addWidget(nftMintBtn);
+
+    // COLLECTIONS Phase-1: create a collection (a set you can add cards to) + browse a set.
+    nftNewCollectionBtn = new QPushButton(tr("New collection"), nftTab);
+    nftNewCollectionBtn->setObjectName("nftNewCollectionButton");
+    nftNewCollectionBtn->setToolTip(tr("Create a collection — a set you can add cards to. "
+                                       "You keep the authority to add cards later."));
+    actionRow->addWidget(nftNewCollectionBtn);
+
+    nftBrowseSetBtn = new QPushButton(tr("Browse set"), nftTab);
+    nftBrowseSetBtn->setObjectName("nftBrowseSetButton");
+    nftBrowseSetBtn->setToolTip(tr("Browse the collections you own and the verified cards "
+                                   "in each set."));
+    actionRow->addWidget(nftBrowseSetBtn);
     outer->addLayout(actionRow);
 
     // Stash each entry button's honesty tooltip so applyNFTSupportGating() can RESTORE
     // it when the node supports NFTs (the gating swaps to the unsupported guidance while
     // disabled). Without this the per-button content-only-privacy honesty would be
     // cleared the moment the page re-enables.
-    for (QPushButton* b : { nftSendFileBtn, nftRecvFileBtn, nftBuyBtn, nftMintBtn }) {
+    for (QPushButton* b : { nftSendFileBtn, nftRecvFileBtn, nftBuyBtn, nftBrowseOffersBtn,
+                            nftMyListingsBtn, nftMintBtn, nftNewCollectionBtn, nftBrowseSetBtn }) {
         if (b) b->setProperty("honestTooltip", b->toolTip());
     }
 
@@ -3307,22 +3400,77 @@ void MainWindow::setupNFTTab() {
     nftUnsupportedPanel = new QWidget(nftTab);
     nftUnsupportedPanel->setObjectName("nftUnsupportedPanel");
     auto* unsupLayout = new QVBoxLayout(nftUnsupportedPanel);
-    unsupLayout->setContentsMargins(0, 8, 0, 0);
-    auto* unsupLabel = new QLabel(RPC::nftUnsupportedGuidance(), nftUnsupportedPanel);
-    unsupLabel->setObjectName("nftUnsupportedLabel");
-    unsupLabel->setWordWrap(true);
-    unsupLabel->setStyleSheet("color:#d9822b;");
-    unsupLayout->addWidget(unsupLabel);
+    // NIT FIX (e2e/vision): give the panel a right inset too, so the amber guidance
+    // line never wraps with its last words hard against the window edge on a narrow
+    // (~968px) window. Left/top kept as-is; only add breathing room on the right.
+    unsupLayout->setContentsMargins(0, 8, 16, 0);
+    unsupLayout->setSpacing(8);
+    nftUnsupportedLabel = new QLabel(RPC::nftUnsupportedGuidance(), nftUnsupportedPanel);
+    nftUnsupportedLabel->setObjectName("nftUnsupportedLabel");
+    nftUnsupportedLabel->setWordWrap(true);
+    // NIT FIX (e2e/vision): cap the guidance copy to a comfortable readable measure so
+    // it wraps cleanly with margin to spare instead of running to the right edge on a
+    // narrow window. Word-wrap still keeps it responsive (it shrinks below this cap on
+    // truly narrow screens); the cap only prevents an edge-hugging full-width line.
+    nftUnsupportedLabel->setMaximumWidth(560);
+    nftUnsupportedLabel->setStyleSheet("color:#d9822b;");
+    // SELECTABLE so the user can copy the exact wording (e.g. to send to support).
+    nftUnsupportedLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    unsupLayout->addWidget(nftUnsupportedLabel);
+
+    // IDIOTPROOF NODE-SWAP: the PRIMARY action. Shown ONLY when the unsupported node is
+    // FOREIGN (we didn't spawn it — ezclassicd == nullptr), set in applyNFTSupportGating().
+    // It NEVER dead-ends: clicking it runs the graceful swap state machine.
+    nftUseBuiltInBtn = new QPushButton(tr("Use this wallet's built-in node"), nftUnsupportedPanel);
+    nftUseBuiltInBtn->setObjectName("nftUseBuiltInBtn");
+    nftUseBuiltInBtn->setToolTip(tr("Stop the older node and start the newer one bundled with "
+                                    "this wallet. Your wallet and funds are unaffected."));
+    nftUseBuiltInBtn->setCursor(Qt::PointingHandCursor);
+    nftUseBuiltInBtn->hide();   // shown only for a FOREIGN unsupported node
+    QObject::connect(nftUseBuiltInBtn, &QPushButton::clicked, this, &MainWindow::switchToBuiltInNode);
+    unsupLayout->addWidget(nftUseBuiltInBtn, 0, Qt::AlignLeft);
+
+    // Swap progress / honest-failure line (e.g. "Stopping the older node…").
+    nftSwapProgressLabel = new QLabel(QString(), nftUnsupportedPanel);
+    nftSwapProgressLabel->setObjectName("nftSwapProgressLabel");
+    nftSwapProgressLabel->setWordWrap(true);
+    nftSwapProgressLabel->setStyleSheet("color:#444;");
+    // SELECTABLE so the user can copy the exact progress/error wording.
+    nftSwapProgressLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    nftSwapProgressLabel->hide();
+    unsupLayout->addWidget(nftSwapProgressLabel);
+
+    // Copy-pasteable service-stop command (monospace), shown only for a systemd service node.
+    nftSwapServiceCmdLabel = new QLabel(QString(), nftUnsupportedPanel);
+    nftSwapServiceCmdLabel->setObjectName("nftSwapServiceCmdLabel");
+    nftSwapServiceCmdLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    nftSwapServiceCmdLabel->setStyleSheet(
+        "font-family: monospace; background:#f3f3f3; color:#222; padding:6px; border-radius:4px;");
+    nftSwapServiceCmdLabel->hide();
+    unsupLayout->addWidget(nftSwapServiceCmdLabel);
+
+    // Retry button (re-runs the swap), shown for a service node or after a retryable failure.
+    nftSwapRetryBtn = new QPushButton(tr("Retry"), nftUnsupportedPanel);
+    nftSwapRetryBtn->setObjectName("nftSwapRetryBtn");
+    nftSwapRetryBtn->setCursor(Qt::PointingHandCursor);
+    nftSwapRetryBtn->hide();
+    QObject::connect(nftSwapRetryBtn, &QPushButton::clicked, this, &MainWindow::switchToBuiltInNode);
+    unsupLayout->addWidget(nftSwapRetryBtn, 0, Qt::AlignLeft);
+
     unsupLayout->addStretch(1);
     nftUnsupportedPanel->hide();
     outer->addWidget(nftUnsupportedPanel);
 
     QObject::connect(nftMintBtn, &QPushButton::clicked, this, &MainWindow::openMintDialog);
     QObject::connect(nftBuyBtn,  &QPushButton::clicked, this, &MainWindow::openBuyDialog);
+    QObject::connect(nftBrowseOffersBtn, &QPushButton::clicked, this, &MainWindow::openNftMarketDialog);
+    QObject::connect(nftMyListingsBtn, &QPushButton::clicked, this, &MainWindow::openMyListingsDialog);
     if (ZCL_LEGACY_DATACHANNEL_UI) {
         QObject::connect(nftSendFileBtn, &QPushButton::clicked, this, &MainWindow::openShieldSendDialog);
         QObject::connect(nftRecvFileBtn, &QPushButton::clicked, this, &MainWindow::openShieldReceiveDialog);
     }
+    QObject::connect(nftNewCollectionBtn, &QPushButton::clicked, this, &MainWindow::openCreateCollectionDialog);
+    QObject::connect(nftBrowseSetBtn,     &QPushButton::clicked, this, &MainWindow::openBrowseCollectionDialog);
 
     // --- the gallery view --------------------------------------------------
     auto* view = new QListView(nftTab);
@@ -3385,6 +3533,142 @@ void MainWindow::setupNFTTab() {
 }
 
 // ----------------------------------------------------------------------------
+// NAMES pillar (ZNAM): the native "Names" tab. Modeled on setupNFTTab — a FlowLayout
+// action row (Register / Look up / Transfer), a My-Names list bound to namesModel, an
+// honest empty / index-off state, and a COPYABLE "-znamindex" config hint mirroring
+// the zslpindex hint. Gated on Settings::getShowNamesTab(); when off nothing is added.
+// Pure GUI, zero chain access at build time (data lands via the name_* RPC wrappers).
+// ----------------------------------------------------------------------------
+void MainWindow::setupNamesTab() {
+    if (!Settings::getInstance()->getShowNamesTab())
+        return;   // tab disabled -> no tab, no rail button, indices unchanged
+
+    namesTab = new QWidget();
+    namesTab->setObjectName("namesTab");
+    auto* outer = new QVBoxLayout(namesTab);
+    outer->setContentsMargins(12, 12, 12, 12);
+    outer->setSpacing(8);
+
+    auto* heading = new QLabel(tr("Names"), namesTab);
+    heading->setObjectName("namesHeading");
+    outer->addWidget(heading);
+
+    // The 3 entry points in a wrap-to-next-line FlowLayout (fits ANY width).
+    auto* actionRow = new FlowLayout(/*margin=*/0, /*hSpacing=*/8, /*vSpacing=*/8);
+    actionRow->setObjectName("namesActionRow");
+    namesRegisterBtn = new QPushButton(tr("Register a name"), namesTab);
+    namesRegisterBtn->setObjectName("namesRegisterButton");
+    namesRegisterBtn->setToolTip(tr("Register a short, human name that points to an address "
+                                    "or other target. First come, first served."));
+    actionRow->addWidget(namesRegisterBtn);
+
+    namesResolveBtn = new QPushButton(tr("Look up a name"), namesTab);
+    namesResolveBtn->setObjectName("namesResolveButton");
+    namesResolveBtn->setToolTip(tr("Look up who owns a name and what it points to."));
+    actionRow->addWidget(namesResolveBtn);
+
+    namesTransferBtn = new QPushButton(tr("Transfer a name"), namesTab);
+    namesTransferBtn->setObjectName("namesTransferButton");
+    namesTransferBtn->setToolTip(tr("Give one of your names to a new owner (a public "
+                                    "transparent address)."));
+    actionRow->addWidget(namesTransferBtn);
+    outer->addLayout(actionRow);
+
+    auto* sub = new QLabel(
+        tr("Names you own appear below. Registering or transferring a name is recorded "
+           "on the public ZCL ledger and shows up here once it confirms."),
+        namesTab);
+    sub->setObjectName("namesSubhead");
+    sub->setWordWrap(true);
+    sub->setProperty("hint", "true");
+    sub->setStyleSheet("color:#9aa0a6; font-size:12pt;");
+    outer->addWidget(sub);
+
+    // Honest empty / index-off state line (hidden once rows arrive).
+    namesEmptyLabel = new QLabel(
+        tr("You don't own any names yet — register one to get started."), namesTab);
+    namesEmptyLabel->setObjectName("namesEmptyLabel");
+    namesEmptyLabel->setWordWrap(true);
+    namesEmptyLabel->setProperty("hint", "true");
+    namesEmptyLabel->setStyleSheet("color:#9aa0a6; font-size:12pt;");
+    outer->addWidget(namesEmptyLabel);
+
+    // COPYABLE "-znamindex" config hint for the index-off dead-end (mirrors the
+    // zslpindex hint on the Collections tab). A read-only selectable line + Copy button
+    // so a foreign/old daemon's owner can paste the exact config line. Always visible
+    // here (the My-Names list only populates with -znamindex on).
+    auto* indexHint = new QWidget(namesTab);
+    indexHint->setObjectName("namesIndexHint");
+    auto* hintRow = new QHBoxLayout(indexHint);
+    hintRow->setContentsMargins(0, 0, 0, 0);
+    hintRow->setSpacing(8);
+    auto* hintLabel = new QLabel(tr("Names need -znamindex. Add this to your zclassic.conf:"),
+                                 indexHint);
+    hintLabel->setObjectName("namesIndexHintLabel");
+    hintLabel->setStyleSheet("color:#9aa0a6;");
+    auto* hintEdit = new QLineEdit(QStringLiteral("znamindex=1"), indexHint);
+    hintEdit->setObjectName("namesIndexHintLine");
+    hintEdit->setReadOnly(true);
+    hintEdit->setMaximumWidth(160);
+    auto* hintCopy = new QPushButton(tr("Copy line"), indexHint);
+    hintCopy->setObjectName("namesIndexHintCopy");
+    QObject::connect(hintCopy, &QPushButton::clicked, this, [hintEdit]() {
+        QApplication::clipboard()->setText(hintEdit->text());
+    });
+    hintRow->addWidget(hintLabel);
+    hintRow->addWidget(hintEdit);
+    hintRow->addWidget(hintCopy);
+    hintRow->addStretch(1);
+    outer->addWidget(indexHint);
+
+    // The My-Names list (name / status / expiry). A QTreeView in list mode keeps it a
+    // simple, copyable read-only table; double-click a row to look it up.
+    namesModel = new QStandardItemModel(this);
+    namesModel->setHorizontalHeaderLabels(
+        QStringList() << tr("Name") << tr("Status") << tr("Expires (block)"));
+    auto* view = new QTreeView(namesTab);
+    view->setObjectName("namesListView");
+    view->setModel(namesModel);
+    view->setRootIsDecorated(false);
+    view->setSelectionMode(QAbstractItemView::SingleSelection);
+    view->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    view->setAlternatingRowColors(true);
+    QObject::connect(view, &QTreeView::activated, this, [this](const QModelIndex& idx) {
+        if (!idx.isValid() || !namesModel)
+            return;
+        const QString name = namesModel->item(idx.row(), 0)
+                                 ? namesModel->item(idx.row(), 0)->text() : QString();
+        if (name.isEmpty() || !rpc)
+            return;
+        auto* dlg = new NameResolveDialog(rpc, name, this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+    });
+    outer->addWidget(view, 1);
+
+    QObject::connect(namesRegisterBtn, &QPushButton::clicked, this, &MainWindow::openRegisterNameDialog);
+    QObject::connect(namesResolveBtn,  &QPushButton::clicked, this, &MainWindow::openResolveNameDialog);
+    QObject::connect(namesTransferBtn, &QPushButton::clicked, this, &MainWindow::openTransferNameDialog);
+
+    // The My-Names list must populate when the user actually NAVIGATES to the Names tab —
+    // not only after a Register/Transfer dialog closes (the live E2E caught that gap: a user
+    // who already owns names saw a false "you don't own any names yet"). setupNamesTab() runs
+    // before the daemon connection is ready, so refresh on every switch to this tab (the
+    // connection is up by then) plus one best-effort initial load. Both are no-ops in headless
+    // tests until a name_listmine seam is installed, and no test navigates to this tab, so this
+    // does not disturb the L1 names_* coverage.
+    QObject::connect(ui->tabWidget, &QTabWidget::currentChanged, this, [this](int idx) {
+        if (namesTab && idx == ui->tabWidget->indexOf(namesTab))
+            refreshMyNames();
+    });
+    refreshMyNames();
+
+    // Insert right AFTER the Collections tab (or at the end if the gallery is off).
+    int afterIdx = nftTab ? ui->tabWidget->indexOf(nftTab) : (ui->tabWidget->count() - 1);
+    ui->tabWidget->insertTab(afterIdx + 1, namesTab, tr("Names"));
+}
+
+// ----------------------------------------------------------------------------
 // BUG #1: apply the NFT-capability gating to the Collections page. `resolvedUnsupported`
 // is true ONLY when the probe RESOLVED to "this node has no NFT RPCs" (an older foreign
 // node). In that state we show the honest guidance panel INSTEAD of an empty gallery,
@@ -3403,7 +3687,8 @@ void MainWindow::applyNFTSupportGating(bool resolvedUnsupported) {
     // The entry points: disabled + the honest "this node can't do collectibles"
     // guidance when unsupported; restored to each button's own honesty tooltip when
     // supported. Mint is where the user hit the original bug.
-    for (QPushButton* b : { nftMintBtn, nftBuyBtn, nftSendFileBtn, nftRecvFileBtn }) {
+    for (QPushButton* b : { nftMintBtn, nftBuyBtn, nftBrowseOffersBtn, nftMyListingsBtn,
+                            nftSendFileBtn, nftRecvFileBtn, nftNewCollectionBtn, nftBrowseSetBtn }) {
         if (!b) continue;
         b->setEnabled(enable);
         b->setToolTip(enable ? b->property("honestTooltip").toString() : guidance);
@@ -3422,6 +3707,44 @@ void MainWindow::applyNFTSupportGating(bool resolvedUnsupported) {
         if (nftIndexHint)  nftIndexHint->hide();
         if (nftIntroLabel) nftIntroLabel->hide();
     }
+
+    // IDIOTPROOF NODE-SWAP: when the unsupported node is FOREIGN (we didn't spawn it —
+    // rpc->isEmbedded()==false), offer the PRIMARY "Use this wallet's built-in node" button
+    // + a short, honest, problem-naming line — never the dead-end "quit it yourself". When
+    // it is OUR OWN node (embedded) that somehow lacks NFT (shouldn't happen with the
+    // bundled daemon), there is nothing to swap to, so we keep the generic guidance copy
+    // and hide the button. Resets any in-progress swap copy on a fresh (re-)gate.
+    const bool foreign = (rpc && !rpc->isEmbedded());
+    if (nftUnsupportedLabel) {
+        if (resolvedUnsupported && foreign) {
+            nftUnsupportedLabel->setText(
+                tr("You're connected to an older ZClassic node that can't do collectibles. "
+                   "This wallet includes a newer one."));
+        } else if (resolvedUnsupported && rpc && rpc->isEmbedded()) {
+            // Our OWN built-in node somehow lacks collectibles support (shouldn't happen with
+            // the bundled beta7 daemon). NEVER tell the user to "use the built-in node" — they
+            // already are; that generic guidance would be a dead-end. Give an honest diagnostic.
+            nftUnsupportedLabel->setText(
+                tr("This wallet's built-in node doesn't support collectibles. Try restarting "
+                   "the wallet; if this keeps happening, please report it."));
+        } else {
+            nftUnsupportedLabel->setText(RPC::nftUnsupportedGuidance());
+        }
+    }
+    if (nftUseBuiltInBtn)
+        // Hidden while a swap is mid-flight too (#6): the progress line carries the story, so a
+        // background re-gate must not pop the primary button back up alongside "Stopping…".
+        nftUseBuiltInBtn->setVisible(resolvedUnsupported && foreign && !nodeSwapInProgress);
+    // A fresh capability re-gate clears stale swap progress/guidance (a new probe outcome
+    // supersedes the previous swap attempt's copy) — BUT NOT while a swap is mid-flight: a
+    // background re-gate (e.g. setNFTItems during the swap) must not wipe the live
+    // "Stopping…/Starting…" line the user is watching (#6). onNFTCapabilityResolved() clears
+    // nodeSwapInProgress the instant the swap resolves, so this re-gate then resets cleanly.
+    if (!nodeSwapInProgress) {
+        if (nftSwapProgressLabel)   { nftSwapProgressLabel->clear();   nftSwapProgressLabel->hide();   }
+        if (nftSwapServiceCmdLabel) { nftSwapServiceCmdLabel->clear(); nftSwapServiceCmdLabel->hide(); }
+        if (nftSwapRetryBtn)        nftSwapRetryBtn->hide();
+    }
 }
 
 // BUG #1: the NFT-capability probe resolved (RPC::probeNFTCapability). Re-apply the
@@ -3431,7 +3754,125 @@ void MainWindow::onNFTCapabilityResolved() {
     if (!rpc)
         return;
     const bool resolvedUnsupported = rpc->nodeNFTProbeResolved() && !rpc->nodeSupportsNFT();
+
+    // IDIOTPROOF NODE-SWAP end marker. When a swap was started, the ConnectionLoader that
+    // ran it is deleted by the time the post-reconnect NFT probe lands here (doRPCSetConnection
+    // ran 'delete this' before re-probing). So MainWindow owns the swap's FINAL E2E marker:
+    // a now-Supported node means the swap succeeded; a still-unsupported node means it didn't.
+    if (nodeSwapAwaitingProbe) {
+        nodeSwapAwaitingProbe = false;
+        nodeSwapInProgress    = false;   // swap resolved -> background re-gates may manage the panel again
+        ++nodeSwapWatchdogGen;           // cancel the never-stuck watchdog (the probe landed)
+        const bool ok = rpc->nodeNFTProbeResolved() && rpc->nodeSupportsNFT();
+        fprintf(stderr, "%s\n", ok ? "ZQW-E2E swap: supported" : "ZQW-E2E swap: failed");
+        fflush(stderr);
+        if (!ok) {
+            // The new node still can't do collectibles — honest, retryable, never a spinner.
+            // Re-gate FIRST (it clears stale swap copy), THEN set the failure progress so the
+            // honest line + Retry survive.
+            applyNFTSupportGating(/*resolvedUnsupported=*/true);
+            setNodeSwapProgress(
+                tr("The node started but still can't do collectibles. Your coins are safe. "
+                   "You can try again."),
+                /*retry=*/true, /*serviceCmd=*/QString());
+            return;
+        }
+    }
+
     applyNFTSupportGating(resolvedUnsupported);
+
+    // TEST SEAM (ZQW_UITEST_SWITCH=1): once the probe resolves Unsupported AND the node is
+    // FOREIGN, auto-invoke the swap so a HEADLESS E2E needs no click. Fires at most once per
+    // resolve; harmless in normal use (the env var is set only by the test harness).
+    if (resolvedUnsupported && rpc && !rpc->isEmbedded()
+        && qgetenv("ZQW_UITEST_SWITCH") == "1") {
+        QTimer::singleShot(0, this, &MainWindow::switchToBuiltInNode);
+    }
+}
+
+// IDIOTPROOF NODE-SWAP entry from the Collections panel button. Spins up a FRESH
+// ConnectionLoader (the connect-time one is deleted post-handoff, exactly like
+// launchBlockchainRepair) and runs its swap state machine. Safe no-op when there is no RPC,
+// or when we already OWN the node (embedded) — there'd be nothing to swap to. NEVER kills a
+// node; the swap uses a graceful "stop" RPC and is fully user-initiated (this click).
+void MainWindow::switchToBuiltInNode() {
+    if (!rpc)
+        return;
+    if (rpc->isEmbedded()) {
+        // We already run the built-in node; nothing to swap. (Shouldn't be reachable — the
+        // button is hidden for an embedded node — but guard anyway.)
+        return;
+    }
+    logger->write("Node-swap: user chose to use the wallet's built-in node");
+    nodeSwapInProgress = true;   // protect live swap progress from a background re-gate (#6)
+    auto* cl = new ConnectionLoader(this, rpc);
+    cl->startNodeSwap();
+}
+
+// Push the swap state machine's honest copy into the Collections panel. One honest line;
+// optional copy-pasteable service command (empty-QString sentinel == none); optional Retry.
+void MainWindow::setNodeSwapProgress(const QString& message, bool retry, const QString& serviceCmd) {
+    // ACTIVE-PROGRESS latch (#6). A non-retry state (Stopping…/Starting…) is live progress that a
+    // background re-gate must not wipe; a retry-able state (failure/service/timeout) means the
+    // swap has STOPPED progressing and is now a user-actionable end state, so re-gates may manage
+    // the panel again. Set FIRST so the applyNFTSupportGating() call just below respects it.
+    nodeSwapInProgress = !retry;
+
+    // During a swap the page is the unsupported panel; make sure it's the visible surface.
+    if (nftUnsupportedPanel && nftUnsupportedPanel->isHidden())
+        applyNFTSupportGating(/*resolvedUnsupported=*/true);
+
+    // While the swap runs, the one-click primary button would be redundant/confusing —
+    // the progress line carries the story now.
+    if (nftUseBuiltInBtn)
+        nftUseBuiltInBtn->setVisible(false);
+
+    if (nftSwapProgressLabel) {
+        nftSwapProgressLabel->setText(message);
+        nftSwapProgressLabel->setVisible(!message.isEmpty());
+    }
+    if (nftSwapServiceCmdLabel) {
+        nftSwapServiceCmdLabel->setText(serviceCmd);
+        nftSwapServiceCmdLabel->setVisible(!serviceCmd.isEmpty());
+    }
+    if (nftSwapRetryBtn)
+        nftSwapRetryBtn->setVisible(retry);
+}
+
+// IDIOTPROOF NODE-SWAP: latch "awaiting the post-start NFT probe" AND arm a never-stuck
+// watchdog. The swap's success/failure marker is emitted by onNFTCapabilityResolved() once the
+// embedded node reconnects + re-probes (the loader is deleted by then). But if the embedded node
+// never comes online (crash before it binds RPC, hang, …), that probe never lands and the panel
+// would sit on "Starting the built-in node…" forever. So: capture a generation token and, after
+// a window slightly beyond the connect warmup (~120s), fire the watchdog — which forces an
+// honest, retryable failure IFF the swap is still unresolved. A clean resolve (or a newer swap)
+// bumps the generation so a stale singleShot is a no-op.
+void MainWindow::noteNodeSwapAwaitingProbe() {
+    nodeSwapAwaitingProbe = true;
+    const int gen = ++nodeSwapWatchdogGen;
+    QTimer::singleShot(135000, this, [this, gen]() {
+        if (gen != nodeSwapWatchdogGen) return;   // superseded by a resolve or a newer swap
+        onNodeSwapWatchdogTimeout();
+    });
+}
+
+// NEVER-STUCK backstop (#1). Force a retryable failure if a swap is still awaiting its probe.
+// Idempotent: a no-op once the swap has already resolved (onNFTCapabilityResolved cleared the
+// flag). Also invoked directly by the L1 test to assert the behaviour without a 135s wait.
+void MainWindow::onNodeSwapWatchdogTimeout() {
+    if (!nodeSwapAwaitingProbe)
+        return;   // already resolved cleanly (success or a probe-driven failure)
+    nodeSwapAwaitingProbe = false;
+    nodeSwapInProgress    = false;
+    fprintf(stderr, "ZQW-E2E swap: failed\n");
+    fflush(stderr);
+    // Re-gate FIRST (resets stale copy now that the swap is no longer in progress), THEN set the
+    // honest, retryable timeout copy so the line + Retry survive.
+    applyNFTSupportGating(/*resolvedUnsupported=*/true);
+    setNodeSwapProgress(
+        tr("The built-in node is taking too long to start. Your coins are safe on the previous "
+           "node. You can try again."),
+        /*retry=*/true, /*serviceCmd=*/QString());
 }
 
 // ----------------------------------------------------------------------------
@@ -3483,6 +3924,49 @@ void MainWindow::openBuyDialog() {
         rpc->refresh(true);
 }
 
+// "My listings" — view the sell offers I created + cancel an open one (Journey 3).
+// Non-modal, WA_DeleteOnClose + show() so the [X]-swallow-while-in-flight scaffold in
+// NftAsyncDialog works (a cancel RPC can be in flight when the user clicks [X]). The
+// dialog pulls nft_listoffers on open and re-pulls after a successful cancel.
+void MainWindow::openMyListingsDialog() {
+    if (!rpc)
+        return;
+    auto* dlg = new NFTListingsDialog(rpc, this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->show();
+}
+
+// Journey 4: "Browse market" — the decentralized discovery surface over the daemon's
+// offer pool. Search -> RPC::nftBrowseOffers; pick a result -> hand its FULL offerBlob
+// into the proven NFTBuyDialog verify/take flow (NFTMarketDialog drives the child Buy
+// dialog internally). Button-launched modal from the Collections tab — no tabWidget
+// index churn. Hands the EXISTING ContentEngine (nftImgCache) for local-only thumbs.
+void MainWindow::openNftMarketDialog() {
+    if (!rpc || !nftImgCache)
+        return;
+    NFTMarketDialog dlg(nftImgCache /*ContentEngine*/, rpc, this);
+    dlg.exec();
+    if (rpc)
+        rpc->refresh(true);   // a purchase inside lands the token once it confirms
+}
+
+// COLLECTIONS Phase-1: open the "Create a collection" dialog (modal). On accept (a
+// successful create) we trigger a full poll so the new collection token lands in the
+// wallet's holdings once it confirms (then it shows up in the mint picker + browse view).
+void MainWindow::openCreateCollectionDialog() {
+    CollectionCreateDialog dlg(rpc, this);
+    if (dlg.exec() == QDialog::Accepted && rpc)
+        rpc->refresh(true);
+}
+
+// COLLECTIONS Phase-1: open the "Browse a collection" view (modal, read-only). Lists the
+// collections the wallet owns; opening one shows its zslp_collectioninfo header + the
+// AUTHORIZED members only.
+void MainWindow::openBrowseCollectionDialog() {
+    CollectionBrowseDialog dlg(rpc, this);
+    dlg.exec();
+}
+
 // SHIELD: open the "Send a private file" dialog (encrypted FILE content over the ZDC1
 // data-channel). HONEST: ownership stays public; only the file's bytes are private, and
 // the ciphertext is stored on-chain forever (the dialog earns permanence consent).
@@ -3500,6 +3984,74 @@ void MainWindow::openShieldReceiveDialog() {
         return;
     ShieldReceiveDialog dlg(rpc, this);
     dlg.exec();
+}
+
+// ----------------------------------------------------------------------------
+// NAMES pillar (ZNAM): the three entry-point slots. The write dialogs are modal,
+// WA_DeleteOnClose + show() (so the [X]-swallow-while-in-flight scaffold works), and
+// on success they refresh the My-Names list inline. The list refresh re-pulls
+// name_listmine and repopulates namesModel + toggles the honest empty state.
+// ----------------------------------------------------------------------------
+void MainWindow::openRegisterNameDialog() {
+    if (!rpc)
+        return;
+    auto* dlg = new NameRegisterDialog(rpc, this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    // Refresh the My-Names list when the dialog closes (a successful registration is
+    // 0-conf, so it shows once it confirms — the refresh re-pulls either way).
+    QObject::connect(dlg, &QDialog::finished, this, [this](int) { refreshMyNames(); });
+    dlg->show();
+}
+
+void MainWindow::openResolveNameDialog() {
+    if (!rpc)
+        return;
+    auto* dlg = new NameResolveDialog(rpc, QString(), this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->show();
+}
+
+void MainWindow::openTransferNameDialog() {
+    if (!rpc || !namesModel)
+        return;
+    // Seed the picker with the current My-Names rows.
+    QStringList myNames;
+    for (int r = 0; r < namesModel->rowCount(); ++r)
+        if (QStandardItem* it = namesModel->item(r, 0))
+            myNames << it->text();
+    auto* dlg = new NameTransferDialog(rpc, myNames, this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    QObject::connect(dlg, &QDialog::finished, this, [this](int) { refreshMyNames(); });
+    dlg->show();
+}
+
+// Re-pull name_listmine and repopulate namesModel + toggle the honest empty state.
+// Safe no-op when the Names tab is disabled (namesModel null) or there's no RPC.
+void MainWindow::refreshMyNames() {
+    if (!rpc || !namesModel)
+        return;
+    QPointer<MainWindow> self(this);
+    rpc->nameListMine(
+        [self](QVector<NameRow> rows) {
+            if (self.isNull() || !self->namesModel)
+                return;
+            self->namesModel->removeRows(0, self->namesModel->rowCount());
+            for (const NameRow& n : rows) {
+                QList<QStandardItem*> cells;
+                cells << new QStandardItem(n.name);
+                cells << new QStandardItem(n.status);
+                cells << new QStandardItem(n.expiryHeight > 0
+                                               ? QString::number(n.expiryHeight)
+                                               : QString());
+                self->namesModel->appendRow(cells);
+            }
+            if (self->namesEmptyLabel)
+                self->namesEmptyLabel->setVisible(rows.isEmpty());
+        },
+        [](QString /*errStr*/) {
+            // Index-off / transient: keep the calm empty state, no scary dialog.
+        }
+    );
 }
 
 // ----------------------------------------------------------------------------

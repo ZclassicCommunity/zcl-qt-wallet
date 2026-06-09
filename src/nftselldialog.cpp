@@ -5,6 +5,8 @@
 #include "nftcommon.h"
 #include "rpc.h"
 #include "settings.h"
+#include "guiutil.h"
+#include <QTimer>
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -132,6 +134,9 @@ NFTSellDialog::NFTSellDialog(const NFTItem& item, RPC* rpc, QWidget* parent)
     connect(m_listBtn,   &QPushButton::clicked, this, &NFTSellDialog::onListClicked);
     connect(m_priceEdit, &QLineEdit::textChanged, this, &NFTSellDialog::onComposeChanged);
     connect(m_buyerEdit, &QLineEdit::textChanged, this, &NFTSellDialog::onComposeChanged);
+
+    makeLabelsSelectable(this);                                     // copyable text (incl. errors)
+    QTimer::singleShot(0, this, [this]{ makeButtonsFit(this); });   // no clipped button labels
 
     onComposeChanged();   // seed disabled/status state
 }
