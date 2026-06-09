@@ -3,10 +3,12 @@
 
 #include "precompiled.h"
 #include "logger.h"
+#include "nft.h"        // NFTItem POD — needed to take QVector<NFTItem> by value below
 
 #include <QProgressBar>
 #include <QElapsedTimer>
 #include <QSharedPointer>
+#include <QVector>
 
 // Forward declare to break circular dependency.
 class RPC;
@@ -17,6 +19,8 @@ class QPushButton;
 class QToolButton;
 class QWidget;
 class QCheckBox;
+class NFTGalleryModel;
+class NFTImageCache;
 
 using json = nlohmann::json;
 
@@ -105,6 +109,30 @@ public:
 
     void balancesReady();
     void payZClassicURI(QString uri = "");
+
+    // Phase C1: feed the Collections gallery with the wallet's REAL on-chain ZSLP
+    // NFTs (built by RPC::refreshNFTs from zslp_listmytokens + zslp_gettoken). Called
+    // on the normal refresh cycle. `indexOff` is true when the daemon lacks
+    // -zslpindex (the public-ZSLP read RPC threw): we show a clean "index off" empty
+    // state rather than an error. This REPLACES the fixture feed on the default path;
+    // it is fingerprint-guarded by the model so an unchanged re-feed is a no-op.
+    //
+    // PRIVACY: we feed metadata + the on-chain document hash ONLY. We NEVER set a
+    // cachePath that points at a remote documenturl, so NFTImageCache never fetches
+    // an image over the network (no IP/interest leak). Image bytes arrive later from
+    // the local cache or an explicit user action; until then the card shows the
+    // shimmer + amber "?" pending badge.
+    void setNFTItems(const QVector<NFTItem>& items, bool indexOff);
+    // True when the gallery tab is enabled (Settings::getShowNFTGallery() AND the tab
+    // was actually created). RPC checks this before issuing any zslp_* read.
+    bool isNFTGalleryActive() const { return nftModel != nullptr; }
+
+    // BUG #1: the NFT-capability probe (RPC::probeNFTCapability) resolved. Re-render
+    // the Collections page: when the attached node lacks NFT support, show the honest
+    // guidance panel INSTEAD of an empty gallery and disable the Mint/Sell/Send-private
+    // entry points (with a matching tooltip); when supported, restore them. Safe no-op
+    // when the gallery tab was never built. Idempotent (called on every (re)connect).
+    void onNFTCapabilityResolved();
 
     // PERF (warm-latency harness, t1 marker). Emitted at the END of
     // updateHomeFixIt() once the privacy-forward HERO labels have been (re)set, i.e.
@@ -315,6 +343,62 @@ private:
     void setupRecieveTab();
     void setupBalancesTab();
     void setupZClassicdTab();
+
+    // Phase C0: the native (no-browser) "Collections" NFT gallery. Builds a
+    // QListView in IconMode driven by an NFTGalleryModel + NFTGalleryDelegate,
+    // added as a NEW tab AFTER Transactions. Pure GUI, fixture-driven, zero chain
+    // dependency. Gated on Settings::getShowNFTGallery(); when off the tab/rail
+    // button are never created so the existing index mapping is unchanged.
+    void setupNFTTab();
+    // DEV-ONLY (Phase C0 fixtures): build + feed the bundled sample NFT set. Compiled
+    // in and reachable ONLY under NFT_GALLERY_FIXTURES; the SHIPPED build feeds the
+    // gallery exclusively from real on-chain data via setNFTItems()/RPC::refreshNFTs.
+    void loadNFTFixtures();
+    // Native NFT detail/mint wiring (NATIVE_NFT_GUIDE §2.4/§2.5). openNFTDetail is
+    // the slot for QListView::activated (fires on double-click AND Enter — connected
+    // ONCE, never alongside doubleClicked, to avoid a double-open). openMintDialog
+    // opens the "Make a collectible" wizard from the gallery heading button.
+    void openNFTDetail(const QModelIndex& idx);
+    void openMintDialog();
+    void openBuyDialog();   // "Buy an NFT" — opens NFTBuyDialog (#119/PART2)
+    void openShieldSendDialog();      // SHIELD: "Send a private file" (file content only)
+    void openShieldReceiveDialog();   // SHIELD: "Receive a private file" (verify-before-decrypt)
+    NFTGalleryModel* nftModel    = nullptr;
+    NFTImageCache*   nftImgCache = nullptr;
+    QWidget*         nftTab      = nullptr;   // the gallery page (added to tabWidget)
+    // Honest state line above the grid: distinct copy for index-off vs empty vs
+    // populated (NATIVE_NFT_GUIDE §2.3). Driven by setNFTItems(items, indexOff).
+    QLabel*          nftStateLabel = nullptr;
+    // Item B: the copyable "zslpindex=1" config hint, shown ONLY in the index-off
+    // state so a foreign/old daemon isn't a prose dead-end. A read-only selectable
+    // QLineEdit (Copy button next to it); hidden otherwise.
+    QWidget*         nftIndexHint  = nullptr;
+    // Item B: first-run Collections intro (what a collectible is + the non-consensus
+    // honesty), shown above the grid only while the gallery has no rows.
+    QLabel*          nftIntroLabel = nullptr;
+    bool             nftFixturesLoaded = false;
+
+    // BUG #1: the honest "this node doesn't support collectibles" guidance panel, shown
+    // INSTEAD of the empty gallery when the attached node lacks the NFT RPCs (the probe
+    // resolved unsupported). Hidden when supported. Built in setupNFTTab, toggled by
+    // onNFTCapabilityResolved()/setNFTItems via applyNFTSupportGating().
+    QWidget*         nftUnsupportedPanel = nullptr;
+    // The gallery view + heading entry buttons, promoted to members so the capability
+    // gating can hide the grid + disable the Mint/Sell/Send-private entry points (with
+    // a matching tooltip) when the node is NFT-unsupported.
+    QWidget*         nftGalleryView      = nullptr;   // the QListView (cast to QWidget)
+    QPushButton*     nftMintBtn          = nullptr;
+    QPushButton*     nftBuyBtn           = nullptr;
+    QPushButton*     nftSendFileBtn      = nullptr;
+    QPushButton*     nftRecvFileBtn      = nullptr;
+    // Apply the current capability gating to the Collections page. resolvedUnsupported
+    // is true ONLY when the probe RESOLVED to "no NFT support" — while unknown/supported
+    // the page behaves normally (fail-open). Centralizes the show/hide + enable/tooltip
+    // so onNFTCapabilityResolved() and setNFTItems() share one path.
+    void applyNFTSupportGating(bool resolvedUnsupported);
+    // Phase C1: the inner thumbnail width the delegate paints (card 168 - 2*8 pad).
+    // Used by both the (dev) fixture feed and the real feed when queuing decodes.
+    static const int nftThumbPx = 152;
 
     void setupSettingsModal();
     void setupStatusBar();

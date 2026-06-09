@@ -3,6 +3,9 @@
 
 #include "precompiled.h"
 
+#include <QStringList>   // NFTVerifyResult::reasons (header-signature type, #119/PART2)
+#include <QVector>       // nftListOffers callback carries QVector<NFTOfferRow>
+
 #include "balancestablemodel.h"
 #include "txtablemodel.h"
 #include "ui_mainwindow.h"
@@ -23,6 +26,79 @@ struct TransactionItem {
     unsigned long   confirmations;
     QString         fromAddr;
     QString         memo;
+};
+
+// NFT SELL pillar (PART 2). Plain PODs (C++14 in-class init, no methods) carried by
+// VALUE across the synchronous doRPC callback boundary (mirroring TransactionItem) —
+// the wrappers fire onDone directly from doRPC's direct-connected lambda, NOT via a
+// queued signal, so NO Q_DECLARE_METATYPE/qRegisterMetaType is needed. priceZat is the
+// daemon-authoritative price in zatoshi (the verify result echoes the on-chain truth).
+struct NFTVerifyResult {
+    bool        ok = false;          // verify passed -> a real green verdict, else amber
+    QString     tokenId;
+    QString     payoutAddr;
+    QString     buyerNftAddr;
+    qint64      priceZat = 0;
+    qint64      expiryHeight = 0;
+    QStringList reasons;             // one honest reason per failed check (amber detail)
+};
+
+struct NFTOfferRow {
+    QString offerId;
+    QString tokenId;
+    QString role;                    // "sell" (every local-store record)
+    QString status;                  // open / filled / expired / canceled
+    qint64  priceZat = 0;
+    qint64  expiryHeight = 0;
+};
+
+// SHIELD (private file send/receive) PODs over the ZDC1 shielded data-channel
+// (doc/nft/PRIVACY_TECH.md). Carried by VALUE across the synchronous doRPC
+// callback boundary (same pattern as NFTOfferRow) so no metatype registration is
+// needed. HONESTY: the data-channel makes only FILE CONTENT private — ownership
+// is ALWAYS public, and the ciphertext is stored publicly on-chain forever.
+
+// One row of z_listdatatransfers — session/in-memory only ("sent" this session),
+// NOT a durable history (the wrapper's caller must label it as such).
+struct DataTransferRow {
+    QString transferId;              // 16-hex
+    QString fingerprint;             // 64-hex ciphertext anchor (== NFT document_hash)
+    QString direction;               // always "sent" in this build (no received list)
+    QString status;                  // always "recorded" in this build
+    QString fromAddress;
+    QString toAddress;
+    QString filename;
+    int     frames = 0;
+};
+
+// The result of z_getdatatransfer (reassemble + verify-before-decrypt). hexData is
+// the plaintext and is non-empty ONLY when verified && complete (the daemon never
+// returns plaintext on a verify/decrypt failure). `error` carries the daemon's
+// honest zdc::status_str text for the four distinct failure states.
+struct DataTransferResult {
+    QString transferId;
+    QString fingerprint;
+    bool    verified = false;
+    bool    complete = false;
+    int     framesReceived = 0;
+    QString hexData;                 // plaintext, hex — only if verified+decrypted
+    int     size = 0;                // plaintext byte length
+    QString filename;
+    QString contentType;
+    QString onchainFingerprint;      // present for mismatch diagnosis
+    QString expectedFingerprint;     // present for mismatch diagnosis
+    QString error;                   // daemon's honest status text (empty on success)
+};
+
+// The result of z_senddatafile (the immediate, pre-async-result object). After
+// this returns the operation runs async; the load-bearing facts (fingerprint =
+// NFT document_hash, the per-transfer disclosure key) are already known here.
+struct SendDataFileResult {
+    QString operationId;
+    QString transferId;              // 16-hex
+    QString fingerprint;             // 64-hex == NFT document_hash
+    QString key;                     // hex per-transfer L3 disclosure key (the secret to safeguard)
+    int     frames = 0;
 };
 
 struct WatchedTx {
@@ -116,6 +192,49 @@ public:
     // repeatedly re-run the balances-model rebuild over a seeded large dataset. The
     // anyUnconfirmed arg is forwarded straight through.
     void testUpdateUI(bool anyUnconfirmed) { updateUI(anyUnconfirmed); }
+
+    // NFT dialog seams (L1, E-PREREQ): one-shot install the result the NEXT
+    // mintNFT/sendNFT delivers, mirroring testSetNextZaddrResult. A non-empty txid
+    // => the success cb fires; a non-empty error (set via testSetNextNftError) takes
+    // priority and fires the error cb. With NOTHING installed the call returns
+    // WITHOUT firing either callback — it simulates an in-flight RPC that never
+    // resolves, which drives the closeEvent-swallowed-while-in-flight test. The
+    // production path below the guard is byte-identical (zero behavior change).
+    void testSetNextMintResult(const QString& txid, const QString& tokenid)
+        { testNextMintTxid = txid; testNextMintTokenId = tokenid; }
+    void testSetNextSendResult(const QString& txid) { testNextSendTxid = txid; }
+    void testSetNextNftError(const QString& err)    { testNextNftError = err; }
+    // NFT SELL seams (PART 2): mirror the mint/send seams — a non-empty testNextNftError
+    // wins on ALL of these (the calm-error path is L1-testable); else the installed
+    // result fires onDone; else the call returns WITHOUT firing either callback (the
+    // perpetual-in-flight closeEvent-swallow test). One-shot (consumed on use). The
+    // verify seam needs an explicit set flag because an ok==false result is still a valid
+    // delivery (we must distinguish "deliver a fail verdict" from "nothing installed").
+    void testSetNextOfferResult(const QString& blob, const QString& id, const QString& outpoint)
+        { testNextOfferBlob = blob; testNextOfferId = id; testNextOfferOutpoint = outpoint; }
+    void testSetNextVerifyResult(const NFTVerifyResult& vr)
+        { testNextVerify = vr; testVerifySet = true; }
+    void testSetNextTakeResult(const QString& txid, qint64 overshootZat)
+        { testNextTakeTxid = txid; testNextTakeOvershoot = overshootZat; }
+    void testSetNextOfferList(const QVector<NFTOfferRow>& rows)
+        { testNextOfferList = rows; testOfferListSet = true; }
+    void testSetNextCancelResult(const QString& txid) { testNextCancelTxid = txid; }
+    // SHIELD seams (mirror the SELL seams): a non-empty testNextNftError wins on all of
+    // these (the calm-error path is L1-testable, incl. the channel-off -32601 message);
+    // else the installed result fires onDone; else the call returns WITHOUT firing either
+    // callback (the perpetual-in-flight closeEvent-swallow test). One-shot. The get/list
+    // results need explicit "set" flags because an unverified/empty result is still a
+    // valid delivery (we must distinguish "deliver a fail verdict" from "nothing installed").
+    void testSetNextSendDataFileResult(const SendDataFileResult& r)
+        { testNextSendDataFile = r; testSendDataFileSet = true; }
+    void testSetNextDataTransferList(const QVector<DataTransferRow>& rows)
+        { testNextDataXferList = rows; testDataXferListSet = true; }
+    void testSetNextDataTransferResult(const DataTransferResult& r)
+        { testNextDataXfer = r; testDataXferSet = true; }
+    // txReceivedDate seam: the confs/blocktime the NEXT call delivers. confs<0 (or
+    // testReceivedSet left false) routes to the error cb instead.
+    void testSetNextReceived(qint64 confs, qint64 blocktime)
+        { testNextReceivedConfs = confs; testNextReceivedBlocktime = blocktime; testReceivedSet = true; }
 #endif
 
     // SAFE-RACE: synchronously-driven re-poll of ONLY the transparent UTXOs, spliced into
@@ -183,6 +302,140 @@ public:
     // once) into a single refresh shortly after the quiet point.
     static constexpr int   kNotifyDebounceMs      = 200;
 
+    // ---- Native NFT write path (dev/testnet; regtest-proven, not mainnet-hardened) ----
+    // Mint a NEW public ZSLP NFT from a file the user picked. docHashHex MUST be 64
+    // lowercase hex (the ContentEngine document_hash); name/ticker optional;
+    // documentUrl is NEVER auto-fetched (pass "" unless the user typed one). On
+    // success onDone(txid, tokenid) — the token is 0-conf/PENDING (invisible to the
+    // confirmed-only indexer until it confirms), so the caller shows a pending card;
+    // we also kick refreshNFTs(). On failure onErr(calm honest message). C++14:
+    // empty-QString sentinels, no std::optional.
+    void mintNFT(const QString& name, const QString& ticker,
+                 const QString& docHashHex, const QString& documentUrl,
+                 const std::function<void(QString txid, QString tokenid)>& onDone,
+                 const std::function<void(QString errStr)>& onErr);
+
+    // Gift/transfer an NFT (amount fixed at 1) to a recipient t-address. On success
+    // the token leaves this wallet immediately (0-conf), so refreshNFTs() will drop
+    // it once confirmed; onDone(txid) lets the caller show "sent — confirming". On
+    // failure onErr(calm honest message).
+    void sendNFT(const QString& tokenId, const QString& toAddress,
+                 const std::function<void(QString txid)>& onDone,
+                 const std::function<void(QString errStr)>& onErr);
+
+    // Detail-dialog provenance back-fill: zslp_gettoken "tokenId" -> the success cb
+    // receives the unwrapped token-metadata object (ticker/name/documenthash/...).
+    // Any error -> the err cb fires with a calm message; the dialog keeps honest
+    // defaults (Creator "Unknown", Set "Not part of a set"), never a dialog.
+    void nftProvenance(const QString& tokenId,
+                       const std::function<void(json tokenMeta)>& onDone,
+                       const std::function<void(QString errStr)>& onErr);
+
+    // Detail-dialog received-date back-fill: gettransaction "txid" -> the success cb
+    // receives (confirmations, blocktime). confs<10 => "Just arrived — confirming…";
+    // >=10 => ISO date + "block N" (the caller formats). Any error -> onErr.
+    void txReceivedDate(const QString& txid,
+                        const std::function<void(qint64 confirmations, qint64 blocktime)>& onDone,
+                        const std::function<void(QString errStr)>& onErr);
+
+    // ---- NFT SELL pillar (PART 2; non-consensus ZSLP atomic swap RPC wrappers) ----
+    // Each wraps one daemon nft_* RPC (src/rpc/nftoffer.cpp). All take a SINGLE JSON
+    // OBJECT param (we send real JSON over HTTP — the client.cpp CLI arg-conversion
+    // table is irrelevant). Calm honest error mapping reuses zslpCalmError. DRY on
+    // doRPC / nftJsonStr / nftJsonInt, exactly like mintNFT/sendNFT.
+
+    // SELL: build a buyer-sealed atomic offer. priceZcl is the human ZCL amount (the
+    // wrapper converts to zat). buyerNftAddr is REQUIRED (the daemon throws without it).
+    // payoutAddr "" => the daemon uses a fresh own address. expiryHeight 0 => the daemon
+    // default (~7 days). onDone(offerBlob "znftoffer:...", offerId, nftOutpoint "txid:n");
+    // onErr(calm).
+    void nftMakeOffer(const QString& tokenId, double priceZcl, const QString& buyerNftAddr,
+                      const QString& payoutAddr, int expiryHeight,
+                      const std::function<void(QString offerBlob, QString offerId, QString nftOutpoint)>& onDone,
+                      const std::function<void(QString errStr)>& onErr);
+
+    // BUY (MANDATORY pre-pay safety check): decode + live-verify the offer. onDone fires
+    // with a filled NFTVerifyResult for BOTH ok and not-ok (ok==false is a valid delivery
+    // carrying the reasons). onErr only on transport/parse failure.
+    void nftVerifyOffer(const QString& offerBlob,
+                        const std::function<void(NFTVerifyResult)>& onDone,
+                        const std::function<void(QString errStr)>& onErr);
+
+    // BUY settle. acknowledge=true sends the overshoot-to-fee consent. onDone(txid,
+    // overshootZat) — overshootZat is the total network fee donated (shown, never silent).
+    void nftTakeOffer(const QString& offerBlob, bool acknowledge,
+                      const std::function<void(QString txid, qint64 overshootZat)>& onDone,
+                      const std::function<void(QString errStr)>& onErr);
+
+    // List local offers (the store is all "mine" — the daemon has no "mine" filter,
+    // so this takes no filter arg). onDone(rows); onErr(calm).
+    void nftListOffers(const std::function<void(QVector<NFTOfferRow>)>& onDone,
+                       const std::function<void(QString errStr)>& onErr);
+
+    // Cancel an outstanding sell offer by self-spending its NFT UTXO. onDone(txid).
+    void nftCancelOffer(const QString& offerId,
+                        const std::function<void(QString txid)>& onDone,
+                        const std::function<void(QString errStr)>& onErr);
+
+    // ---- SHIELD pillar (private file send/receive over the ZDC1 data-channel) ----
+    // Each wraps one daemon z_*datafile / z_*datatransfer RPC (src/rpc/datachannel.cpp),
+    // a SINGLE JSON OBJECT param. HONEST error mapping: the data-channel RPCs are only
+    // registered under -datachannel (default OFF); when off the dispatcher returns
+    // RPC_METHOD_NOT_FOUND (-32601) — we map that to a CALM "enable private transfers in
+    // Settings first" message (datachannelOff()) instead of a scary raw error.
+    //
+    // The plaintext NEVER leaves the user's machine for a SEND: the GUI hex-encodes the
+    // local file bytes and sends `hexdata` (not a server filepath). The 40000-byte cap
+    // is enforced UP FRONT in the dialog (nftdc::ZDC_MAX_FILE_BYTES). acknowledge_permanent
+    // is ALWAYS true here (the dialog earns that consent via a mandatory checkbox; the
+    // daemon also refuses without it). content_type/filename are optional metadata.
+
+    // SEND a private file. `hexData` is the lowercase-hex of the local file bytes (the
+    // caller reads them binary-safe and hex-encodes). fromAddr/toAddr are Sapling
+    // z-addresses (zs..). z_senddatafile is ASYNC and returns an operationid; the
+    // immediate object carries the fingerprint (= NFT document_hash) + per-transfer key,
+    // which is what the success screen needs — so we surface that immediate result via
+    // onDone (no operation poll needed for the load-bearing facts). onErr(calm honest).
+    void sendDataFile(const QString& fromAddr, const QString& toAddr,
+                      const QString& hexData, const QString& filename,
+                      const QString& contentType,
+                      const std::function<void(SendDataFileResult)>& onDone,
+                      const std::function<void(QString errStr)>& onErr);
+
+    // LIST the data transfers this node sent THIS SESSION (z_listdatatransfers; in-memory,
+    // 72h TTL — NOT a durable or received history; the caller labels it honestly).
+    // onDone(rows); onErr(calm). -32601 (channel off) routes to onErr(datachannelOff()).
+    void listDataTransfers(const std::function<void(QVector<DataTransferRow>)>& onDone,
+                           const std::function<void(QString errStr)>& onErr);
+
+    // GET (reassemble + VERIFY-BEFORE-DECRYPT) a private file. Identify by transfer_id
+    // (16-hex) OR fingerprint (64-hex) — pass the one you have, "" for the other. `address`
+    // optional (defaults to the recorded toaddress, else scans viewable addrs) supports
+    // CROSS-WALLET receive. `verifyFingerprint` optional out-of-band 64-hex anchor. The
+    // daemon verifies BEFORE any decrypt and returns plaintext ONLY when verified+complete;
+    // onDone always fires with a filled DataTransferResult (even on a verify/decrypt
+    // FAILURE — the .error field carries the honest state). onErr only on transport/off.
+    void getDataTransfer(const QString& transferId, const QString& fingerprint,
+                         const QString& address, const QString& verifyFingerprint,
+                         const std::function<void(DataTransferResult)>& onDone,
+                         const std::function<void(QString errStr)>& onErr);
+
+    // PROVENANCE: the PUBLIC transfer history of an NFT (zslp_listtransfers, newest-first,
+    // reorg-safe). HONEST: ZSLP ownership is always public — this is the on-chain
+    // chain-of-custody, not a private log. onDone(array of JSON transfer rows); onErr(calm).
+    void nftListTransfers(const QString& tokenId,
+                          const std::function<void(json transfers)>& onDone,
+                          const std::function<void(QString errStr)>& onErr);
+
+    // Pure conversion helper (L0-testable): human ZCL (double) -> zatoshi (qint64),
+    // rounded to the nearest zat. Clamped at 0. The ONE place price strings become zat.
+    static qint64 zclToZat(double zcl);
+
+    // Honest gating: the PRIVATE (ZDC1 shielded) mint/gift path is not built yet, so
+    // this is hard-false. The mint/send dialogs disable the Private tile as "Coming
+    // in this release" rather than ship a dead Create button (spec §2.5 polarity).
+    static bool isPrivateMintWired() { return false; }
+
     QString getDefaultSaplingAddress();
     QString getDefaultTAddress();
 
@@ -191,12 +444,65 @@ public:
     Turnstile*  getTurnstile()  { return turnstile; }
     Connection* getConnection() { return conn; }
 
+    // ---- NFT-CAPABILITY probe (BUG #1 fix) ----
+    // True UNLESS we have CONFIRMED the currently-attached node lacks NFT support. The
+    // user can attach to an OLDER foreign ZClassic node (e.g. a running beta6 release
+    // daemon) that has no zslp_*/nft_*/z_*datafile RPCs even though THIS wallet's
+    // embedded node does — gating the NFT surfaces on this flag turns the cryptic
+    // "method not found" into honest, actionable guidance. We PROBE an actual NFT RPC
+    // (we NEVER parse the daemon version string, which the embedded node mis-reports).
+    // Fail-OPEN while the probe is unresolved (returns true) so the gallery never
+    // flashes the "unsupported" panel during the brief warmup before the first reply.
+    // Re-probed on every setConnection() (a reconnect may be a different node).
+    bool nodeSupportsNFT() const { return nftCapability != NftCap::Unsupported; }
+    // True once the probe RESOLVED, so the UI can tell "still checking" from a
+    // confirmed yes/no (it shows the unsupported panel ONLY on a resolved-No).
+    bool nodeNFTProbeResolved() const { return nftCapability != NftCap::Unknown; }
+    // The ONE honest guidance string shown when the attached node lacks NFT support:
+    // the Collections panel, the disabled-entry tooltips, AND every NFT/zslp RPC
+    // wrapper's -32601 mapping all share it, so an action can never dead-end on a raw
+    // "method not found".
+    static QString nftUnsupportedGuidance();
+    // Fire the probe against the current connection. Safe no-op when conn==nullptr;
+    // on resolve it notifies the MainWindow so the gallery + entry points re-gate.
+    void probeNFTCapability();
+
+#ifdef ZCL_WIDGET_TEST
+    // TEST SEAM (BUG #1): force the capability flag without a daemon so the L1 tests
+    // can drive the "unsupported node" gating + calm -32601 mapping deterministically.
+    void testSetNodeSupportsNFT(bool supported) {
+        nftCapability = supported ? NftCap::Supported : NftCap::Unsupported;
+    }
+    // TEST SEAM: run the SHARED zslpCalmError() mapper against a synthetic JSON-RPC
+    // error body { "error": { "code": <code> } } with a null reply, exactly as every
+    // NFT/zslp wrapper does on a daemon error. Lets the unit test assert the -32601 ->
+    // nftUnsupportedGuidance() mapping directly (no daemon, no widgets).
+    static QString testCalmErrorForCode(int errorCode);
+#endif
+
 private:
     void refreshBalances();
 
-    void refreshTransactions();    
+    void refreshTransactions();
     void refreshSentZTrans();
     void refreshReceivedZTrans(QList<QString> zaddresses);
+
+    // Phase C1: fetch the wallet's REAL on-chain ZSLP NFTs and feed the native
+    // Collections gallery (MainWindow::setNFTItems). zslp_listmytokens lists the
+    // tokens this wallet holds (intersect of the indexed tokens with our t-addresses
+    // — ZSLP rides transparent dust); for each we zslp_gettoken for the on-chain
+    // document hash / url / decimals / genesis height, then map to NFTItem.
+    //
+    // GRACEFUL FALLBACK: zslp_listmytokens throws RPC_MISC_ERROR (code -1) when the
+    // daemon lacks -zslpindex; we catch that in the error callback and feed an empty
+    // "index off" set (no crash, no error dialog). An index-on wallet that owns no
+    // tokens simply yields an empty gallery.
+    //
+    // PRIVACY: we read metadata + the on-chain document hash ONLY and set
+    // cachePath="" on every item — the GUI never auto-fetches a remote documenturl
+    // image (no IP / interest leak). Bytes arrive later from the local cache or an
+    // explicit user action. Read-only: no key material, no node mutation.
+    void refreshNFTs();
 
     bool processUnspent     (const json& reply, QMap<QString, double>* newBalances, QList<UnspentOutput>* newUtxos);
     // SAFE-RACE: build a new owned list = the shielded-note rows kept from `oldUtxos`
@@ -362,6 +668,15 @@ private:
     // per-address balances model / UTXO set and never touches the hero labels.
     bool                        summaryCapable              = true;
 
+    // ---- NFT-CAPABILITY probe state (BUG #1 fix) ----
+    // Tri-state, reset to Unknown on every setConnection() and resolved by the first
+    // probeNFTCapability() reply: Supported (an NFT RPC answered) / Unsupported (-32601
+    // "method not found" — an older foreign node) / Unknown (probe in flight). The
+    // accessors above fail OPEN while Unknown so the UI never flashes the unsupported
+    // panel during warmup. We PROBE, never parse the version string.
+    enum class NftCap { Unknown, Supported, Unsupported };
+    NftCap                      nftCapability               = NftCap::Unknown;
+
     Connection*                 conn                        = nullptr;
     QProcess*                   ezclassicd                     = nullptr;
 
@@ -429,6 +744,30 @@ private:
     // SAFE-RACE backing store: the transparent set the next repollTransparentUnspent()
     // splices in (one-shot). nullptr => the re-poll cannot fire (fail-closed).
     QList<UnspentOutput>*       testRepollUTXOs = nullptr;
+    // NFT dialog seam backing stores (one-shot; consumed inside mintNFT/sendNFT/
+    // txReceivedDate). Empty txid + empty error => the call returns without firing a
+    // callback (the perpetual-in-flight closeEvent test). Never in the shipped build.
+    QString                     testNextMintTxid, testNextMintTokenId, testNextSendTxid;
+    QString                     testNextNftError;
+    qint64                      testNextReceivedConfs     = 0;
+    qint64                      testNextReceivedBlocktime = 0;
+    bool                        testReceivedSet           = false;
+    // NFT SELL seam backing stores (one-shot; consumed inside the nft offer wrappers).
+    QString                     testNextOfferBlob, testNextOfferId, testNextOfferOutpoint;
+    NFTVerifyResult             testNextVerify;
+    bool                        testVerifySet             = false;
+    QString                     testNextTakeTxid;
+    qint64                      testNextTakeOvershoot     = 0;
+    QVector<NFTOfferRow>        testNextOfferList;
+    bool                        testOfferListSet          = false;
+    QString                     testNextCancelTxid;
+    // SHIELD seam backing stores (one-shot; consumed inside the data-channel wrappers).
+    SendDataFileResult          testNextSendDataFile;
+    bool                        testSendDataFileSet       = false;
+    QVector<DataTransferRow>    testNextDataXferList;
+    bool                        testDataXferListSet       = false;
+    DataTransferResult          testNextDataXfer;
+    bool                        testDataXferSet           = false;
 #endif
 };
 

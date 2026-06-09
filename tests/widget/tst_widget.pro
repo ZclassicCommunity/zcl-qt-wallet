@@ -48,9 +48,23 @@ DEPENDPATH  += $$PWD/../../res
 # qrcode 3rdparty + singleapplication + the test itself.
 SOURCES += \
     ../../src/mainwindow.cpp \
+    ../../src/flowlayout.cpp \
     ../../src/rpc.cpp \
     ../../src/balancestablemodel.cpp \
     ../../src/privacybadgedelegate.cpp \
+    ../../src/nftgallerymodel.cpp \
+    ../../src/nftgallerydelegate.cpp \
+    ../../src/contentengine.cpp \
+    ../../src/nftimagecache.cpp \
+    ../../src/nftasyncdialog.cpp \
+    ../../src/nftcommon.cpp \
+    ../../src/nftdetaildialog.cpp \
+    ../../src/nftmintdialog.cpp \
+    ../../src/nftsenddialog.cpp \
+    ../../src/nftselldialog.cpp \
+    ../../src/nftbuydialog.cpp \
+    ../../src/shieldsenddialog.cpp \
+    ../../src/shieldreceivedialog.cpp \
     ../../src/3rdparty/qrcode/BitBuffer.cpp \
     ../../src/3rdparty/qrcode/QrCode.cpp \
     ../../src/3rdparty/qrcode/QrSegment.cpp \
@@ -74,6 +88,18 @@ SOURCES += \
 HEADERS += \
     ../../src/mainwindow.h \
     ../../src/privacybadgedelegate.h \
+    ../../src/nftgallerymodel.h \
+    ../../src/nftgallerydelegate.h \
+    ../../src/contentengine.h \
+    ../../src/nftimagecache.h \
+    ../../src/nftasyncdialog.h \
+    ../../src/nftdetaildialog.h \
+    ../../src/nftmintdialog.h \
+    ../../src/nftsenddialog.h \
+    ../../src/nftselldialog.h \
+    ../../src/nftbuydialog.h \
+    ../../src/shieldsenddialog.h \
+    ../../src/shieldreceivedialog.h \
     ../../src/qrcodelabel.h \
     ../../src/fillediconlabel.h \
     ../../src/addresscombo.h \

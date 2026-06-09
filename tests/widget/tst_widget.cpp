@@ -42,6 +42,7 @@
 #include <QLineEdit>
 #include <QProgressBar>
 #include <QVBoxLayout>
+#include <QScrollArea>
 #include <QFontMetrics>
 #include <QWidget>
 #include <QDialog>
@@ -53,6 +54,10 @@
 #include <QEvent>
 #include <QDir>
 #include <QFile>
+#include <QMimeData>
+#include <QDropEvent>
+#include <QCryptographicHash>
+#include <QImage>
 #include <QPixmap>
 #include <QPalette>
 #include <QColor>
@@ -82,6 +87,20 @@
 #include "settings.h"
 #include "connection.h"
 #include "notifyserver.h"
+#include "nft.h"
+#include "contentengine.h"
+#include "nftdetaildialog.h"
+#include "nftmintdialog.h"
+#include "nftsenddialog.h"
+#include "nftselldialog.h"
+#include "nftbuydialog.h"
+#include "shieldsenddialog.h"
+#include "shieldreceivedialog.h"
+#include <QPlainTextEdit>
+#include <QCheckBox>
+#include <QListWidget>
+#include <QComboBox>
+#include <QTemporaryFile>
 
 // Kept alive for the whole process so QStandardPaths/QSettings stay isolated.
 static QTemporaryDir* g_homeDir = nullptr;
@@ -1854,6 +1873,1616 @@ private slots:
     //   without a rebuild. To measure the REAL rebuild cost on every iteration we
     //   alternate between two distinct datasets (A/B) so each call sees changed
     //   data and actually does the work.
+    // ---- NFT detail dialog: no-local-bytes is a TERMINAL state, never a spinner -----
+    // Review fix #1/#2: an on-chain NFT whose image bytes are NOT on this computer
+    // (the DEFAULT for every freshly-listed token: cachePath="") must show a neutral,
+    // factual verify line — NOT a perpetual "Checking this image…" with no work in
+    // flight, and NOT an instruction the dialog cannot fulfil ("Open to fetch it
+    // yourself" with no fetch affordance). We construct the dialog with a real engine
+    // and a no-bytes item, then assert the verify line settled to the terminal copy.
+    void nftDetail_noBytesIsTerminalNotSpinner() {
+        ContentEngine engine(nullptr);   // a real engine; null model is fine (token path)
+
+        NFTItem it;
+        it.name       = "Orphan";
+        it.collection = "Strays";
+        it.txid       = "deadbeef";
+        it.docHashHex = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        it.cachePath  = "";              // NO local bytes -> the no-fetch terminal path
+        it.isPrivate  = false;
+        it.verifyState = 0;
+        QVector<NFTItem> ordered; ordered.push_back(it);
+
+        // rpc == nullptr: the dialog's backfill RPCs are guarded on m_rpc==nullptr, so
+        // this exercises the pure poster/verify path with no daemon.
+        NFTDetailDialog* dlg = new NFTDetailDialog(it, ordered, 0, &engine, nullptr);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+
+        auto* verifyLine = dlg->findChild<QLabel*>("nftDetailVerifyLine");
+        QVERIFY2(verifyLine, "detail dialog must expose its verify line by objectName");
+
+        // The no-bytes decision is synchronous (requestPoster early-returns), so the
+        // verify line is already terminal — but pump a few cycles to be safe.
+        QElapsedTimer t; t.start();
+        while (verifyLine->text().contains("Checking", Qt::CaseInsensitive)
+               && t.elapsed() < 2000)
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 25);
+
+        const QString line = verifyLine->text();
+        // (a) NOT a perpetual spinner.
+        QVERIFY2(!line.contains("Checking", Qt::CaseInsensitive),
+                 qPrintable("verify line stuck spinning: " + line));
+        // (b) NOT a dead-end instruction (no "fetch it yourself" call-to-action with
+        //     no affordance) — it states a FACT.
+        QVERIFY2(!line.contains("fetch it yourself", Qt::CaseInsensitive),
+                 qPrintable("verify line gives an impossible instruction: " + line));
+        // (c) It's the honest neutral "can't check — not on this computer" terminal.
+        QVERIFY2(line.contains("Can't check", Qt::CaseInsensitive)
+                     && line.contains("isn't on this computer", Qt::CaseInsensitive),
+                 qPrintable("verify line is not the terminal no-bytes copy: " + line));
+
+        // The single state-aware verify button (objectName nftVerifyFileButton, formerly
+        // the Re-check/attach pair). With NO local bytes it must NOT offer a dead "Re-check"
+        // (there is nothing to re-check) — it flips to the actionable "Check my file…" path
+        // (the user picks the local file they hold; nothing is uploaded). This test item
+        // HAS an on-chain fingerprint (it.docHashHex set), so that path is the ONLY route to
+        // a green badge and the button is enabled; a hash-less NFT would disable it instead.
+        auto* verify = dlg->findChild<QPushButton*>("nftVerifyFileButton");
+        QVERIFY2(verify, "detail dialog must expose the verify button by objectName");
+        QVERIFY2(verify->text().contains("Check my file", Qt::CaseInsensitive),
+                 qPrintable("no-bytes verify button must offer 'Check my file…', not a dead "
+                            "re-check: " + verify->text()));
+        QVERIFY2(!verify->text().contains("Re-check", Qt::CaseInsensitive),
+                 qPrintable("no-bytes state must NOT label the button 'Re-check' (nothing to "
+                            "re-check): " + verify->text()));
+        QVERIFY2(verify->isEnabled(),
+                 "with an on-chain fingerprint the user CAN check their local file");
+
+        dlg->close();   // WA_DeleteOnClose -> deleted; closing the UAF surface too
+    }
+
+    // ======================================================================
+    // NFT dialog L1 tests (items A + E). Driven via the RPC test seams
+    // (testSetNextMintResult/SendResult/NftError) + the detail dialog's
+    // testAttachFile seam, all under ZCL_WIDGET_TEST + offscreen QPA. No daemon.
+    // ----------------------------------------------------------------------
+private:
+    // Pump the event loop until `pred()` is true or the bound elapses. Returns the
+    // final pred() value so a test can assert it (never an open-ended sleep).
+    template <typename Pred>
+    bool pumpUntil(Pred pred, int maxMs = 5000) {
+        QElapsedTimer t; t.start();
+        while (!pred() && t.elapsed() < maxMs)
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 25);
+        return pred();
+    }
+    // Write a real, decodable PNG of a given color; return its path + true SHA-256
+    // (the bare whole-file hash — small files anchor on the whole hash). The detail
+    // attach-gate + posterForToken both accept that as the on-chain anchor.
+    QString writePngWithHash(const QString& dir, const QString& name,
+                             const QColor& fill, QString& outHashHex) {
+        const QString p = QDir(dir).filePath(name);
+        QImage img(40, 40, QImage::Format_ARGB32);
+        img.fill(fill);
+        if (!img.save(p, "PNG")) return QString();
+        QFile f(p);
+        if (!f.open(QIODevice::ReadOnly)) return QString();
+        const QByteArray bytes = f.readAll(); f.close();
+        outHashHex = QString::fromLatin1(
+            QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
+        return p;
+    }
+
+private slots:
+
+    // -- MINT: Create stays disabled until name + fingerprint, hashing reaches ready
+    void nftMint_createGatedUntilNameAndFingerprint() {
+        QTemporaryDir appDir; QVERIFY(appDir.isValid());
+        qputenv("XDG_DATA_HOME", appDir.path().toUtf8());
+        QStandardPaths::setTestModeEnabled(true);
+        ContentEngine engine(nullptr);
+
+        MainWindow* w = makeWindow();
+        NftMintDialog* dlg = new NftMintDialog(&engine, w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* create = dlg->findChild<QPushButton*>("nftMintCreateButton");
+        auto* name   = dlg->findChild<QLineEdit*>("nftMintNameEdit");
+        auto* fp     = dlg->findChild<QLabel*>("nftMintFingerprintLabel");
+        QVERIFY(create && name && fp);
+
+        QVERIFY2(!create->isEnabled(), "Create must be disabled at open (no name, no file)");
+
+        // Type a name -> still disabled (no fingerprint yet).
+        name->setText("My collectible");
+        QVERIFY2(!create->isEnabled(), "Create must stay disabled with a name but no fingerprint");
+
+        // Drive a real file hash through the engine (the same descriptorReady the
+        // dialog listens for). The dialog computes the anchor + reaches "ready".
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        QString hashHex;
+        const QString png = writePngWithHash(tmp.path(), "a.png", Qt::blue, hashHex);
+        QVERIFY(!png.isEmpty());
+        // Drive the dialog's own pick path (same as a choose/drop) via the test seam.
+        dlg->testPickFile(png);
+
+        QVERIFY2(pumpUntil([&]{ return fp->text().contains("Fingerprint ready", Qt::CaseInsensitive); }),
+                 qPrintable("fingerprint never reached ready: " + fp->text()));
+        QVERIFY2(create->isEnabled(), "Create must be ENABLED once name + fingerprint are present");
+
+        dlg->close();
+        w->deleteLater();
+        QStandardPaths::setTestModeEnabled(false);
+    }
+
+    // -- MINT: a remote-URL drop is rejected + Create stays disabled
+    void nftMint_remoteUrlDropRejected() {
+        ContentEngine engine(nullptr);
+        MainWindow* w = makeWindow();
+        NftMintDialog* dlg = new NftMintDialog(&engine, w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* create = dlg->findChild<QPushButton*>("nftMintCreateButton");
+        auto* name   = dlg->findChild<QLineEdit*>("nftMintNameEdit");
+        auto* fp     = dlg->findChild<QLabel*>("nftMintFingerprintLabel");
+        QVERIFY(create && name && fp);
+        name->setText("Has a name");   // name present so the gate hinges on the rejected file
+
+        // A remote/URL "file" must be rejected by the privacy guard (same path a
+        // non-local drop takes): isRemoteUrl(path) -> red copy, no hashing, no anchor.
+        dlg->testPickFile("https://example.com/cat.png");
+
+        QVERIFY2(fp->text().contains("local file", Qt::CaseInsensitive)
+                 || fp->text().contains("web link", Qt::CaseInsensitive),
+                 qPrintable("remote drop not rejected with the privacy copy: " + fp->text()));
+        QVERIFY2(!create->isEnabled(), "Create must stay DISABLED after a rejected remote drop");
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- MINT: success -> Create becomes Done + honest "confirming" line + NOT accepted
+    void nftMint_successBecomesDoneNotAutoAccepted() {
+        QTemporaryDir appDir; QVERIFY(appDir.isValid());
+        qputenv("XDG_DATA_HOME", appDir.path().toUtf8());
+        QStandardPaths::setTestModeEnabled(true);
+        ContentEngine engine(nullptr);
+
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+        NftMintDialog* dlg = new NftMintDialog(&engine, rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* create = dlg->findChild<QPushButton*>("nftMintCreateButton");
+        auto* name   = dlg->findChild<QLineEdit*>("nftMintNameEdit");
+        auto* fp     = dlg->findChild<QLabel*>("nftMintFingerprintLabel");
+        auto* result = dlg->findChild<QLabel*>("nftMintResultLine");
+        QVERIFY(create && name && fp && result);
+
+        name->setText("Done test");
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        QString hashHex;
+        const QString png = writePngWithHash(tmp.path(), "b.png", Qt::red, hashHex);
+        dlg->testPickFile(png);
+        QVERIFY(pumpUntil([&]{ return create->isEnabled(); }));
+
+        // Install the success result the next mintNFT delivers, then click Create.
+        rpc->testSetNextMintResult("txdeadbeef", "tokdeadbeef");
+        create->click();
+
+        QVERIFY2(pumpUntil([&]{ return create->text() == QString("Done"); }),
+                 qPrintable("Create did not retire to Done: " + create->text()));
+        QVERIFY2(result->text().contains("confirm", Qt::CaseInsensitive),
+                 qPrintable("result line missing the honest confirming copy: " + result->text()));
+        QCOMPARE(dlg->lastTxid(), QString("txdeadbeef"));
+        QVERIFY2(dlg->result() != QDialog::Accepted,
+                 "dialog must NOT auto-accept on success (user reads the confirmation first)");
+
+        dlg->close();
+        w->deleteLater();
+        QStandardPaths::setTestModeEnabled(false);
+    }
+
+    // -- MINT: the window [X]/close is swallowed while the RPC is in flight
+    void nftMint_closeSwallowedWhileInFlight() {
+        QTemporaryDir appDir; QVERIFY(appDir.isValid());
+        qputenv("XDG_DATA_HOME", appDir.path().toUtf8());
+        QStandardPaths::setTestModeEnabled(true);
+        ContentEngine engine(nullptr);
+
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+        NftMintDialog* dlg = new NftMintDialog(&engine, rpc, w);
+        dlg->show();   // NOT WA_DeleteOnClose: we assert it survives the close
+
+        auto* create = dlg->findChild<QPushButton*>("nftMintCreateButton");
+        auto* name   = dlg->findChild<QLineEdit*>("nftMintNameEdit");
+        QVERIFY(create && name);
+        name->setText("Inflight");
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        QString hashHex;
+        const QString png = writePngWithHash(tmp.path(), "c.png", Qt::green, hashHex);
+        dlg->testPickFile(png);
+        QVERIFY(pumpUntil([&]{ return create->isEnabled(); }));
+
+        // Install NOTHING -> the seam returns without firing either callback, so the
+        // dialog stays in-flight (m_inFlight==true) indefinitely.
+        create->click();
+        QVERIFY2(pumpUntil([&]{ return create->text() == QString("Creating…"); }),
+                 "Create should read Creating… while in flight");
+
+        // Attempt to close: the closeEvent must be swallowed (dialog still visible).
+        dlg->close();
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 25);
+        QVERIFY2(dlg->isVisible(), "dialog must NOT close while the mint RPC is in flight");
+        QVERIFY2(dlg->result() != QDialog::Accepted, "must not have accepted while in flight");
+
+        delete dlg;   // test owns it (no WA_DeleteOnClose); explicit teardown
+        w->deleteLater();
+        QStandardPaths::setTestModeEnabled(false);
+    }
+
+    // -- SEND: 4-state recipient validation; zs rejected; Send only for a valid t-addr
+    void nftSend_fourStateRecipientValidation() {
+        const QString TADDR = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        const QString ZSADDR =
+            "zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u";
+
+        MainWindow* w = makeWindow();
+        NFTItem it; it.name = "Gift"; it.txid = "tok1"; it.verifyState = 1;
+        NFTSendDialog* dlg = new NFTSendDialog(it, w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* rcpt   = dlg->findChild<QLineEdit*>("nftSendRecipientEdit");
+        auto* status = dlg->findChild<QLabel*>("nftSendAddrStatus");
+        auto* send   = dlg->findChild<QPushButton*>("nftSendButton");
+        QVERIFY(rcpt && status && send);
+
+        // (1) empty -> status clear, Send disabled.
+        QVERIFY2(status->text().isEmpty(), "empty recipient should clear the status");
+        QVERIFY(!send->isEnabled());
+
+        // (2) garbage -> "doesn't look like a ZClassic address", Send disabled.
+        rcpt->setText("not-an-address");
+        QVERIFY2(status->text().contains("doesn't look like", Qt::CaseInsensitive)
+                 || status->text().contains("ZClassic address", Qt::CaseInsensitive),
+                 qPrintable("garbage addr status: " + status->text()));
+        QVERIFY(!send->isEnabled());
+
+        // (3) valid t-addr -> "public" status, Send ENABLED.
+        rcpt->setText(TADDR);
+        QVERIFY2(status->text().contains("public", Qt::CaseInsensitive),
+                 qPrintable("valid t-addr status should mention public: " + status->text()));
+        QVERIFY2(send->isEnabled(), "Send must be ENABLED for a valid t-addr (verifyState 1)");
+
+        // (4) valid zs-addr -> private gifts coming soon, Send DISABLED.
+        rcpt->setText(ZSADDR);
+        QVERIFY2(status->text().contains("Private gifts", Qt::CaseInsensitive)
+                 || status->text().contains("public (transparent) address", Qt::CaseInsensitive),
+                 qPrintable("zs-addr should be rejected with the private-soon copy: " + status->text()));
+        QVERIFY2(!send->isEnabled(), "a valid zs-addr must NOT enable Send (public path only)");
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- SEND: the LOAD-BEARING mismatch guard. verifyState==2 disables Send even with
+    //    a valid t-addr; verifyState==1 with the same addr allows it.
+    void nftSend_mismatchDisablesSendEvenWithValidTAddr() {
+        const QString TADDR = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        MainWindow* w = makeWindow();
+
+        // MISMATCH item (verifyState==2): the red warning is present AND Send stays
+        // disabled even after typing a valid t-addr.
+        NFTItem bad; bad.name = "Tampered"; bad.txid = "tokbad"; bad.verifyState = 2;
+        NFTSendDialog* dBad = new NFTSendDialog(bad, w->getRPC(), w);
+        dBad->setAttribute(Qt::WA_DeleteOnClose);
+        dBad->show();
+        auto* warn = dBad->findChild<QLabel*>("nftSendMismatchWarning");
+        auto* rcptBad = dBad->findChild<QLineEdit*>("nftSendRecipientEdit");
+        auto* sendBad = dBad->findChild<QPushButton*>("nftSendButton");
+        QVERIFY(rcptBad && sendBad);
+        QVERIFY2(warn, "a verifyState==2 item must surface the red mismatch warning");
+        QVERIFY2(warn->text().contains("doesn't match", Qt::CaseInsensitive),
+                 qPrintable("mismatch warning copy: " + warn->text()));
+        rcptBad->setText(TADDR);
+        QVERIFY2(!sendBad->isEnabled(),
+                 "MISMATCH: Send must stay DISABLED even with a valid t-addr (the guard)");
+        dBad->close();
+
+        // VERIFIED sibling (verifyState==1): the same valid t-addr enables Send.
+        NFTItem ok; ok.name = "Good"; ok.txid = "tokok"; ok.verifyState = 1;
+        NFTSendDialog* dOk = new NFTSendDialog(ok, w->getRPC(), w);
+        dOk->setAttribute(Qt::WA_DeleteOnClose);
+        dOk->show();
+        auto* warnOk = dOk->findChild<QLabel*>("nftSendMismatchWarning");
+        auto* rcptOk = dOk->findChild<QLineEdit*>("nftSendRecipientEdit");
+        auto* sendOk = dOk->findChild<QPushButton*>("nftSendButton");
+        QVERIFY(rcptOk && sendOk);
+        QVERIFY2(!warnOk, "a verified item must NOT show the mismatch warning");
+        rcptOk->setText(TADDR);
+        QVERIFY2(sendOk->isEnabled(),
+                 "VERIFIED: a valid t-addr must enable Send (proves the guard is mismatch-only)");
+        dOk->close();
+
+        w->deleteLater();
+    }
+
+    // -- SEND: success -> Send becomes Done + "on its way" copy + NOT auto-accepted
+    void nftSend_successBecomesDone() {
+        const QString TADDR = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+
+        NFTItem it; it.name = "Sendable"; it.txid = "toksend"; it.verifyState = 1;
+        NFTSendDialog* dlg = new NFTSendDialog(it, rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* rcpt = dlg->findChild<QLineEdit*>("nftSendRecipientEdit");
+        auto* send = dlg->findChild<QPushButton*>("nftSendButton");
+        auto* result = dlg->findChild<QLabel*>("nftSendAddrStatus");   // status reused
+        QVERIFY(rcpt && send);
+        rcpt->setText(TADDR);
+        QVERIFY(pumpUntil([&]{ return send->isEnabled(); }));
+
+        rpc->testSetNextSendResult("txsent");
+        send->click();
+
+        QVERIFY2(pumpUntil([&]{ return send->text() == QString("Done"); }),
+                 qPrintable("Send did not retire to Done: " + send->text()));
+        QVERIFY2(dlg->result() != QDialog::Accepted,
+                 "send dialog must NOT auto-accept on success");
+        (void)result;
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- DETAIL: VERIFIED says "matches its on-chain fingerprint"
+    void nftDetail_verifiedSaysMatches() {
+        QTemporaryDir appDir; QVERIFY(appDir.isValid());
+        qputenv("XDG_DATA_HOME", appDir.path().toUtf8());
+        QStandardPaths::setTestModeEnabled(true);
+        ContentEngine engine(nullptr);
+
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        QString hashHex;
+        const QString png = writePngWithHash(tmp.path(), "good.png", Qt::cyan, hashHex);
+        QVERIFY(!png.isEmpty());
+
+        NFTItem it; it.name = "Verified"; it.txid = "tokv";
+        it.docHashHex = hashHex; it.cachePath = png; it.isPrivate = false; it.verifyState = 1;
+        QVector<NFTItem> ordered; ordered.push_back(it);
+
+        NFTDetailDialog* dlg = new NFTDetailDialog(it, ordered, 0, &engine, nullptr);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        auto* line = dlg->findChild<QLabel*>("nftDetailVerifyLine");
+        QVERIFY(line);
+        QVERIFY2(pumpUntil([&]{ return line->text().contains("matches its on-chain fingerprint", Qt::CaseInsensitive); }),
+                 qPrintable("verified verify line: " + line->text()));
+
+        dlg->close();
+        QStandardPaths::setTestModeEnabled(false);
+    }
+
+    // -- DETAIL: MISMATCH says "does NOT match"
+    void nftDetail_mismatchSaysDoesNotMatch() {
+        QTemporaryDir appDir; QVERIFY(appDir.isValid());
+        qputenv("XDG_DATA_HOME", appDir.path().toUtf8());
+        QStandardPaths::setTestModeEnabled(true);
+        ContentEngine engine(nullptr);
+
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        QString realHash;
+        const QString png = writePngWithHash(tmp.path(), "real.png", Qt::magenta, realHash);
+        QVERIFY(!png.isEmpty());
+        // docHashHex is a WRONG anchor -> the engine recomputes from the real bytes and
+        // reports CE_Mismatch.
+        const QString wrong = QString(64, QChar('0'));
+
+        NFTItem it; it.name = "Tampered"; it.txid = "tokm";
+        it.docHashHex = wrong; it.cachePath = png; it.isPrivate = false; it.verifyState = 0;
+        QVector<NFTItem> ordered; ordered.push_back(it);
+
+        NFTDetailDialog* dlg = new NFTDetailDialog(it, ordered, 0, &engine, nullptr);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        auto* line = dlg->findChild<QLabel*>("nftDetailVerifyLine");
+        QVERIFY(line);
+        QVERIFY2(pumpUntil([&]{ return line->text().contains("does NOT match", Qt::CaseInsensitive); }),
+                 qPrintable("mismatch verify line: " + line->text()));
+
+        dlg->close();
+        QStandardPaths::setTestModeEnabled(false);
+    }
+
+    // -- DETAIL item-A: attach a MATCHING file -> badge resolves VERIFIED + cache filled
+    void nftDetail_attachFileVerifiesBadge() {
+        QTemporaryDir appDir; QVERIFY(appDir.isValid());
+        qputenv("XDG_DATA_HOME", appDir.path().toUtf8());
+        QStandardPaths::setTestModeEnabled(true);
+        ContentEngine engine(nullptr);
+
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        QString hashHex;
+        const QString png = writePngWithHash(tmp.path(), "attach.png", Qt::yellow, hashHex);
+        QVERIFY(!png.isEmpty());
+        // Clean any stale blob for this key so cacheGet starts empty.
+        QFile::remove(ContentEngine::blobCacheDir() + "/" + hashHex);
+        QVERIFY2(ContentEngine::cacheGet(hashHex).isEmpty(), "precondition: no cached blob");
+
+        // A RECEIVED NFT: cachePath="" (privacy), but docHashHex IS recorded.
+        NFTItem it; it.name = "Received"; it.txid = "tokr";
+        it.docHashHex = hashHex; it.cachePath = ""; it.isPrivate = false; it.verifyState = 0;
+        QVector<NFTItem> ordered; ordered.push_back(it);
+
+        NFTDetailDialog* dlg = new NFTDetailDialog(it, ordered, 0, &engine, nullptr);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        auto* line   = dlg->findChild<QLabel*>("nftDetailVerifyLine");
+        auto* attach = dlg->findChild<QLabel*>("nftAttachStatus");
+        QVERIFY(line && attach);
+        // Opens in the no-bytes terminal.
+        QVERIFY(pumpUntil([&]{ return line->text().contains("Can't check", Qt::CaseInsensitive); }));
+
+        // Drive the attach seam with the MATCHING file.
+        dlg->testAttachFile(png);
+        QVERIFY2(pumpUntil([&]{ return attach->text().contains("matches the on-chain fingerprint", Qt::CaseInsensitive); }),
+                 qPrintable("attach status (match) copy: " + attach->text()));
+        // The verify line resolves to VERIFIED, and the blob is now cached.
+        QVERIFY2(pumpUntil([&]{ return line->text().contains("matches its on-chain fingerprint", Qt::CaseInsensitive); }),
+                 qPrintable("verify line after attach: " + line->text()));
+        QVERIFY2(!ContentEngine::cacheGet(hashHex).isEmpty(),
+                 "a matching attach must cachePut the bytes (content-addressed)");
+
+        dlg->close();
+        QStandardPaths::setTestModeEnabled(false);
+    }
+
+    // -- DETAIL item-A: attach a NON-MATCHING file -> stays unverified, NOT cached
+    void nftDetail_attachNonMatchStaysUnverified() {
+        QTemporaryDir appDir; QVERIFY(appDir.isValid());
+        qputenv("XDG_DATA_HOME", appDir.path().toUtf8());
+        QStandardPaths::setTestModeEnabled(true);
+        ContentEngine engine(nullptr);
+
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        QString goodHash, otherHash;
+        const QString good  = writePngWithHash(tmp.path(), "good2.png",  Qt::darkGreen, goodHash);
+        const QString other = writePngWithHash(tmp.path(), "other.png",  Qt::darkRed,   otherHash);
+        QVERIFY(!good.isEmpty() && !other.isEmpty());
+        QVERIFY(goodHash != otherHash);
+        QFile::remove(ContentEngine::blobCacheDir() + "/" + goodHash);
+        QVERIFY(ContentEngine::cacheGet(goodHash).isEmpty());
+
+        // The NFT records goodHash, but the user attaches the WRONG file (other).
+        NFTItem it; it.name = "Received2"; it.txid = "tokr2";
+        it.docHashHex = goodHash; it.cachePath = ""; it.isPrivate = false; it.verifyState = 0;
+        QVector<NFTItem> ordered; ordered.push_back(it);
+
+        NFTDetailDialog* dlg = new NFTDetailDialog(it, ordered, 0, &engine, nullptr);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        auto* line   = dlg->findChild<QLabel*>("nftDetailVerifyLine");
+        auto* attach = dlg->findChild<QLabel*>("nftAttachStatus");
+        QVERIFY(line && attach);
+        QVERIFY(pumpUntil([&]{ return line->text().contains("Can't check", Qt::CaseInsensitive); }));
+
+        dlg->testAttachFile(other);   // wrong bytes
+        QVERIFY2(pumpUntil([&]{ return attach->text().contains("does NOT match", Qt::CaseInsensitive); }),
+                 qPrintable("attach status (non-match) copy: " + attach->text()));
+        // No cachePut happened for the NFT's real hash, and the verify line never went green.
+        QVERIFY2(ContentEngine::cacheGet(goodHash).isEmpty(),
+                 "a non-matching attach must NOT cache the bytes");
+        QVERIFY2(!line->text().contains("matches its on-chain fingerprint", Qt::CaseInsensitive),
+                 qPrintable("verify line must NOT go verified on a non-match: " + line->text()));
+
+        dlg->close();
+        QStandardPaths::setTestModeEnabled(false);
+    }
+
+    // ======================================================================
+    // #119 HONESTY-FIX regression locks + NFT SELL/BUY L1 tests (PART 2).
+    // All driven via the RPC test seams (testSetNextOfferResult / VerifyResult /
+    // TakeResult / CancelResult / NftError) + the buy dialog's testPasteOffer seam,
+    // under ZCL_WIDGET_TEST + offscreen QPA. No daemon.
+    // ----------------------------------------------------------------------
+
+    // -- #119 (b): the detail pill must NEVER claim shielded/private OWNERSHIP.
+    void nftDetail_noShieldedOwnershipClaim() {
+        ContentEngine engine(nullptr);
+        NFTItem it; it.name = "Pub"; it.txid = "tok1";
+        it.docHashHex = "aa"; it.cachePath = ""; it.isPrivate = false; it.verifyState = 0;
+        QVector<NFTItem> ordered; ordered.push_back(it);
+
+        NFTDetailDialog* dlg = new NFTDetailDialog(it, ordered, 0, &engine, nullptr);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+
+        auto* pill = dlg->findChild<QLabel*>("nftDetailPrivacyPill");
+        QVERIFY2(pill, "detail dialog must expose its ownership pill by objectName");
+        const QString t = pill->text();
+        QVERIFY2(!t.contains("shielded", Qt::CaseInsensitive),
+                 qPrintable("pill must never claim shielded ownership: " + t));
+        QVERIFY2(!t.contains("only you", Qt::CaseInsensitive),
+                 qPrintable("pill must never claim only-you-can-see: " + t));
+        QVERIFY2(!t.contains("Private", Qt::CaseInsensitive),
+                 qPrintable("pill must never imply a private owner: " + t));
+        QVERIFY2(t.contains("Public", Qt::CaseInsensitive)
+                     && t.contains("public ledger", Qt::CaseInsensitive),
+                 qPrintable("pill must state the honest public truth: " + t));
+        dlg->close();
+    }
+
+    // -- #119 (b): even when an item somehow carries isPrivate==true, the pill stays
+    //    honest (the dead branch was removed — it can never resurrect the lie).
+    void nftDetail_pillHonestEvenIfIsPrivateTrue() {
+        ContentEngine engine(nullptr);
+        NFTItem it; it.name = "Legacy"; it.txid = "tok2";
+        it.docHashHex = "bb"; it.cachePath = ""; it.isPrivate = true; it.verifyState = 0;
+        QVector<NFTItem> ordered; ordered.push_back(it);
+
+        NFTDetailDialog* dlg = new NFTDetailDialog(it, ordered, 0, &engine, nullptr);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        auto* pill = dlg->findChild<QLabel*>("nftDetailPrivacyPill");
+        QVERIFY(pill);
+        QVERIFY2(!pill->text().contains("shielded", Qt::CaseInsensitive),
+                 qPrintable("isPrivate==true must NOT resurrect the shielded claim: " + pill->text()));
+        QVERIFY2(pill->text().contains("Public", Qt::CaseInsensitive),
+                 qPrintable("pill must stay Public regardless of isPrivate: " + pill->text()));
+        dlg->close();
+    }
+
+    // -- #119 (a): the NFTItem default must be PUBLIC (isPrivate==false).
+    void nftItem_defaultsPublic() {
+        NFTItem it;
+        QVERIFY2(it.isPrivate == false, "NFTItem must default to public (isPrivate==false)");
+    }
+
+    // -- #119 (d): a mismatch item's Send opens with Send HARD-disabled and there is
+    //    NO "Send anyway?" override modal (the override offered an action that doesn't
+    //    exist). We drive onSendGift indirectly: with the prompt removed, the Send
+    //    button on the detail dialog is enabled (the *send dialog* is where the gate
+    //    lives); the regression is that NO QMessageBox blocks. Since exec() on the
+    //    nested NFTSendDialog would block offscreen, we assert the SOURCE invariant via
+    //    the send dialog gate (proven elsewhere) + that the detail Sell/Send buttons
+    //    behave honestly for a mismatch (Sell disabled).
+    void nftDetail_mismatchSellDisabledNoOverride() {
+        ContentEngine engine(nullptr);
+        NFTItem it; it.name = "Tampered"; it.txid = "tok3";
+        it.docHashHex = "cc"; it.cachePath = ""; it.isPrivate = false; it.verifyState = 2;
+        QVector<NFTItem> ordered; ordered.push_back(it);
+
+        NFTDetailDialog* dlg = new NFTDetailDialog(it, ordered, 0, &engine, nullptr);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        auto* sell = dlg->findChild<QPushButton*>("nftDetailSellButton");
+        QVERIFY2(sell, "detail dialog must expose the Sell button");
+        QVERIFY2(!sell->isEnabled(), "Sell must be disabled for a tampered (mismatch) collectible");
+        dlg->close();
+    }
+
+    // -- L1 lock on the price->zat conversion (the ONE money conversion).
+    void nftSell_zclToZatConversionExact() {
+        QCOMPARE(RPC::zclToZat(1.0),        (qint64)100000000);
+        QCOMPARE(RPC::zclToZat(0.00000001), (qint64)1);
+        QCOMPARE(RPC::zclToZat(1.23456789), (qint64)123456789);
+        QCOMPARE(RPC::zclToZat(0.0),        (qint64)0);
+        QCOMPARE(RPC::zclToZat(-5.0),       (qint64)0);
+    }
+
+    // -- SELL: List gated until a valid price AND a valid buyer t-address; zs rejected.
+    void nftSell_listGatedUntilPriceAndBuyerAddr() {
+        MainWindow* w = makeWindow();
+        NFTItem it; it.name = "ForSale"; it.txid = "toks1";
+        it.docHashHex = "dd"; it.isPrivate = false; it.verifyState = 1;
+
+        NFTSellDialog* dlg = new NFTSellDialog(it, w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* price = dlg->findChild<QLineEdit*>("nftSellPriceEdit");
+        auto* buyer = dlg->findChild<QLineEdit*>("nftSellBuyerAddrEdit");
+        auto* list  = dlg->findChild<QPushButton*>("nftSellListButton");
+        auto* note  = dlg->findChild<QLabel*>("nftSellPublicNote");
+        QVERIFY(price && buyer && list && note);
+
+        // Honest public-settlement line present: the trade is public and BOTH addresses
+        // (plus the price) are visible on the ledger. New copy: "This trade is public —
+        // the price and both addresses are visible on the ledger."
+        QVERIFY2(note->text().contains("public", Qt::CaseInsensitive)
+                     && note->text().contains("addresses are visible", Qt::CaseInsensitive),
+                 qPrintable("sell must state the public-settlement truth: " + note->text()));
+
+        QVERIFY2(!list->isEnabled(), "List disabled at open (no price, no buyer)");
+
+        price->setText("100");
+        QVERIFY2(!list->isEnabled(), "List stays disabled with a price but no buyer addr");
+
+        // A shielded address must be rejected (the daemon needs a public t-addr).
+        buyer->setText("zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u");
+        QVERIFY2(!list->isEnabled(), "List must reject a shielded (zs) buyer address");
+
+        buyer->setText("t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi");
+        QVERIFY2(list->isEnabled(), "List enabled with a valid price + buyer t-address");
+
+        // Clearing the price re-disables.
+        price->clear();
+        QVERIFY2(!list->isEnabled(), "List re-disabled when the price is cleared");
+        dlg->close();
+    }
+
+    // -- SELL: a mismatch item shows a red warning + List hard-disabled.
+    void nftSell_mismatchDisablesList() {
+        MainWindow* w = makeWindow();
+        NFTItem it; it.name = "Bad"; it.txid = "toks2";
+        it.docHashHex = "ee"; it.isPrivate = false; it.verifyState = 2;
+
+        NFTSellDialog* dlg = new NFTSellDialog(it, w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* warn  = dlg->findChild<QLabel*>("nftSellMismatchWarning");
+        auto* price = dlg->findChild<QLineEdit*>("nftSellPriceEdit");
+        auto* buyer = dlg->findChild<QLineEdit*>("nftSellBuyerAddrEdit");
+        auto* list  = dlg->findChild<QPushButton*>("nftSellListButton");
+        QVERIFY2(warn, "mismatch item must show the red warning label");
+        QVERIFY(price && buyer && list);
+
+        // Even with a valid price + buyer, List stays disabled for a tampered item.
+        price->setText("100");
+        buyer->setText("t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi");
+        QVERIFY2(!list->isEnabled(), "List must stay disabled for a verifyState==2 item");
+        dlg->close();
+    }
+
+    // -- SELL: a successful List shows the blob + Copy/Save/Cancel + a "Listed" badge.
+    void nftSell_successShowsBlobCopySaveCancel() {
+        MainWindow* w = makeWindow();
+        w->getRPC()->testSetNextOfferResult("znftoffer:AAAA", "offerid01", "tok:0");
+
+        NFTItem it; it.name = "Goods"; it.txid = "toks3";
+        it.docHashHex = "ff"; it.isPrivate = false; it.verifyState = 1;
+        NFTSellDialog* dlg = new NFTSellDialog(it, w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* price = dlg->findChild<QLineEdit*>("nftSellPriceEdit");
+        auto* buyer = dlg->findChild<QLineEdit*>("nftSellBuyerAddrEdit");
+        auto* list  = dlg->findChild<QPushButton*>("nftSellListButton");
+        QVERIFY(price && buyer && list);
+        price->setText("100");
+        buyer->setText("t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi");
+        QVERIFY(list->isEnabled());
+        list->click();
+
+        QVERIFY2(pumpUntil([&]{ return dlg->findChild<QPlainTextEdit*>("nftSellOfferBlob") != nullptr; }),
+                 "the offer blob view must appear after a successful List");
+        auto* blob   = dlg->findChild<QPlainTextEdit*>("nftSellOfferBlob");
+        auto* copy   = dlg->findChild<QPushButton*>("nftSellCopyButton");
+        auto* save   = dlg->findChild<QPushButton*>("nftSellSaveButton");
+        auto* cancel = dlg->findChild<QPushButton*>("nftSellCancelButton");
+        auto* badge  = dlg->findChild<QLabel*>("nftSellListedBadge");
+        QVERIFY2(blob && copy && save && cancel && badge,
+                 "listed state must expose blob + Copy + Save + Cancel + Listed badge");
+        QCOMPARE(blob->toPlainText(), QString("znftoffer:AAAA"));
+        QVERIFY2(badge->text().contains("Listed", Qt::CaseInsensitive),
+                 qPrintable("listed badge copy: " + badge->text()));
+        QCOMPARE(dlg->lastOfferId(), QString("offerid01"));
+        dlg->close();
+    }
+
+    // -- BUY: a green verify renders the green verdict + enables Buy (after ack).
+    void nftBuy_verifyGreenEnablesBuy() {
+        MainWindow* w = makeWindow();
+        ContentEngine engine(nullptr);
+
+        NFTVerifyResult vr; vr.ok = true; vr.tokenId = "tokbuy01";
+        vr.priceZat = 250000000; vr.expiryHeight = 99999;
+        w->getRPC()->testSetNextVerifyResult(vr);
+
+        NFTBuyDialog* dlg = new NFTBuyDialog(&engine, w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* verdict = dlg->findChild<QLabel*>("nftBuyVerdict");
+        auto* price   = dlg->findChild<QLabel*>("nftBuyPrice");
+        auto* buy     = dlg->findChild<QPushButton*>("nftBuyButton");
+        auto* ack     = dlg->findChild<QCheckBox*>("nftBuyAcknowledge");
+        QVERIFY(verdict && price && buy && ack);
+
+        QVERIFY2(!buy->isEnabled(), "Buy must be disabled before any verify");
+        dlg->testPasteOffer("znftoffer:GREEN");
+
+        QVERIFY2(pumpUntil([&]{ return verdict->text().contains("Verified", Qt::CaseInsensitive); }),
+                 qPrintable("verdict after green verify: " + verdict->text()));
+        QVERIFY2(price->text().contains("2.5", Qt::CaseInsensitive),
+                 qPrintable("price must render the ZCL amount: " + price->text()));
+        // Buy still disabled until the overshoot acknowledgement is checked.
+        QVERIFY2(!buy->isEnabled(), "Buy must require the overshoot acknowledgement");
+        ack->setChecked(true);
+        QVERIFY2(buy->isEnabled(), "Buy must enable on a green verify + ack");
+        dlg->close();
+    }
+
+    // -- BUY: a failed verify shows AMBER + the reason and keeps Buy disabled (no
+    //    green badge without a real ok).
+    void nftBuy_verifyFailShowsAmberReasonBuyDisabled() {
+        MainWindow* w = makeWindow();
+        ContentEngine engine(nullptr);
+
+        NFTVerifyResult vr; vr.ok = false; vr.tokenId = "tokbad01";
+        vr.priceZat = 100000000;
+        vr.reasons << "vin[0] is not a live (unspent) UTXO";
+        w->getRPC()->testSetNextVerifyResult(vr);
+
+        NFTBuyDialog* dlg = new NFTBuyDialog(&engine, w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* verdict = dlg->findChild<QLabel*>("nftBuyVerdict");
+        auto* buy     = dlg->findChild<QPushButton*>("nftBuyButton");
+        auto* ack     = dlg->findChild<QCheckBox*>("nftBuyAcknowledge");
+        QVERIFY(verdict && buy && ack);
+
+        dlg->testPasteOffer("znftoffer:FORGED");
+        QVERIFY2(pumpUntil([&]{ return verdict->text().contains("Don't pay", Qt::CaseInsensitive); }),
+                 qPrintable("amber verdict after failed verify: " + verdict->text()));
+        QVERIFY2(verdict->text().contains("not a live", Qt::CaseInsensitive),
+                 qPrintable("amber verdict must carry the honest reason: " + verdict->text()));
+        QVERIFY2(!verdict->text().contains("Verified", Qt::CaseInsensitive),
+                 "a failed verify must NEVER say Verified");
+        // Even checking ack cannot enable Buy on a non-ok verify.
+        ack->setChecked(true);
+        QVERIFY2(!buy->isEnabled(), "Buy must stay disabled on a failed verify even with ack");
+        dlg->close();
+    }
+
+    // -- BUY: editing the offer after a green verify re-disables Buy (anti-stale).
+    void nftBuy_editAfterVerifyResetsGate() {
+        MainWindow* w = makeWindow();
+        ContentEngine engine(nullptr);
+
+        NFTVerifyResult vr; vr.ok = true; vr.tokenId = "tokstale";
+        vr.priceZat = 100000000;
+        w->getRPC()->testSetNextVerifyResult(vr);
+
+        NFTBuyDialog* dlg = new NFTBuyDialog(&engine, w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* input = dlg->findChild<QPlainTextEdit*>("nftBuyOfferInput");
+        auto* buy   = dlg->findChild<QPushButton*>("nftBuyButton");
+        auto* ack   = dlg->findChild<QCheckBox*>("nftBuyAcknowledge");
+        QVERIFY(input && buy && ack);
+
+        dlg->testPasteOffer("znftoffer:GREEN2");
+        QVERIFY(pumpUntil([&]{ return dlg->verifyResult().ok; }));
+        ack->setChecked(true);
+        QVERIFY(buy->isEnabled());
+
+        // Edit the offer -> the green verdict is invalidated, Buy re-disabled.
+        input->setPlainText("znftoffer:TAMPERED");
+        QVERIFY2(!buy->isEnabled(), "editing the offer after a green verify must re-disable Buy");
+        QVERIFY2(!dlg->verifyResult().ok, "an edit must clear the verified flag");
+        dlg->close();
+    }
+
+    // -- BUY: a successful take becomes "Done" + shows the overshoot, NOT auto-accepted.
+    void nftBuy_successBecomesDoneOnItsWay() {
+        MainWindow* w = makeWindow();
+        ContentEngine engine(nullptr);
+
+        NFTVerifyResult vr; vr.ok = true; vr.tokenId = "tokwin";
+        vr.priceZat = 100000000;
+        w->getRPC()->testSetNextVerifyResult(vr);
+        w->getRPC()->testSetNextTakeResult("txwin0001", 12345);   // overshoot 12345 zat
+
+        NFTBuyDialog* dlg = new NFTBuyDialog(&engine, w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* buy    = dlg->findChild<QPushButton*>("nftBuyButton");
+        auto* ack    = dlg->findChild<QCheckBox*>("nftBuyAcknowledge");
+        auto* result = dlg->findChild<QLabel*>("nftBuyResultLine");
+        QVERIFY(buy && ack && result);
+
+        dlg->testPasteOffer("znftoffer:WIN");
+        QVERIFY(pumpUntil([&]{ return dlg->verifyResult().ok; }));
+        ack->setChecked(true);
+        QVERIFY(buy->isEnabled());
+        buy->click();
+
+        QVERIFY2(pumpUntil([&]{ return buy->text() == QString("Done"); }),
+                 "Buy must become Done after a successful purchase");
+        QVERIFY2(result->text().contains("on its way", Qt::CaseInsensitive),
+                 qPrintable("success copy: " + result->text()));
+        QVERIFY2(result->text().contains("fee", Qt::CaseInsensitive),
+                 qPrintable("overshoot/fee must be shown: " + result->text()));
+        QCOMPARE(dlg->lastTxid(), QString("txwin0001"));
+        QCOMPARE(dlg->lastOvershootZat(), (qint64)12345);
+        // NOT auto-accepted: the dialog is still visible (the user dismisses via Done).
+        QVERIFY2(dlg->isVisible(), "success must NOT auto-accept the dialog");
+        dlg->close();
+    }
+
+    // -- BUY: nothing installed -> perpetual in-flight -> [X] swallowed (UAF guard).
+    void nftBuy_closeSwallowedWhileInFlight() {
+        MainWindow* w = makeWindow();
+        ContentEngine engine(nullptr);
+
+        NFTVerifyResult vr; vr.ok = true; vr.tokenId = "tokhold";
+        vr.priceZat = 100000000;
+        w->getRPC()->testSetNextVerifyResult(vr);
+        // Install NO take result -> nftTakeOffer returns without firing a callback.
+
+        NFTBuyDialog* dlg = new NFTBuyDialog(&engine, w->getRPC(), w);
+        // NOT WA_DeleteOnClose here: we assert the dialog survives the close attempt.
+        dlg->show();
+
+        auto* buy = dlg->findChild<QPushButton*>("nftBuyButton");
+        auto* ack = dlg->findChild<QCheckBox*>("nftBuyAcknowledge");
+        QVERIFY(buy && ack);
+        dlg->testPasteOffer("znftoffer:HOLD");
+        QVERIFY(pumpUntil([&]{ return dlg->verifyResult().ok; }));
+        ack->setChecked(true);
+        QVERIFY(buy->isEnabled());
+        buy->click();
+        QVERIFY2(pumpUntil([&]{ return buy->text() == QString("Buying…"); }),
+                 "Buy must enter the in-flight Buying… state");
+
+        dlg->close();   // must be SWALLOWED while in flight
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+        QVERIFY2(dlg->isVisible(), "close must be swallowed while the take RPC is in flight");
+        delete dlg;     // we own it (no WA_DeleteOnClose)
+    }
+
+    // -- C-4 (DRY): the public-trade honesty sentence must be IDENTICAL in the sell
+    //    and buy dialogs (both now read it from nftPublicTradeNote()). A drift here
+    //    would split the translation entry and risk one dialog saying something the
+    //    other doesn't. Also assert it carries the load-bearing honesty words.
+    void nftCommon_publicTradeNoteIdenticalSellAndBuy() {
+        MainWindow* w = makeWindow();
+        ContentEngine engine(nullptr);
+
+        NFTItem it; it.txid = "tokcommon01"; it.name = "Common"; it.verifyState = 1;
+        NFTSellDialog* sell = new NFTSellDialog(it, w->getRPC(), w);
+        sell->setAttribute(Qt::WA_DeleteOnClose);
+        NFTBuyDialog* buy = new NFTBuyDialog(&engine, w->getRPC(), w);
+        buy->setAttribute(Qt::WA_DeleteOnClose);
+
+        auto* sellNote = sell->findChild<QLabel*>("nftSellPublicNote");
+        auto* buyNote  = buy->findChild<QLabel*>("nftBuyPublicNote");
+        QVERIFY(sellNote && buyNote);
+        QCOMPARE(sellNote->text(), buyNote->text());   // single source -> identical
+        // New copy: "This trade is public — the price and both addresses are visible on the
+        // ledger." The load-bearing honesty word is "public" (the trade is not private).
+        QVERIFY2(sellNote->text().contains("public", Qt::CaseInsensitive)
+                     && sellNote->text().contains("visible", Qt::CaseInsensitive),
+                 qPrintable("public-trade note must stay honest: " + sellNote->text()));
+        sell->close();
+        buy->close();
+    }
+
+    // -- C-4 (DRY): the shared 4-state t-address validator must paint the SAME copy
+    //    in the send and sell dialogs for the same input (both call
+    //    nftValidateTAddrInto). We drive the green (valid t-address) state and the
+    //    not-an-address red state; the shielded-specific hint legitimately differs.
+    void nftCommon_tAddrValidatorSharedCopy() {
+        MainWindow* w = makeWindow();
+
+        NFTItem it; it.txid = "tokcommon02"; it.name = "Common2"; it.verifyState = 1;
+        NFTSendDialog* send = new NFTSendDialog(it, w->getRPC(), w);
+        send->setAttribute(Qt::WA_DeleteOnClose);
+        NFTSellDialog* sell = new NFTSellDialog(it, w->getRPC(), w);
+        sell->setAttribute(Qt::WA_DeleteOnClose);
+
+        auto* sendRcpt   = send->findChild<QLineEdit*>("nftSendRecipientEdit");
+        auto* sendStatus = send->findChild<QLabel*>("nftSendAddrStatus");
+        auto* sellBuyer  = sell->findChild<QLineEdit*>("nftSellBuyerAddrEdit");
+        auto* sellStatus = sell->findChild<QLabel*>("nftSellBuyerStatus");
+        QVERIFY(sendRcpt && sendStatus && sellBuyer && sellStatus);
+
+        // Valid t-address -> identical green/amber "Looks good" copy in both dialogs.
+        const QString tAddr = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        sendRcpt->setText(tAddr);
+        sellBuyer->setText(tAddr);
+        QCOMPARE(sendStatus->text(), sellStatus->text());
+        QVERIFY2(sendStatus->text().contains("Looks good", Qt::CaseInsensitive),
+                 qPrintable("valid-taddr copy: " + sendStatus->text()));
+
+        // Garbage -> identical "doesn't look like a ZClassic address" copy.
+        sendRcpt->setText("not-an-address");
+        sellBuyer->setText("not-an-address");
+        QCOMPARE(sendStatus->text(), sellStatus->text());
+        QVERIFY2(sendStatus->text().contains("doesn't look like", Qt::CaseInsensitive),
+                 qPrintable("invalid-addr copy: " + sendStatus->text()));
+        send->close();
+        sell->close();
+    }
+
+    // =======================================================================
+    // SHIELD — private file send/receive (ZDC1 data-channel). Driven via the RPC
+    // test seams (testSetNextSendDataFileResult / DataTransferResult / List) +
+    // the ShieldSendDialog::testPickFile seam, under ZCL_WIDGET_TEST + offscreen.
+    // The coin is ZCL; the feature makes only FILE CONTENT private.
+    // =======================================================================
+
+    static const char* SAPLING_ZS_A() {
+        return "zs1gv64eu0v2wx7raxqxlmj354y9ycznwaau9kduljzczxztvs4qcl00kn2sjxtejvrxnkucw5xx9u";
+    }
+    static const char* SAPLING_ZS_B() {
+        return "zs10m00rvkhfm4f7n23e4sxsx275r7ptnggx39ygl0vy46j9mdll5c97gl6dxgpk0njuptg2mn9w5s";
+    }
+
+    // Write a small binary file (with a NUL + high byte) and return its path.
+    QString writeSmallBinary(const QString& dir, const QString& name, int bytes) {
+        const QString p = QDir(dir).filePath(name);
+        QFile f(p);
+        if (!f.open(QIODevice::WriteOnly)) return QString();
+        QByteArray data;
+        for (int i = 0; i < bytes; ++i)
+            data.append(char(i % 256));   // includes 0x00 and high bytes -> binary-safe path
+        f.write(data); f.close();
+        return p;
+    }
+
+    // -- SHIELD SEND: Send gated until file + recipient + consent; consent is mandatory.
+    void shieldSend_consentMandatoryAndGating() {
+        MainWindow* w = makeWindow();
+        // Install a wallet Sapling z-addr so the From combo has a valid spending addr.
+        auto* zs = new QList<QString>(); zs->append(SAPLING_ZS_A());
+        w->getRPC()->testSetZAddresses(zs);
+
+        ShieldSendDialog* dlg = new ShieldSendDialog(w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* to      = dlg->findChild<QLineEdit*>("shieldSendToEdit");
+        auto* consent = dlg->findChild<QCheckBox*>("shieldSendConsentCheck");
+        auto* send    = dlg->findChild<QPushButton*>("shieldSendButton");
+        QVERIFY(to && consent && send);
+        QVERIFY2(!send->isEnabled(), "Send must be disabled at open (no file/recipient/consent)");
+
+        // Pick a valid small binary file (the From combo is already a valid Sapling addr).
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        const QString file = writeSmallBinary(tmp.path(), "payload.bin", 256);
+        QVERIFY(!file.isEmpty());
+        dlg->testPickFile(file);
+
+        // A valid Sapling recipient -> still disabled until consent is ticked.
+        to->setText(SAPLING_ZS_B());
+        QVERIFY2(!send->isEnabled(), "Send must stay DISABLED until permanence consent is ticked");
+
+        // Tick consent -> Send enabled.
+        consent->setChecked(true);
+        QVERIFY2(send->isEnabled(), "Send must enable once file + recipient + consent are all present");
+
+        // Untick consent -> disabled again (consent is not a one-way latch).
+        consent->setChecked(false);
+        QVERIFY2(!send->isEnabled(), "unticking consent must disable Send again");
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- SHIELD SEND: a too-large file is rejected UP FRONT (no RPC), Send stays disabled.
+    void shieldSend_oversizeRejectedUpFront() {
+        MainWindow* w = makeWindow();
+        auto* zs = new QList<QString>(); zs->append(SAPLING_ZS_A());
+        w->getRPC()->testSetZAddresses(zs);
+
+        ShieldSendDialog* dlg = new ShieldSendDialog(w->getRPC(), w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* to      = dlg->findChild<QLineEdit*>("shieldSendToEdit");
+        auto* consent = dlg->findChild<QCheckBox*>("shieldSendConsentCheck");
+        auto* send    = dlg->findChild<QPushButton*>("shieldSendButton");
+        auto* fileLine= dlg->findChild<QLabel*>("shieldSendFileLine");
+        QVERIFY(to && consent && send && fileLine);
+
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        const QString big = writeSmallBinary(tmp.path(), "big.bin", 41000);   // > 40000 cap
+        QVERIFY(!big.isEmpty());
+        dlg->testPickFile(big);
+
+        QVERIFY2(fileLine->text().contains("too large", Qt::CaseInsensitive),
+                 qPrintable("oversize message: " + fileLine->text()));
+        // Even with a valid recipient + consent, Send stays disabled (no hex payload set).
+        to->setText(SAPLING_ZS_B());
+        consent->setChecked(true);
+        QVERIFY2(!send->isEnabled(), "an oversize file must keep Send disabled (rejected up front)");
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- SHIELD SEND: success -> Done + fingerprint + disclosure key surfaced + NOT auto-accepted.
+    void shieldSend_successShowsFingerprintAndKey() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+        auto* zs = new QList<QString>(); zs->append(SAPLING_ZS_A());
+        rpc->testSetZAddresses(zs);
+
+        ShieldSendDialog* dlg = new ShieldSendDialog(rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* to      = dlg->findChild<QLineEdit*>("shieldSendToEdit");
+        auto* consent = dlg->findChild<QCheckBox*>("shieldSendConsentCheck");
+        auto* send    = dlg->findChild<QPushButton*>("shieldSendButton");
+        QVERIFY(to && consent && send);
+
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        const QString file = writeSmallBinary(tmp.path(), "p.bin", 100);
+        dlg->testPickFile(file);
+        to->setText(SAPLING_ZS_B());
+        consent->setChecked(true);
+        QVERIFY(pumpUntil([&]{ return send->isEnabled(); }));
+
+        SendDataFileResult r;
+        r.operationId = "opid-1";
+        r.transferId  = "00112233aabbccdd";
+        r.fingerprint = QString(64, QChar('a'));
+        r.key         = QString(64, QChar('b'));
+        r.frames      = 2;
+        rpc->testSetNextSendDataFileResult(r);
+        send->click();
+
+        QVERIFY2(pumpUntil([&]{ return send->text() == QString("Done"); }),
+                 qPrintable("Send did not retire to Done: " + send->text()));
+        QVERIFY2(dlg->result() != QDialog::Accepted,
+                 "shield send must NOT auto-accept on success");
+
+        // The fingerprint + disclosure key fields are now present + carry the values.
+        auto* fpField  = dlg->findChild<QLineEdit*>("shieldSendFingerprintField");
+        auto* keyField = dlg->findChild<QLineEdit*>("shieldSendKeyField");
+        QVERIFY2(fpField,  "the content fingerprint field must appear on success");
+        QVERIFY2(keyField, "the disclosure key field must appear on success");
+        QCOMPARE(fpField->text(), r.fingerprint);
+        QCOMPARE(keyField->text(), r.key);
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- SHIELD SEND: the [X]/close is swallowed while the send RPC is in flight (UAF guard).
+    void shieldSend_closeSwallowedWhileInFlight() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+        auto* zs = new QList<QString>(); zs->append(SAPLING_ZS_A());
+        rpc->testSetZAddresses(zs);
+
+        ShieldSendDialog* dlg = new ShieldSendDialog(rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* to      = dlg->findChild<QLineEdit*>("shieldSendToEdit");
+        auto* consent = dlg->findChild<QCheckBox*>("shieldSendConsentCheck");
+        auto* send    = dlg->findChild<QPushButton*>("shieldSendButton");
+        QVERIFY(to && consent && send);
+
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        dlg->testPickFile(writeSmallBinary(tmp.path(), "p.bin", 80));
+        to->setText(SAPLING_ZS_B());
+        consent->setChecked(true);
+        QVERIFY(pumpUntil([&]{ return send->isEnabled(); }));
+
+        // Nothing installed -> the send RPC never resolves -> perpetual in-flight.
+        send->click();
+        QVERIFY2(pumpUntil([&]{ return send->text() == QString("Encrypting and sending…"); }),
+                 qPrintable("Send did not enter in-flight state: " + send->text()));
+        dlg->close();   // must be SWALLOWED while in flight
+        QCoreApplication::processEvents();
+        QVERIFY2(dlg->isVisible(), "close must be swallowed while the send RPC is in flight");
+        QVERIFY2(dlg->result() != QDialog::Accepted, "must not accept while in flight");
+
+        w->deleteLater();
+    }
+
+    // -- SHIELD SEND: channel-off (-32601) maps to the calm "enable in Settings" line.
+    void shieldSend_channelOffCalmError() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+        auto* zs = new QList<QString>(); zs->append(SAPLING_ZS_A());
+        rpc->testSetZAddresses(zs);
+
+        ShieldSendDialog* dlg = new ShieldSendDialog(rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* to      = dlg->findChild<QLineEdit*>("shieldSendToEdit");
+        auto* consent = dlg->findChild<QCheckBox*>("shieldSendConsentCheck");
+        auto* send    = dlg->findChild<QPushButton*>("shieldSendButton");
+        auto* result  = dlg->findChild<QLabel*>("shieldSendResultLine");
+        QVERIFY(to && consent && send && result);
+
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        dlg->testPickFile(writeSmallBinary(tmp.path(), "p.bin", 60));
+        to->setText(SAPLING_ZS_B());
+        consent->setChecked(true);
+        QVERIFY(pumpUntil([&]{ return send->isEnabled(); }));
+
+        // The seam fires the error cb with the calm channel-off message (as the real
+        // datachannelCalmError would for -32601).
+        rpc->testSetNextNftError(QStringLiteral(
+            "Private file transfers are turned off on your node. Turn on “Enable private "
+            "file transfers” in Settings → Privacy, then restart, to use this."));
+        send->click();
+
+        QVERIFY2(pumpUntil([&]{ return result->text().contains("turned off", Qt::CaseInsensitive)
+                                       && result->text().contains("Settings", Qt::CaseInsensitive); }),
+                 qPrintable("channel-off calm error: " + result->text()));
+        // After an error the primary returns to a retryable state (Try again), not Done.
+        QVERIFY2(send->text() == QString("Try again"),
+                 qPrintable("after error Send should read Try again: " + send->text()));
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- SHIELD RECEIVE: verified+complete -> success line + Save enabled.
+    void shieldReceive_verifiedEnablesSave() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+
+        ShieldReceiveDialog* dlg = new ShieldReceiveDialog(rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* id    = dlg->findChild<QLineEdit*>("shieldReceiveIdEdit");
+        auto* look  = dlg->findChild<QPushButton*>("shieldReceiveLookupButton");
+        auto* state = dlg->findChild<QLabel*>("shieldReceiveStateLine");
+        auto* save  = dlg->findChild<QPushButton*>("shieldReceiveSaveButton");
+        QVERIFY(id && look && state && save);
+        QVERIFY2(!save->isEnabled(), "Save must be disabled until a file verifies");
+
+        DataTransferResult r;
+        r.verified = true; r.complete = true;
+        r.hexData  = QString::fromLatin1(QByteArray("hello").toHex());
+        r.size     = 5; r.filename = "hello.txt"; r.contentType = "text/plain";
+        rpc->testSetNextDataTransferResult(r);
+
+        id->setText(QString(64, QChar('a')));
+        look->click();
+
+        QVERIFY2(pumpUntil([&]{ return state->text().contains("verified", Qt::CaseInsensitive); }),
+                 qPrintable("verified state line: " + state->text()));
+        QVERIFY2(save->isEnabled(), "Save must enable ONLY after verify+decrypt");
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- SHIELD RECEIVE: the four honest failure states stay DISTINCT (no generic "failed",
+    //    no fake "try again" on a hard refusal), and Save NEVER enables on failure.
+    void shieldReceive_distinctFailureStates() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+
+        struct Case { QString error; bool complete; QString expect; bool refusal; };
+        const QList<Case> cases = {
+            { "content hash mismatch after reassembly",          true,  "doesn't match", true  },
+            { "AEAD verification failed (tamper or wrong key)",  true,  "tampered",      true  },
+            { "key not yet available (sealed)",                  true,  "addressed to you", false },
+            { "transfer incomplete (missing frames)",            false, "haven't confirmed", false },
+        };
+        for (const Case& c : cases) {
+            ShieldReceiveDialog* dlg = new ShieldReceiveDialog(rpc, w);
+            dlg->setAttribute(Qt::WA_DeleteOnClose);
+            dlg->show();
+            auto* id    = dlg->findChild<QLineEdit*>("shieldReceiveIdEdit");
+            auto* look  = dlg->findChild<QPushButton*>("shieldReceiveLookupButton");
+            auto* state = dlg->findChild<QLabel*>("shieldReceiveStateLine");
+            auto* save  = dlg->findChild<QPushButton*>("shieldReceiveSaveButton");
+            QVERIFY(id && look && state && save);
+
+            DataTransferResult r;
+            r.verified = false; r.complete = c.complete; r.error = c.error;
+            rpc->testSetNextDataTransferResult(r);
+            id->setText(QString(64, QChar('c')));
+            look->click();
+
+            QVERIFY2(pumpUntil([&]{ return state->text().contains(c.expect, Qt::CaseInsensitive); }),
+                     qPrintable("state for [" + c.error + "] -> " + state->text()));
+            QVERIFY2(!save->isEnabled(), "Save must NEVER enable on a failure");
+            if (c.refusal)
+                QVERIFY2(!state->text().contains("try again", Qt::CaseInsensitive),
+                         qPrintable("a hard refusal must NOT say try again: " + state->text()));
+            dlg->close();
+        }
+        w->deleteLater();
+    }
+
+    // -- SHIELD SEND: the recipient field is a FULL 4-state validator, and (unlike the
+    //    NFT-send t-addr validator) the data-channel needs a SAPLING (zs…) recipient.
+    //    States: (1) empty -> no status, Send disabled; (2) garbage -> red "doesn't
+    //    look like a ZClassic address"; (3) a valid t-addr or Sprout z-addr -> red
+    //    "need a Sapling (zs…) recipient" (the channel is Sapling-only) — and Send
+    //    stays disabled even with file+consent present; (4) a valid Sapling zs-addr ->
+    //    green "Looks good". This is the inverse-polarity validator the spec (§6.4)
+    //    requires, so it gets its own coverage separate from the NFT-send t-addr one.
+    void shieldSend_recipientFourStateValidation() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+        auto* zs = new QList<QString>(); zs->append(SAPLING_ZS_A());
+        rpc->testSetZAddresses(zs);
+
+        ShieldSendDialog* dlg = new ShieldSendDialog(rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* to      = dlg->findChild<QLineEdit*>("shieldSendToEdit");
+        auto* status  = dlg->findChild<QLabel*>("shieldSendToStatus");
+        auto* consent = dlg->findChild<QCheckBox*>("shieldSendConsentCheck");
+        auto* send    = dlg->findChild<QPushButton*>("shieldSendButton");
+        QVERIFY(to && status && consent && send);
+
+        // Pre-arm the OTHER gates (valid file + consent) so the recipient state is the
+        // sole remaining lever on Send for the t-addr/Sprout case below.
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        dlg->testPickFile(writeSmallBinary(tmp.path(), "p.bin", 64));
+        consent->setChecked(true);
+
+        // State 1 — empty: no status text, Send disabled.
+        to->setText("");
+        QVERIFY2(status->text().isEmpty(), qPrintable("empty -> no status: " + status->text()));
+        QVERIFY2(!send->isEnabled(), "empty recipient must keep Send disabled");
+
+        // State 2 — garbage: red "doesn't look like a ZClassic address".
+        to->setText("not-an-address");
+        QVERIFY2(status->text().contains("doesn't look like", Qt::CaseInsensitive),
+                 qPrintable("garbage -> red invalid copy: " + status->text()));
+        QVERIFY2(!send->isEnabled(), "garbage recipient must keep Send disabled");
+
+        // State 3 — a valid t-addr is a real ZClassic address but the channel is
+        // Sapling-only: it must be REFUSED with the "need a Sapling (zs…)" hint, and
+        // Send must stay disabled even though file + consent are present.
+        to->setText("t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi");
+        QVERIFY2(status->text().contains("Sapling", Qt::CaseInsensitive),
+                 qPrintable("t-addr -> Sapling-only hint: " + status->text()));
+        QVERIFY2(!send->isEnabled(),
+                 "a valid t-addr recipient must NOT enable a Sapling-only private send");
+
+        // State 4 — a valid Sapling zs-addr: green "Looks good", and with file+consent
+        // already set, Send finally enables.
+        to->setText(SAPLING_ZS_B());
+        QVERIFY2(status->text().contains("Looks good", Qt::CaseInsensitive),
+                 qPrintable("zs-addr -> green ok copy: " + status->text()));
+        QVERIFY2(send->isEnabled(),
+                 "a valid Sapling recipient (+ file + consent) must enable Send");
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- SHIELD RECEIVE (Mode A): the cross-wallet "open the file linked to a token you
+    //    hold" path. prefillFingerprint(<64-hex>) fills the lookup box with the NFT's
+    //    document_hash and immediately runs verify-before-decrypt by FINGERPRINT (no
+    //    transfer_id). On a verified+complete result the success line shows and Save
+    //    enables — exercising the registry-free cross-wallet receive seam.
+    void shieldReceive_crossWalletByFingerprintPrefill() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+
+        DataTransferResult r;
+        r.verified = true; r.complete = true;
+        r.hexData  = QString::fromLatin1(QByteArray("xwallet-bytes").toHex());
+        r.size     = 13; r.filename = "art.png"; r.contentType = "image/png";
+        const QString fp = QString(64, QChar('f'));
+        r.fingerprint = fp;
+        rpc->testSetNextDataTransferResult(r);
+
+        ShieldReceiveDialog* dlg = new ShieldReceiveDialog(rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* id    = dlg->findChild<QLineEdit*>("shieldReceiveIdEdit");
+        auto* state = dlg->findChild<QLabel*>("shieldReceiveStateLine");
+        auto* save  = dlg->findChild<QPushButton*>("shieldReceiveSaveButton");
+        QVERIFY(id && state && save);
+
+        // Mode A entry: pre-fill the held token's fingerprint and run the lookup.
+        dlg->prefillFingerprint(fp);
+
+        // The lookup box reflects the fingerprint and the verify-by-fingerprint path
+        // reached a verified result -> Save enabled.
+        QVERIFY2(pumpUntil([&]{ return state->text().contains("verified", Qt::CaseInsensitive); }),
+                 qPrintable("cross-wallet by-fingerprint verified line: " + state->text()));
+        QCOMPARE(id->text(), fp);
+        QVERIFY2(save->isEnabled(), "a verified cross-wallet open must enable Save");
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // -- SHIELD RECEIVE: verify-BEFORE-open means a HASH_MISMATCH refusal leaks NO
+    //    plaintext. The daemon never returns hexdata on a verify failure, and the
+    //    dialog must hold none: Save stays disabled AND clicking Save (defensively)
+    //    surfaces "no verified file to save" rather than writing bytes. The mismatch
+    //    diagnosis shows BOTH fingerprints (honest), but never any file content.
+    void shieldReceive_mismatchVerifyBeforeOpenNoPlaintext() {
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+
+        ShieldReceiveDialog* dlg = new ShieldReceiveDialog(rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+
+        auto* id    = dlg->findChild<QLineEdit*>("shieldReceiveIdEdit");
+        auto* look  = dlg->findChild<QPushButton*>("shieldReceiveLookupButton");
+        auto* state = dlg->findChild<QLabel*>("shieldReceiveStateLine");
+        auto* meta  = dlg->findChild<QLabel*>("shieldReceiveMetaLine");
+        auto* save  = dlg->findChild<QPushButton*>("shieldReceiveSaveButton");
+        QVERIFY(id && look && state && meta && save);
+
+        // The daemon refuses (HASH_MISMATCH) and returns NO hexdata, with both
+        // fingerprints for honest diagnosis.
+        DataTransferResult r;
+        r.verified = false; r.complete = true;
+        r.error    = "content hash mismatch after reassembly";
+        r.hexData  = QString();   // daemon NEVER returns plaintext on a refusal
+        r.onchainFingerprint  = QString(64, QChar('1'));
+        r.expectedFingerprint = QString(64, QChar('2'));
+        rpc->testSetNextDataTransferResult(r);
+
+        id->setText(QString(64, QChar('2')));   // expected anchor (out-of-band)
+        look->click();
+
+        QVERIFY2(pumpUntil([&]{ return state->text().contains("doesn't match", Qt::CaseInsensitive); }),
+                 qPrintable("mismatch refusal line: " + state->text()));
+        QVERIFY2(state->text().contains("Not opened", Qt::CaseInsensitive),
+                 qPrintable("a refusal must say it did NOT open the file: " + state->text()));
+        // No plaintext: Save stays disabled, and the honest diagnosis shows the two
+        // fingerprints (abbreviated) — never any file bytes/content.
+        QVERIFY2(!save->isEnabled(), "Save must stay disabled on a verify refusal (no plaintext)");
+        QVERIFY2(meta->text().contains("On-chain", Qt::CaseInsensitive)
+                     && meta->text().contains("expected", Qt::CaseInsensitive),
+                 qPrintable("mismatch diagnosis should show both fingerprints: " + meta->text()));
+
+        // Defensive: forcing the save slot must NOT write — there is no verified file.
+        QMetaObject::invokeMethod(dlg, "onSaveDecrypted");
+        QVERIFY2(state->text().contains("no verified file", Qt::CaseInsensitive),
+                 qPrintable("forcing Save with no verified file must refuse: " + state->text()));
+
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // ======================================================================
+    // BUG #1 — NFT-CAPABILITY gating (the user attached to an OLDER node that
+    // lacks the NFT RPCs, so minting 404'd with a cryptic "method not found").
+    // ======================================================================
+
+    // (a) nodeSupportsNFT=false => Collections shows the guidance panel AND the
+    //     Mint/Buy/Send-private/Receive-private entry points are DISABLED with the
+    //     honest tooltip. (Sell lives on the per-item detail dialog; the gallery
+    //     entry points are Mint/Buy/Send-private/Receive-private.)
+    void nftCapability_unsupportedShowsGuidanceAndDisablesEntries() {
+        Settings::getInstance()->setShowNFTGallery(true);
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+        QVERIFY2(w->isNFTGalleryActive(), "gallery tab must be built for this test");
+
+        // Force the probe result OFF (no daemon) and re-render the gating.
+        rpc->testSetNodeSupportsNFT(false);
+        w->onNFTCapabilityResolved();
+
+        auto* panel = w->findChild<QWidget*>("nftUnsupportedPanel");
+        auto* label = w->findChild<QLabel*>("nftUnsupportedLabel");
+        auto* view  = w->findChild<QWidget*>("nftGalleryView");
+        QVERIFY2(panel && label && view, "gallery must expose the unsupported panel + view");
+
+        // Assert the EXPLICIT show/hide flag (isHidden): the Collections tab is not the
+        // current QTabWidget page in this isolated test, so isVisibleTo(w) is false for
+        // everything on it — isHidden() reflects the gating decision regardless.
+        QVERIFY2(!panel->isHidden(), "unsupported node => guidance panel must be shown");
+        QVERIFY2(view->isHidden(),   "unsupported node => the empty grid must be hidden");
+        // The guidance is HONEST + actionable (and ZCL, never ZEC) — and never the
+        // raw RPC error.
+        QVERIFY2(label->text().contains("built-in node", Qt::CaseInsensitive),
+                 qPrintable("guidance must point at the built-in node: " + label->text()));
+        QVERIFY2(label->text().contains("beta7", Qt::CaseInsensitive),
+                 qPrintable("guidance must name the version that works: " + label->text()));
+        QVERIFY2(!label->text().contains("method not found", Qt::CaseInsensitive),
+                 "guidance must NEVER surface the raw 'method not found'");
+
+        // Every gallery entry point disabled with the matching tooltip.
+        for (const char* name : { "nftMakeButton", "nftBuyAnNftButton",
+                                  "nftSendPrivateFileButton", "nftReceivePrivateFileButton" }) {
+            auto* b = w->findChild<QPushButton*>(name);
+            QVERIFY2(b, qPrintable(QString("missing entry button ") + name));
+            QVERIFY2(!b->isEnabled(),
+                     qPrintable(QString("entry button must be disabled when unsupported: ") + name));
+            QVERIFY2(b->toolTip().contains("built-in node", Qt::CaseInsensitive),
+                     qPrintable(QString("entry button needs the honest tooltip: ") + name));
+        }
+
+        // And the inverse: a SUPPORTED node restores the page (no panel, entries on).
+        rpc->testSetNodeSupportsNFT(true);
+        w->onNFTCapabilityResolved();
+        QVERIFY2(panel->isHidden(), "supported node => guidance panel hidden");
+        QVERIFY2(!view->isHidden(), "supported node => the grid is shown");
+        auto* mint = w->findChild<QPushButton*>("nftMakeButton");
+        QVERIFY2(mint && mint->isEnabled(), "supported node => Mint re-enabled");
+        // A supported node must NOT leave the unsupported guidance stuck on the button.
+        // applyNFTSupportGating() RESTORES each button's own honesty tooltip (stashed in
+        // the honestTooltip dynamic property) rather than clearing it — so the tooltip is
+        // the button's content-only-privacy/affordance copy, never the "built-in node"
+        // unsupported guidance.
+        QVERIFY2(!mint->toolTip().contains("built-in node", Qt::CaseInsensitive),
+                 qPrintable("supported node => the unsupported guidance must be gone from the "
+                            "tooltip, not stuck: " + mint->toolTip()));
+        QCOMPARE(mint->toolTip(), mint->property("honestTooltip").toString());
+
+        w->deleteLater();
+    }
+
+    // (b) An NFT RPC returning -32601 yields the calm guidance string (NOT "method
+    //     not found"). nftUnsupportedGuidance() is the single string the -32601 path
+    //     in zslpCalmError()/datachannelCalmError() returns, so asserting it locks
+    //     the honest message that backs EVERY NFT/zslp wrapper's -32601 mapping.
+    void nftCapability_minusThirtyTwoSixOhOneIsCalmGuidance() {
+        const QString g = RPC::nftUnsupportedGuidance();
+        QVERIFY2(!g.contains("method not found", Qt::CaseInsensitive),
+                 qPrintable("the -32601 guidance must never say 'method not found': " + g));
+        QVERIFY2(!g.contains("-32601"),
+                 qPrintable("the -32601 guidance must not leak the raw code: " + g));
+        // It must be ACTIONABLE: name the fix (quit the other node + restart, or upgrade).
+        QVERIFY2(g.contains("Quit", Qt::CaseInsensitive)
+                     && g.contains("restart", Qt::CaseInsensitive),
+                 qPrintable("guidance must tell the user to quit + restart: " + g));
+        // It must offer the upgrade path. New copy names the version that works
+        // ("ZClassic v2.1.2-beta7 or newer") instead of the bare word "upgrade" — same
+        // honest actionable upgrade route, more specific.
+        QVERIFY2(g.contains("beta7", Qt::CaseInsensitive)
+                     && g.contains("newer", Qt::CaseInsensitive),
+                 qPrintable("guidance must offer the version-upgrade path: " + g));
+        // Coin is ZCL, never ZEC/Zcash in user copy.
+        QVERIFY2(!g.contains("ZEC") && !g.contains("Zcash"),
+                 qPrintable("user copy must say ZClassic/ZCL, never ZEC/Zcash: " + g));
+
+        // End-to-end: the dialog seam routes the SAME calm guidance to the result line
+        // (never a raw error), exactly as the production -32601 mapping would.
+        Settings::getInstance()->setShowNFTGallery(true);
+        MainWindow* w = makeWindow();
+        RPC* rpc = w->getRPC();
+        ContentEngine engine(nullptr);
+        NftMintDialog* dlg = new NftMintDialog(&engine, rpc, w);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+        auto* create = dlg->findChild<QPushButton*>("nftMintCreateButton");
+        auto* name   = dlg->findChild<QLineEdit*>("nftMintNameEdit");
+        auto* result = dlg->findChild<QLabel*>("nftMintResultLine");
+        QVERIFY(create && name && result);
+        name->setText("OldNode");
+        QTemporaryDir tmp; QVERIFY(tmp.isValid());
+        QString hashHex;
+        const QString png = writePngWithHash(tmp.path(), "d.png", Qt::cyan, hashHex);
+        dlg->testPickFile(png);
+        QVERIFY(pumpUntil([&]{ return create->isEnabled(); }));
+        // The seam injects what the real -32601 mapping produces.
+        rpc->testSetNextNftError(g);
+        create->click();
+        QVERIFY2(pumpUntil([&]{ return result->text().contains("built-in node", Qt::CaseInsensitive); }),
+                 qPrintable("mint -32601 must surface the calm guidance: " + result->text()));
+        QVERIFY2(!result->text().contains("method not found", Qt::CaseInsensitive),
+                 "mint must never dead-end on a raw 'method not found'");
+        dlg->close();
+        w->deleteLater();
+    }
+
+    // (c) DIRECT mapping assertion: the shared zslpCalmError() mapper, given a JSON-RPC
+    //     body with error.code == -32601 and a null reply (exactly what every NFT/zslp
+    //     wrapper passes on a daemon error), must return nftUnsupportedGuidance()
+    //     VERBATIM — never the raw "method not found", never ZEC/Zcash. This locks the
+    //     -32601 -> calm-guidance mapping at the source, not just through a dialog.
+    void nftCalmError_minus32601MapsToGuidanceDirect() {
+        const QString mapped   = RPC::testCalmErrorForCode(-32601);
+        const QString guidance = RPC::nftUnsupportedGuidance();
+        QCOMPARE(mapped, guidance);
+        QVERIFY2(!mapped.contains("method not found", Qt::CaseInsensitive),
+                 qPrintable("the -32601 mapping must never surface 'method not found': " + mapped));
+        QVERIFY2(!mapped.contains("-32601"),
+                 qPrintable("the -32601 mapping must not leak the raw code: " + mapped));
+        QVERIFY2(!mapped.contains("ZEC") && !mapped.contains("Zcash"),
+                 qPrintable("user copy must say ZClassic/ZCL, never ZEC/Zcash: " + mapped));
+
+        // Sanity: a DIFFERENT code must NOT map to the unsupported guidance (proves the
+        // -32601 branch is doing real work, not a constant return).
+        QVERIFY2(RPC::testCalmErrorForCode(-13) != guidance,
+                 "only -32601 (method-not-found) maps to the unsupported guidance");
+    }
+
+    // ======================================================================
+    // BUG #2 — responsive sizing. The mint + detail dialogs must fit a SMALL
+    // screen (1280x720 with chrome, and the height stays <= ~640 so it fits
+    // 1024x600 after the user shrinks it). We assert minimumSizeHint() — the
+    // smallest the dialog can become — plus the detail dialog's chosen open size.
+    // ======================================================================
+    void nftDialogs_fitSmallScreen() {
+        const int kMaxW = 1280;
+        const int kMaxH = 640;
+
+        ContentEngine engine(nullptr);
+        MainWindow* w = makeWindow();
+
+        // MINT (where the user hit the bug): its smallest size must fit.
+        {
+            NftMintDialog* dlg = new NftMintDialog(&engine, w->getRPC(), w);
+            dlg->setAttribute(Qt::WA_DeleteOnClose);
+            dlg->show();
+            const QSize ms = dlg->minimumSizeHint();
+            QVERIFY2(ms.width()  <= kMaxW,
+                     qPrintable(QString("mint min width %1 must be <= %2").arg(ms.width()).arg(kMaxW)));
+            QVERIFY2(ms.height() <= kMaxH,
+                     qPrintable(QString("mint min height %1 must be <= %2").arg(ms.height()).arg(kMaxH)));
+            dlg->close();
+        }
+
+        // DETAIL: the tallest dialog. The OLD broken dialog used a hard
+        // setMinimumSize(760,560) with no scroll area, so its content min width was
+        // ~878 and it could not shrink onto a small screen — yet a loose `<= kMaxW`
+        // (1280) bound passed anyway (tautological). We now assert the REAL contract:
+        //   (a) minimumSizeHint().width() <= 700  -> catches the old ~878 content-min,
+        //   (b) the body lives in a QScrollArea named "nftDetailScroll" (so a tall
+        //       layout scrolls instead of forcing the window off-screen), and
+        //   (c) after shrinking to 600x420 the dialog actually shrinks to that size
+        //       (its required minimum fits within the given size — nothing clips).
+        {
+            NFTItem it; it.name = "Fits"; it.txid = "tokfit";
+            it.docHashHex = "ab"; it.cachePath = ""; it.isPrivate = false; it.verifyState = 1;
+            QVector<NFTItem> ordered; ordered.push_back(it);
+            NFTDetailDialog* dlg = new NFTDetailDialog(it, ordered, 0, &engine, nullptr, w);
+            dlg->setAttribute(Qt::WA_DeleteOnClose);
+            dlg->show();
+
+            // (a) the smallest the dialog can become must be genuinely small.
+            const QSize ms = dlg->minimumSizeHint();
+            QVERIFY2(ms.width()  <= 700,
+                     qPrintable(QString("detail minimumSizeHint width %1 must be <= 700 "
+                                        "(the old un-scrolled dialog was ~878)").arg(ms.width())));
+            QVERIFY2(ms.height() <= kMaxH,
+                     qPrintable(QString("detail min height %1 must be <= %2").arg(ms.height()).arg(kMaxH)));
+
+            // (b) the body must be in the scroll area, so a tall layout scrolls.
+            QScrollArea* scroll = dlg->findChild<QScrollArea*>("nftDetailScroll");
+            QVERIFY2(scroll != nullptr,
+                     "detail dialog body must live in a QScrollArea named 'nftDetailScroll'");
+
+            // The CHOSEN open size must also fit (the constructor clamps to the screen).
+            QVERIFY2(dlg->size().width()  <= kMaxW,
+                     qPrintable(QString("detail open width %1 must be <= %2").arg(dlg->size().width()).arg(kMaxW)));
+            QVERIFY2(dlg->size().height() <= kMaxH,
+                     qPrintable(QString("detail open height %1 must be <= %2").arg(dlg->size().height()).arg(kMaxH)));
+
+            // (c) shrink it to a tiny window: the layout must NOT require more than the
+            // given size. After resize+activate the actual size must match the request,
+            // which proves the layout's minimum fits inside it (no clipped controls).
+            dlg->resize(600, 420);
+            QVERIFY(QTest::qWaitForWindowExposed(dlg));
+            qApp->processEvents();
+            QVERIFY2(dlg->size().width()  <= 600,
+                     qPrintable(QString("detail must shrink to width 600, got %1 "
+                                        "(layout requires more than given size)").arg(dlg->size().width())));
+            QVERIFY2(dlg->size().height() <= 420,
+                     qPrintable(QString("detail must shrink to height 420, got %1 "
+                                        "(layout requires more than given size)").arg(dlg->size().height())));
+            if (QLayout* lay = dlg->layout()) {
+                QVERIFY2(lay->minimumSize().width()  <= 600,
+                         qPrintable(QString("detail layout minimum width %1 must fit 600")
+                                        .arg(lay->minimumSize().width())));
+                QVERIFY2(lay->minimumSize().height() <= 420,
+                         qPrintable(QString("detail layout minimum height %1 must fit 420")
+                                        .arg(lay->minimumSize().height())));
+            }
+            dlg->close();
+        }
+
+        w->deleteLater();
+    }
+
     void perf16_modelJank() {
         MainWindow* w = makeWindow();
         RPC* rpc = w->getRPC();

@@ -23,6 +23,13 @@
 
 using json = nlohmann::json;
 
+// Item 138: ONE canonical "first-run security-files download" detail line, shared by
+// every place that announces the one-time zk-param fetch so the two call sites can
+// never drift apart. Honest + short: it is a single ~1.7 GB download that happens once.
+static QString oneTimeDownloadDetail() {
+    return QObject::tr("One-time ~1.7 GB download (about 10–20 min on home internet).");
+}
+
 ConnectionLoader::ConnectionLoader(MainWindow* main, RPC* rpc) {
     this->main = main;
     this->rpc  = rpc;
@@ -43,9 +50,9 @@ ConnectionLoader::ConnectionLoader(MainWindow* main, RPC* rpc) {
     ezCard->setContentsMargins(16, 8, 16, 8);
     ezCard->setText(QObject::tr(
         "<b>Setting up ZClassic</b><br>"
-        "The first run downloads the security files and a copy of the blockchain, "
-        "then catches up with the network — this can take a while, but you only do "
-        "it once. You can leave it running and come back later; it is safe.<br><br>"
+        "Your first run downloads the blockchain and security files, then catches up "
+        "with the network. This takes a while but happens only once — you can leave it "
+        "running and come back later.<br><br>"
         "&nbsp;&nbsp;<b>Step 1.</b> Getting the security files ready<br>"
         "&nbsp;&nbsp;<b>Step 2.</b> Starting your wallet<br>"
         "&nbsp;&nbsp;<b>Step 3.</b> Catching up with the network"));
@@ -253,8 +260,7 @@ void ConnectionLoader::doAutoConnect(bool tryEzclassicdStart) {
                 // below takes over with real percent.
                 if (ezParamFetchLikely) {
                     this->showInformation(QObject::tr("Step 1 of 3: Getting the security files ready…"),
-                        QObject::tr("One-time download of about 1.7 GB — on a typical home "
-                            "connection this takes 10–20 minutes. You only do this once."));
+                        oneTimeDownloadDetail());
                 } else {
                     this->showInformation(QObject::tr("Step 2 of 3: Starting your wallet…"),
                         QObject::tr("Almost ready — getting things going (this can take a minute)…"));
@@ -328,7 +334,7 @@ void ConnectionLoader::createZClassicConf() {
     ui.grpAdvanced->setVisible(false);
     QObject::connect(ui.btnAdvancedConfig, &QPushButton::toggled, [=](bool isVisible) {
         ui.grpAdvanced->setVisible(isVisible);
-        ui.btnAdvancedConfig->setText(isVisible ? QObject::tr("Hide Advanced Config") : QObject::tr("Show Advanced Config"));
+        ui.btnAdvancedConfig->setText(isVisible ? QObject::tr("Hide advanced settings") : QObject::tr("Advanced settings"));
     });
 
     QObject::connect(ui.chkCustomDatadir, &QCheckBox::stateChanged, [=](int chked) {
@@ -454,7 +460,7 @@ void ConnectionLoader::downloadParams(std::function<void(void)> cb) {
 
     // P1-1: this is Step 1 of onboarding.
     this->showInformation(QObject::tr("Step 1 of 3: Getting the security files ready…"),
-                          QObject::tr("One-time download of about 1.7 GB — on a typical home connection this takes 10–20 minutes. You only do this once."));
+                          oneTimeDownloadDetail());
 
     // Add all the files to the download queue
     downloadQueue = new QQueue<QUrl>();
@@ -2385,13 +2391,21 @@ void ConnectionLoader::classifyForeignDaemon(Connection* connection) {
     connection->doRPC(biPayload,
         [=] (json) {
             if (!alive || !*alive) return;   // W2: loader gone — do not touch members
-            // Foreign node WITH the bundled feature set (advisory only). Refresh the
+            // Foreign node that answers getbootstrapinfo (advisory only). Refresh the
             // flag for richer warmup progress, then ATTACH (avoids launching a second
-            // daemon onto the held ports).
+            // daemon onto the held ports). HONESTY (BUG #1): getbootstrapinfo presence
+            // is NOT a guarantee of the NFT feature set — an older node can answer it
+            // yet lack the zslp_*/nft_* RPCs. The REAL NFT capability is PROBED at
+            // runtime in RPC::probeNFTCapability() (fired from setConnection), which
+            // gates the NFT surfaces honestly. So we no longer claim a "bundled feature
+            // set" here.
             ezBootstrapRpcProbed = 1;
             QSettings().setValue("heal/daemonHasBootstrapRpc", 1);
             d->hide();
-            main->logger->write("Attached to a ZClassic node already running (bundled feature set).");
+            main->logger->write("Attached to a ZClassic node already running (probing NFT support).");
+            // Deterministic stderr marker for the E2E harness + support logs:
+            // a successful getinfo/getbootstrapinfo on a node we did NOT spawn.
+            fprintf(stderr, "ZQW-E2E attached to node\n"); fflush(stderr);
             this->doRPCSetConnection(connection);
         },
         [=] (auto, auto) {
@@ -2405,6 +2419,9 @@ void ConnectionLoader::classifyForeignDaemon(Connection* connection) {
             QSettings().setValue("heal/daemonHasBootstrapRpc", 0);
             d->hide();
             main->logger->write("Pre-existing ZClassic node has an older feature set (no getbootstrapinfo) — attaching anyway.");
+            // Deterministic stderr marker for the E2E harness + support logs:
+            // a successful attach to a foreign (older) node we did NOT spawn.
+            fprintf(stderr, "ZQW-E2E attached to node\n"); fflush(stderr);
             this->doRPCSetConnection(connection);
         });
 }

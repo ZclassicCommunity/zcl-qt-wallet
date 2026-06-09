@@ -125,7 +125,7 @@ void AddressBook::open(MainWindow* parent, QLineEdit* target) {
         if (!addr.isEmpty() && !ab.label->text().isEmpty()) {
             // Test if address is valid.
             if (!Settings::isValidAddress(addr)) {
-                QMessageBox::critical(parent, QObject::tr("Address Format Error"), addr + QObject::tr(" doesn't seem to be a valid ZClassic address."), QMessageBox::Ok);
+                QMessageBox::critical(parent, QObject::tr("Invalid address"), QObject::tr("That isn't a valid ZClassic address.") + "\n\n" + addr, QMessageBox::Ok);
             } else {
                 model.addNewLabel(ab.label->text(), ab.addr->text());
             }

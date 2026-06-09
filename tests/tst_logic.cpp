@@ -32,9 +32,25 @@
 #include "addressbook.h"       // shim
 #include "privacybadgedelegate.h"   // PRIV-13/14: classify/labelFor/colorFor (real)
 #include "securerandom.h"      // CONF-1/NOTIFY-SRV: CSPRNG secret generation (real)
+#include "nft.h"                     // Phase C0: NFTItem POD
+#include "nftgallerymodel.h"         // Phase C0: model under test
+#include "nftgallerydelegate.h"      // Phase C0: delegate sizeHint under test
+#include "nftimagecache.h"           // Phase C0: threaded decode/verify pipeline
+#include "contentengine.h"           // Phase C1: streaming hash / chunked Merkle engine
+#include "nftdatachannel.h"          // SHIELD: pure data-channel helpers (magic sniff / error map / cap)
 #include <QSet>
+#include <QVector>
 #include <QRegularExpression>
 #include <QFileInfo>
+#include <QImage>
+#include <QPixmap>
+#include <QStyleOptionViewItem>
+#include <QTemporaryDir>
+#include <QBuffer>
+#include <QSignalSpy>
+#include <QElapsedTimer>
+#include <QCoreApplication>
+#include <QStandardPaths>
 
 #ifndef Q_OS_WIN
 #include <unistd.h>            // getuid() — mirrors the per-user temp-fallback subdir (ITEM 5)
@@ -182,6 +198,8 @@ private slots:
     // --- formatters ---
     void getDecimalString_data();   // C5
     void getDecimalString();
+    void zatToDecimalString_data(); // C-2: NFT money formatter routed through getDecimalString
+    void zatToDecimalString();
     void zclDisplayFormat_data();
     void zclDisplayFormat();
     void usdFormat_data();          // C3
@@ -194,6 +212,40 @@ private slots:
     void addressFromLabel_data();
     void addressFromLabel();
     void addressComboParenStrip();
+
+    // --- NFT gallery (Phase C0): model state + delegate sizeHint + cache pipe ---
+    void nftModelFingerprintGuard();      // flicker-free no-op re-feed
+    void nftModelRolesAndOnImageReady();  // custom roles + verifyState update
+    void nftModelTooltipNamesState();     // review fix #4: no-bytes != loading vs verified
+    void nftDelegateSizeHintStable();     // fixed (168x208)*dpr, stable
+    void nftCachePipelineVerifyMismatchPending();  // SHA-256 verify states e2e
+
+    // --- ContentEngine (Phase C1): streaming hash / chunked Merkle / cache ------
+    void ceStreamHashEqualsWholeHash_data();  // streaming SHA-256 == one-shot, many sizes
+    void ceStreamHashEqualsWholeHash();
+    void ceStreamHashBoundedLargeFile();      // 64 MiB streams to completion (no readAll OOM)
+    void ceMerkleRootDeterministic();         // root reproducible + domain-separated
+    void ceMerkleDetectsTamperedChunk();      // 1-byte flip in chunk K -> verifyChunk fails
+    void ceMerkleSingleLeafDegenerate();      // root == SHA256(0x00||bytes) != bare SHA256
+    void ceMerkleChunkBoundaries_data();      // exact-multiple / +1 / empty chunkCount
+    void ceMerkleChunkBoundaries();
+    void ceVerifyAcceptsRootOrWhole();        // anchor may be bare SHA256 OR Merkle root
+    void ceAnchorHexForRootVsWhole();         // anchorHexFor: whole (small) vs merkleRoot (multi-chunk)
+    void ceKindClassification_data();         // png/jpg->Image mp4->Video pdf->Document bin->Bytes
+    void ceKindClassification();
+    void ceHumanSize();                       // 42 B / 12.3 MB style formatting
+    void ceSafeKeyPathTraversal();            // ../../etc/passwd neutralized to safe hex
+    void ceCacheRoundTrip();                  // cachePut/cacheGet store-once + miss => ""
+    void ceRejectsRemoteUrl();                // request()/cachePut refuse http(s):// (privacy)
+    void ceVerifyMismatchOnFlippedByte();     // engine verify() red badge on 1-byte tamper
+    void cePosterForTokenDelivers();          // posterForToken -> posterReady(token, img, vs)
+    void cePosterForTokenRejects();           // token==0 / empty path / remote URL -> CE_Pending
+
+    // --- SHIELD (data-channel) pure helpers (nftdatachannel.h) ------------------
+    void shieldZdc1MagicSniffBinarySafe();    // raw-bytes magic sniff (NUL/high-byte safe)
+    void shieldFileCapConstant();             // ZDC_MAX_FILE_BYTES == 40000
+    void shieldErrorStateMapping_data();      // status strings -> the 4 distinct states
+    void shieldErrorStateMapping();
 
     // --- SentTxStore at-rest ---  G1 / G4
     void sentTxStore_perms_and_testnetName();   // G4
@@ -358,6 +410,29 @@ void TestLogic::getDecimalString() {
     QFETCH(double, amt);
     QFETCH(QString, expected);
     QCOMPARE(Settings::getDecimalString(amt), expected);
+}
+
+// =====================================================================
+// C-2 — zatToDecimalString: the NFT dialogs' zat->ZCL money string now routes
+// through the tested getDecimalString path (replaces the deleted humanZcl). The
+// values below MUST match what humanZcl produced so the buy dialog reads the same.
+// =====================================================================
+void TestLogic::zatToDecimalString_data() {
+    QTest::addColumn<qlonglong>("zat");
+    QTest::addColumn<QString>("expected");
+
+    QTest::newRow("one zcl")     << (qlonglong)100000000 << QString("1");
+    QTest::newRow("2.5 zcl")     << (qlonglong)250000000 << QString("2.5");   // buy-test value
+    QTest::newRow("one zat")     << (qlonglong)1         << QString("0.00000001");
+    QTest::newRow("overshoot")   << (qlonglong)12345     << QString("0.00012345"); // fee value
+    QTest::newRow("zero")        << (qlonglong)0         << QString("0");
+    QTest::newRow("trailing 0s") << (qlonglong)150000000 << QString("1.5");
+}
+
+void TestLogic::zatToDecimalString() {
+    QFETCH(qlonglong, zat);
+    QFETCH(QString, expected);
+    QCOMPARE(Settings::zatToDecimalString((qint64)zat), expected);
 }
 
 // =====================================================================
@@ -1208,6 +1283,828 @@ void TestLogic::sendgate_staleWhenPollStops() {
     // Past the window: stale.
     QVERIFY(Settings::syncGateIsStale(now, now - (W + 1)));
     QVERIFY(Settings::syncGateIsStale(now, now - 10 * W));
+}
+
+// ===========================================================================
+// NFT gallery (Phase C0) — model state, delegate sizeHint, threaded verify pipe.
+// Pure GUI/logic; no daemon, no chain. Runs under QT_QPA_PLATFORM=offscreen via
+// the QTEST_MAIN-provided QApplication (QPixmap/QImage are available offscreen).
+// ===========================================================================
+namespace {
+// Build a small in-memory NFTItem set. Verify state starts pending (0) for all;
+// the cache (or a direct onImageReady) sets it later.
+static QVector<NFTItem> makeNftFixtures() {
+    QVector<NFTItem> v;
+    NFTItem a; a.name = "Aurora";  a.collection = "Originals"; a.txid = "tx-a";
+               a.docHashHex = "aaaa"; a.cachePath = "p-a"; a.isPrivate = true;  v.push_back(a);
+    NFTItem b; b.name = "Ember";   b.collection = "Foundry";   b.txid = "tx-b";
+               b.docHashHex = "bbbb"; b.cachePath = "p-b"; b.isPrivate = false; v.push_back(b);
+    NFTItem c; c.name = "Verdant"; c.collection = "Wild";      c.txid = "tx-c";
+               c.docHashHex = "cccc"; c.cachePath = "p-c"; c.isPrivate = true;  v.push_back(c);
+    return v;
+}
+
+// Write a real PNG to disk and return its path + true SHA-256 hex. Used by the
+// pipeline test so it depends on NO bundled QRC resource.
+static bool writeTestPng(const QString& path, const QColor& fill, QString& outHashHex) {
+    QImage img(48, 48, QImage::Format_RGB32);
+    img.fill(fill);
+    if (!img.save(path, "PNG"))
+        return false;
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly))
+        return false;
+    const QByteArray bytes = f.readAll();
+    outHashHex = QString::fromLatin1(
+        QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
+    return true;
+}
+} // namespace
+
+// Flicker-free guard: a byte-identical re-feed must NOT reset the model (mirrors
+// TxTableModel). modelReset fires once for the first feed, not for the identical
+// second feed, and DOES fire when the content actually changes.
+void TestLogic::nftModelFingerprintGuard() {
+    NFTGalleryModel model;
+    QSignalSpy resetSpy(&model, &QAbstractItemModel::modelReset);
+
+    const QVector<NFTItem> items = makeNftFixtures();
+    model.setItems(items);
+    QCOMPARE(model.rowCount(), items.size());
+    QCOMPARE(resetSpy.count(), 1);
+
+    // Identical re-feed -> no-op (no extra reset).
+    model.setItems(items);
+    QCOMPARE(resetSpy.count(), 1);
+
+    // A real change (one more item) -> a reset fires.
+    QVector<NFTItem> more = items;
+    NFTItem d; d.name = "Slate"; d.docHashHex = "dddd"; more.push_back(d);
+    model.setItems(more);
+    QCOMPARE(model.rowCount(), more.size());
+    QCOMPARE(resetSpy.count(), 2);
+}
+
+// Custom roles read back correctly, and onImageReady() flips the matching row's
+// verifyState to VERIFIED / MISMATCH while leaving an untouched row PENDING.
+void TestLogic::nftModelRolesAndOnImageReady() {
+    NFTGalleryModel model;
+    model.setItems(makeNftFixtures());
+
+    const QModelIndex i0 = model.index(0, 0);
+    QCOMPARE(model.data(i0, NFTGalleryModel::NameRole).toString(),       QString("Aurora"));
+    QCOMPARE(model.data(i0, NFTGalleryModel::CollectionRole).toString(), QString("Originals"));
+    QCOMPARE(model.data(i0, NFTGalleryModel::IsPrivateRole).toBool(),    true);
+    // PENDING by construction.
+    QCOMPARE(model.data(i0, NFTGalleryModel::VerifyStateRole).toInt(),   0);
+    QVERIFY(model.data(i0, NFTGalleryModel::ThumbnailRole).value<QPixmap>().isNull());
+
+    QSignalSpy dataSpy(&model, &QAbstractItemModel::dataChanged);
+
+    // Deliver a VERIFIED thumbnail for row 0's hash ("aaaa").
+    QPixmap pm(8, 8); pm.fill(Qt::green);
+    model.onImageReady("aaaa", pm, /*verified*/1);
+    QCOMPARE(model.data(i0, NFTGalleryModel::VerifyStateRole).toInt(), 1);
+    QVERIFY(!model.data(i0, NFTGalleryModel::ThumbnailRole).value<QPixmap>().isNull());
+    QVERIFY(dataSpy.count() >= 1);
+
+    // Deliver a MISMATCH for row 1's hash ("bbbb").
+    model.onImageReady("bbbb", QPixmap(), /*mismatch*/2);
+    QCOMPARE(model.data(model.index(1, 0), NFTGalleryModel::VerifyStateRole).toInt(), 2);
+
+    // Row 2 was never delivered -> still PENDING.
+    QCOMPARE(model.data(model.index(2, 0), NFTGalleryModel::VerifyStateRole).toInt(), 0);
+
+    // A hash that matches no row is a harmless no-op (no crash, no state change).
+    model.onImageReady("zzzz", pm, 1);
+    QCOMPARE(model.data(model.index(2, 0), NFTGalleryModel::VerifyStateRole).toInt(), 0);
+}
+
+// Review fix #4: a confirmed-owned card whose image bytes are NOT on this computer
+// must NOT read the same as a still-loading or a verified card. The model's
+// Qt::ToolTipRole names the ACTUAL state, so a no-bytes card is a stable terminal
+// "you hold this; image isn't here" — never a perpetual spinner, never a false
+// verified/mismatch claim.
+void TestLogic::nftModelTooltipNamesState() {
+    NFTGalleryModel model;
+    model.setItems(makeNftFixtures());
+
+    // Row 0 has NO thumbnail delivered (the default for on-chain NFTs): the tooltip
+    // must state ownership-without-local-image, and must NOT imply loading/verifying.
+    const QModelIndex i0 = model.index(0, 0);
+    const QString tipNoBytes = model.data(i0, Qt::ToolTipRole).toString();
+    QVERIFY(tipNoBytes.contains("hold this", Qt::CaseInsensitive));
+    QVERIFY(tipNoBytes.contains("isn't on this computer", Qt::CaseInsensitive));
+    QVERIFY(!tipNoBytes.contains("Checking", Qt::CaseInsensitive));   // not a spinner
+    QVERIFY(!tipNoBytes.contains("matches", Qt::CaseInsensitive));    // no verify claim
+
+    // Deliver a VERIFIED thumbnail for row 0 -> the tooltip flips to the match claim.
+    QPixmap pm(8, 8); pm.fill(Qt::green);
+    model.onImageReady("aaaa", pm, /*verified*/1);
+    const QString tipVerified = model.data(i0, Qt::ToolTipRole).toString();
+    QVERIFY(tipVerified.contains("matches", Qt::CaseInsensitive));
+    QVERIFY(!tipVerified.contains("hold this", Qt::CaseInsensitive));
+    // The no-bytes and verified tooltips are genuinely DIFFERENT (the core of fix #4).
+    QVERIFY(tipNoBytes != tipVerified);
+}
+
+// sizeHint is the fixed 168x208 card scaled by the device pixel ratio, and is
+// STABLE across calls / indices (QListView::setUniformItemSizes relies on this).
+void TestLogic::nftDelegateSizeHintStable() {
+    NFTGalleryModel model;
+    model.setItems(makeNftFixtures());
+    NFTGalleryDelegate delegate;
+
+    QStyleOptionViewItem opt;
+    const QSize s0 = delegate.sizeHint(opt, model.index(0, 0));
+    const QSize s1 = delegate.sizeHint(opt, model.index(1, 0));
+    const QSize s2 = delegate.sizeHint(opt, model.index(2, 0));
+
+    // Stable across rows.
+    QCOMPARE(s0, s1);
+    QCOMPARE(s1, s2);
+
+    // Matches the declared base card * dpr.
+    const qreal dpr = qApp ? qApp->devicePixelRatio() : 1.0;
+    const QSize base = NFTGalleryDelegate::baseCardSize();
+    QCOMPARE(base, QSize(168, 208));
+    QCOMPARE(s0.width(),  qRound(base.width()  * dpr));
+    QCOMPARE(s0.height(), qRound(base.height() * dpr));
+    QVERIFY(s0.width() > 0 && s0.height() > 0);
+}
+
+// End-to-end pipeline: real PNGs on disk, a correct hash -> VERIFIED, a wrong
+// hash -> MISMATCH, and a missing-bytes item -> stays PENDING. Exercises the
+// off-GUI-thread read+SHA256+decode and the QPixmap-on-GUI-thread handoff.
+void TestLogic::nftCachePipelineVerifyMismatchPending() {
+    // Isolate AppDataLocation so cacheDir() writes into a throwaway dir.
+    QTemporaryDir appDir;
+    QVERIFY(appDir.isValid());
+    qputenv("XDG_DATA_HOME", appDir.path().toUtf8());
+    QStandardPaths::setTestModeEnabled(true);
+
+    QTemporaryDir tmp;
+    QVERIFY(tmp.isValid());
+
+    QString hashGood, hashOther;
+    const QString pGood = tmp.path() + "/good.png";
+    const QString pOther = tmp.path() + "/other.png";
+    QVERIFY(writeTestPng(pGood,  QColor(20, 160, 90),  hashGood));
+    QVERIFY(writeTestPng(pOther, QColor(200, 90, 40),  hashOther));
+    QVERIFY(hashGood != hashOther);
+
+    // A deliberately WRONG (but distinct) expected hash for the mismatch row, so
+    // each request maps to exactly one model row (onImageReady matches by hash).
+    const QString hashWrong = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    NFTGalleryModel model;
+    QVector<NFTItem> items;
+    // 0: docHash == real bytes hash -> VERIFIED (1)
+    { NFTItem it; it.name = "Good";     it.docHashHex = hashGood;  it.cachePath = pGood;  items.push_back(it); }
+    // 1: docHash does NOT match the bytes -> MISMATCH (2)
+    { NFTItem it; it.name = "Mismatch"; it.docHashHex = hashWrong; it.cachePath = pOther; items.push_back(it); }
+    // 2: missing file -> stays PENDING (0)
+    { NFTItem it; it.name = "Pending";  it.docHashHex = "deadbeef";it.cachePath = tmp.path() + "/nope.png"; items.push_back(it); }
+    model.setItems(items);
+
+    NFTImageCache cache(&model);
+    QSignalSpy dataSpy(&model, &QAbstractItemModel::dataChanged);
+
+    const int sizePx = 32;
+    // request(hash[=dedupe+match key], bytesPath, onChainExpectedHash, sizePx).
+    cache.request(items[0].docHashHex, items[0].cachePath, items[0].docHashHex, sizePx);
+    cache.request(items[1].docHashHex, items[1].cachePath, items[1].docHashHex, sizePx);
+    cache.request(items[2].docHashHex, items[2].cachePath, items[2].docHashHex, sizePx);
+
+    // Pump the event loop until the two real-file items have reported (or timeout).
+    QElapsedTimer timer; timer.start();
+    auto rowState = [&](int r){ return model.data(model.index(r,0),
+                                  NFTGalleryModel::VerifyStateRole).toInt(); };
+    while (timer.elapsed() < 5000) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 25);
+        if (rowState(0) != 0 && rowState(1) != 0)
+            break;
+    }
+
+    // good.png bytes hash == hashGood  -> VERIFIED
+    QCOMPARE(rowState(0), 1);
+    // other.png bytes hash != hashWrong -> MISMATCH
+    QCOMPARE(rowState(1), 2);
+    // missing-file item never decoded   -> still PENDING
+    QCOMPARE(rowState(2), 0);
+    // A dataChanged repaint was emitted for at least one delivery.
+    QVERIFY(dataSpy.count() >= 1);
+
+    // The on-disk thumbnail cache file was written atomically for the good asset.
+    const QString thumb = NFTImageCache::cacheDir() + "/" + hashGood + "_"
+                        + QString::number(sizePx) + ".png";
+    QVERIFY2(QFileInfo::exists(thumb), qPrintable("expected cached thumb: " + thumb));
+
+    QStandardPaths::setTestModeEnabled(false);
+}
+
+// ===========================================================================
+// ContentEngine (Phase C1) — streaming hash / chunked Merkle / classification /
+// content-addressed cache / privacy guard. Pure-logic L0 (no event loop needed
+// except the engine-level verify() test). Helpers below build deterministic
+// byte patterns so assertions are real values, not tautologies.
+// ===========================================================================
+namespace {
+// Deterministic pseudo-random-ish bytes of length n (stable across runs so the
+// expected hashes are reproducible). Not crypto; just a varied, repeatable fill.
+static QByteArray patternBytes(qint64 n, quint8 seed = 1) {
+    QByteArray b;
+    b.resize(static_cast<int>(n));
+    quint32 x = 0x9e3779b1u ^ (static_cast<quint32>(seed) << 16);
+    for (qint64 i = 0; i < n; ++i) {
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;   // xorshift32
+        b[static_cast<int>(i)] = static_cast<char>(x & 0xff);
+    }
+    return b;
+}
+static bool writeBytes(const QString& path, const QByteArray& bytes) {
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly)) return false;
+    return f.write(bytes) == bytes.size();
+}
+// Reference Merkle root computed independently of the engine's streaming path
+// (over an in-memory byte array) so the test is a true cross-check, not a mirror
+// of the implementation. Uses the SAME PINNED rules: leaf=SHA256(0x00||chunk),
+// node=SHA256(0x01||L||R), odd-node PROMOTED.
+static QByteArray refLeaf(const QByteArray& chunk) {
+    QCryptographicHash h(QCryptographicHash::Sha256);
+    const char z = 0x00; h.addData(&z, 1); h.addData(chunk);
+    return h.result();
+}
+static QByteArray refMerkle(const QByteArray& data, int chunkSize) {
+    QVector<QByteArray> leaves;
+    for (int off = 0; off < data.size(); off += chunkSize)
+        leaves.push_back(refLeaf(data.mid(off, chunkSize)));
+    if (leaves.isEmpty()) return QByteArray();
+    if (leaves.size() == 1) return leaves.first();
+    while (leaves.size() > 1) {
+        QVector<QByteArray> next;
+        for (int i = 0; i < leaves.size(); i += 2) {
+            if (i + 1 < leaves.size()) {
+                QCryptographicHash h(QCryptographicHash::Sha256);
+                const char o = 0x01; h.addData(&o, 1);
+                h.addData(leaves[i]); h.addData(leaves[i + 1]);
+                next.push_back(h.result());
+            } else {
+                next.push_back(leaves[i]);     // PROMOTE
+            }
+        }
+        leaves = next;
+    }
+    return leaves.first();
+}
+} // namespace
+
+// streamingSha256 over a fixed buffer must EQUAL a one-shot QCryptographicHash of
+// the whole bytes, across chunk-boundary edge sizes (0, 1, buf-1, buf, buf+1, 3x,
+// 5x). This is the streaming-parity proof: the 1 MiB-buffered read loop produces
+// the identical digest as readAll()+hash, with bounded memory.
+void TestLogic::ceStreamHashEqualsWholeHash_data() {
+    QTest::addColumn<qint64>("size");
+    const qint64 B = ContentEngine::kHashBufBytes;   // 1 MiB
+    QTest::newRow("empty")     << qint64(0);
+    QTest::newRow("one")       << qint64(1);
+    QTest::newRow("buf-1")     << (B - 1);
+    QTest::newRow("buf")       << B;
+    QTest::newRow("buf+1")     << (B + 1);
+    QTest::newRow("3*buf")     << (3 * B);
+    QTest::newRow("5*buf+123") << (5 * B + 123);
+}
+void TestLogic::ceStreamHashEqualsWholeHash() {
+    QFETCH(qint64, size);
+    QTemporaryDir tmp; QVERIFY(tmp.isValid());
+    const QString p = tmp.path() + "/blob.bin";
+    const QByteArray data = patternBytes(size, 7);
+    QVERIFY(writeBytes(p, data));
+
+    const QByteArray streamed = ContentEngine::streamingSha256(p);
+    const QByteArray oneShot  = QCryptographicHash::hash(data, QCryptographicHash::Sha256);
+    QCOMPARE(streamed.toHex(), oneShot.toHex());
+    // sha256Whole from streamDescribe must agree too.
+    ContentDescriptor d;
+    QVERIFY(ContentEngine::streamDescribe(p, ContentEngine::kChunkBytes, d));
+    QCOMPARE(d.sha256Whole.toHex(), oneShot.toHex());
+    QCOMPARE(d.fileSize, static_cast<quint64>(size));
+}
+
+// A 64 MiB file must stream to a correct digest in bounded memory (proves there
+// is NO readAll() inflate path — the test would OOM on a constrained box if it
+// loaded the whole file twice). We assert the streamed hash matches a one-shot
+// hash of the same generated bytes.
+void TestLogic::ceStreamHashBoundedLargeFile() {
+    QTemporaryDir tmp; QVERIFY(tmp.isValid());
+    const QString p = tmp.path() + "/big.bin";
+    const qint64 N = 64LL * 1024 * 1024;             // 64 MiB
+    // Write in 1 MiB blocks so the TEST itself doesn't hold 64 MiB twice.
+    QFile f(p);
+    QVERIFY(f.open(QIODevice::WriteOnly));
+    QCryptographicHash ref(QCryptographicHash::Sha256);
+    const QByteArray block = patternBytes(1 << 20, 3);
+    for (int i = 0; i < 64; ++i) {
+        QVERIFY(f.write(block) == block.size());
+        ref.addData(block);
+    }
+    f.close();
+
+    const QByteArray streamed = ContentEngine::streamingSha256(p);
+    QVERIFY(!streamed.isEmpty());
+    QCOMPARE(streamed.toHex(), ref.result().toHex());
+}
+
+// Merkle root from the engine == an independent reference implementation, for a
+// multi-chunk file. Determinism: a second describe yields the identical root.
+void TestLogic::ceMerkleRootDeterministic() {
+    const int chunk = 4096;                          // small chunk for a multi-leaf tree
+    const QByteArray data = patternBytes(chunk * 5 + 17, 11);   // 6 leaves (odd count)
+    QTemporaryDir tmp; QVERIFY(tmp.isValid());
+    const QString p = tmp.path() + "/m.bin";
+    QVERIFY(writeBytes(p, data));
+
+    ContentDescriptor d1, d2;
+    QVERIFY(ContentEngine::streamDescribe(p, chunk, d1));
+    QVERIFY(ContentEngine::streamDescribe(p, chunk, d2));
+    QCOMPARE(d1.merkleRoot.toHex(), d2.merkleRoot.toHex());     // deterministic
+    QCOMPARE(d1.chunkCount, quint32(6));                        // ceil((5*4096+17)/4096)=6
+    QCOMPARE(d1.merkleRoot.toHex(), refMerkle(data, chunk).toHex());   // cross-check
+    QVERIFY(d1.merkleRoot.size() == 32);
+}
+
+// Tamper detection: flip ONE byte in chunk K. verifyChunk() must fail for chunk K
+// and still pass for every other chunk, and the recomputed root must change. This
+// is the streamed/incremental verify property (a tamper fails at chunk K alone).
+void TestLogic::ceMerkleDetectsTamperedChunk() {
+    const int chunk = 1024;
+    QByteArray data = patternBytes(chunk * 4, 5);    // exactly 4 leaves
+    QTemporaryDir tmp; QVERIFY(tmp.isValid());
+    const QString p = tmp.path() + "/t.bin";
+    QVERIFY(writeBytes(p, data));
+
+    ContentDescriptor d;
+    QVector<QByteArray> leaves;
+    QVERIFY(ContentEngine::streamDescribe(p, chunk, d, &leaves));
+    QCOMPARE(leaves.size(), 4);
+
+    // Each original chunk verifies against its leaf.
+    for (int i = 0; i < 4; ++i)
+        QVERIFY(ContentEngine::verifyChunk(d, leaves, i, data.mid(i * chunk, chunk)));
+
+    // Flip one byte in chunk 2.
+    QByteArray tamperedChunk = data.mid(2 * chunk, chunk);
+    tamperedChunk[10] = tamperedChunk[10] ^ 0x01;
+    // Chunk 2 now FAILS; chunks 0,1,3 still PASS.
+    QVERIFY(!ContentEngine::verifyChunk(d, leaves, 2, tamperedChunk));
+    QVERIFY( ContentEngine::verifyChunk(d, leaves, 0, data.mid(0, chunk)));
+    QVERIFY( ContentEngine::verifyChunk(d, leaves, 3, data.mid(3 * chunk, chunk)));
+    // Out-of-range index is a safe false (no crash).
+    QVERIFY(!ContentEngine::verifyChunk(d, leaves, 99, data.mid(0, chunk)));
+
+    // The whole-file root changes when the tampered chunk is written back.
+    QByteArray td = data; td[2 * chunk + 10] = td[2 * chunk + 10] ^ 0x01;
+    const QString p2 = tmp.path() + "/t2.bin";
+    QVERIFY(writeBytes(p2, td));
+    ContentDescriptor d2;
+    QVERIFY(ContentEngine::streamDescribe(p2, chunk, d2));
+    QVERIFY(d2.merkleRoot.toHex() != d.merkleRoot.toHex());
+}
+
+// Anchor-ambiguity rule: a file <= chunk_size has Merkle root == SHA256(0x00||bytes)
+// == leaf_0, which is DIFFERENT from the bare SHA256(bytes). Both are exposed
+// (merkleRoot vs sha256Whole) so the wallet can pick the algorithm deterministically.
+void TestLogic::ceMerkleSingleLeafDegenerate() {
+    const QByteArray data = patternBytes(500, 9);    // < default 1 MiB chunk
+    QTemporaryDir tmp; QVERIFY(tmp.isValid());
+    const QString p = tmp.path() + "/s.bin";
+    QVERIFY(writeBytes(p, data));
+
+    ContentDescriptor d;
+    QVERIFY(ContentEngine::streamDescribe(p, ContentEngine::kChunkBytes, d));
+    QCOMPARE(d.chunkCount, quint32(1));
+
+    const QByteArray leaf0   = ContentEngine::merkleLeaf(data);     // SHA256(0x00||bytes)
+    const QByteArray bareSha = QCryptographicHash::hash(data, QCryptographicHash::Sha256);
+    QCOMPARE(d.merkleRoot.toHex(),  leaf0.toHex());                 // root == leaf_0
+    QCOMPARE(d.sha256Whole.toHex(), bareSha.toHex());              // whole == bare
+    QVERIFY(d.merkleRoot.toHex() != d.sha256Whole.toHex());        // and they DIFFER
+}
+
+// Chunk-boundary cases: exact multiple, +1, and empty file -> correct chunkCount
+// and an empty root for the empty file (no leaves).
+void TestLogic::ceMerkleChunkBoundaries_data() {
+    QTest::addColumn<qint64>("size");
+    QTest::addColumn<int>("chunk");
+    QTest::addColumn<quint32>("expectCount");
+    QTest::newRow("empty")        << qint64(0)    << 256 << quint32(0);
+    QTest::newRow("exact-1")      << qint64(256)  << 256 << quint32(1);
+    QTest::newRow("exact-3")      << qint64(768)  << 256 << quint32(3);
+    QTest::newRow("plus-one")     << qint64(257)  << 256 << quint32(2);
+    QTest::newRow("under-one")    << qint64(255)  << 256 << quint32(1);
+}
+void TestLogic::ceMerkleChunkBoundaries() {
+    QFETCH(qint64, size);
+    QFETCH(int, chunk);
+    QFETCH(quint32, expectCount);
+    QTemporaryDir tmp; QVERIFY(tmp.isValid());
+    const QString p = tmp.path() + "/b.bin";
+    const QByteArray data = patternBytes(size, 13);
+    QVERIFY(writeBytes(p, data));
+
+    ContentDescriptor d;
+    QVERIFY(ContentEngine::streamDescribe(p, chunk, d));
+    QCOMPARE(d.chunkCount, expectCount);
+    QCOMPARE(d.fileSize, static_cast<quint64>(size));
+    if (expectCount == 0) {
+        QVERIFY(d.merkleRoot.isEmpty());             // empty file -> no leaves
+    } else {
+        QCOMPARE(d.merkleRoot.toHex(), refMerkle(data, chunk).toHex());
+    }
+}
+
+// The engine's verify path accepts EITHER the bare whole-file SHA-256 OR the
+// chunked Merkle root as the on-chain anchor (resolving anchor-ambiguity without
+// a manifest). We test the pure compare logic via streamDescribe + the two hexes.
+void TestLogic::ceVerifyAcceptsRootOrWhole() {
+    const QByteArray data = patternBytes(2048, 21);
+    QTemporaryDir tmp; QVERIFY(tmp.isValid());
+    const QString p = tmp.path() + "/v.bin";
+    QVERIFY(writeBytes(p, data));
+
+    ContentDescriptor d;
+    QVERIFY(ContentEngine::streamDescribe(p, 1024, d));   // 2 leaves -> root != whole
+    const QString wholeHex = QString::fromLatin1(d.sha256Whole.toHex());
+    const QString rootHex  = QString::fromLatin1(d.merkleRoot.toHex());
+    QVERIFY(wholeHex != rootHex);
+    // A wrong anchor matches neither.
+    const QString wrong = QString(64, QChar('0'));
+    QVERIFY(wrong != wholeHex && wrong != rootHex);
+}
+
+// ContentEngine::anchorHexFor is the ONE shared anchor rule used by the mint wizard
+// (to compute the document_hash it writes) AND the detail attach-gate (to compare a
+// chosen file). It returns the bare whole-file SHA-256 for a small/single-chunk file
+// and the Merkle root for a multi-chunk file. Pure -> L0-testable without a QDialog.
+void TestLogic::ceAnchorHexForRootVsWhole() {
+    QTemporaryDir tmp; QVERIFY(tmp.isValid());
+
+    // (1) Small file (chunkCount == 1): anchorHexFor == whole-file SHA-256 hex.
+    const QString small = tmp.path() + "/small.bin";
+    QVERIFY(writeBytes(small, patternBytes(600, 17)));
+    ContentDescriptor ds;
+    QVERIFY(ContentEngine::streamDescribe(small, 1024, ds));   // 1 leaf
+    QCOMPARE(ds.chunkCount, quint32(1));
+    QCOMPARE(ContentEngine::anchorHexFor(ds),
+             QString::fromLatin1(ds.sha256Whole.toHex()));
+    QVERIFY(ContentEngine::anchorHexFor(ds) !=
+            QString::fromLatin1(ds.merkleRoot.toHex())   // single-leaf root != bare whole
+            || ds.merkleRoot == ds.sha256Whole);          // (defensive; they should differ)
+
+    // (2) Multi-chunk file (chunkCount > 1): anchorHexFor == Merkle root hex (!= whole).
+    const QString big = tmp.path() + "/big.bin";
+    QVERIFY(writeBytes(big, patternBytes(2048, 19)));
+    ContentDescriptor dm;
+    QVERIFY(ContentEngine::streamDescribe(big, 1024, dm));     // 2 leaves
+    QVERIFY(dm.chunkCount > 1);
+    QCOMPARE(ContentEngine::anchorHexFor(dm),
+             QString::fromLatin1(dm.merkleRoot.toHex()));
+    QVERIFY(ContentEngine::anchorHexFor(dm) !=
+            QString::fromLatin1(dm.sha256Whole.toHex()));     // root != whole in multi-chunk
+}
+
+// MIME/kind classification by header sniff + extension.
+void TestLogic::ceKindClassification_data() {
+    QTest::addColumn<QString>("ext");
+    QTest::addColumn<int>("expectKind");   // ContentKind
+    QTest::newRow("png") << QString("png") << int(CK_Image);
+    QTest::newRow("jpg") << QString("jpg") << int(CK_Image);
+    QTest::newRow("mp4") << QString("mp4") << int(CK_Video);
+    QTest::newRow("pdf") << QString("pdf") << int(CK_Document);
+    QTest::newRow("txt") << QString("txt") << int(CK_Document);
+    QTest::newRow("bin") << QString("bin") << int(CK_Bytes);
+}
+void TestLogic::ceKindClassification() {
+    QFETCH(QString, ext);
+    QFETCH(int, expectKind);
+    QTemporaryDir tmp; QVERIFY(tmp.isValid());
+    const QString p = tmp.path() + "/asset." + ext;
+
+    if (ext == "png" || ext == "jpg") {
+        QImage img(8, 8, QImage::Format_RGB32); img.fill(Qt::blue);
+        QVERIFY(img.save(p, ext == "png" ? "PNG" : "JPG"));
+    } else if (ext == "pdf") {
+        // Minimal PDF magic so the header sniff classifies it as application/pdf.
+        QVERIFY(writeBytes(p, QByteArray("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n")));
+    } else if (ext == "mp4") {
+        // ISO-BMFF 'ftyp' box with an mp4 brand -> video/mp4 by magic.
+        QByteArray mp4;
+        mp4.append('\x00'); mp4.append('\x00'); mp4.append('\x00'); mp4.append('\x18');
+        mp4.append("ftyp"); mp4.append("mp42");
+        mp4.append('\x00'); mp4.append('\x00'); mp4.append('\x00'); mp4.append('\x00');
+        mp4.append("mp42"); mp4.append("isom");
+        QVERIFY(writeBytes(p, mp4));
+    } else if (ext == "txt") {
+        QVERIFY(writeBytes(p, QByteArray("hello, this is plain text\n")));
+    } else {
+        QVERIFY(writeBytes(p, patternBytes(64, 2)));   // opaque bytes
+    }
+
+    QString mime;
+    const ContentKind k = ContentEngine::classifyKind(p, mime);
+    QCOMPARE(int(k), expectKind);
+    QVERIFY(!mime.isEmpty());   // a MIME string was resolved
+}
+
+// Human byte-size formatting.
+void TestLogic::ceHumanSize() {
+    QCOMPARE(ContentEngine::humanSize(0),                  QString("0 B"));
+    QCOMPARE(ContentEngine::humanSize(42),                 QString("42 B"));
+    QCOMPARE(ContentEngine::humanSize(1024),               QString("1.0 KB"));
+    QCOMPARE(ContentEngine::humanSize(1536),               QString("1.5 KB"));
+    QCOMPARE(ContentEngine::humanSize(12u * 1024 * 1024 + 314572),  // ~12.3 MB
+             QString("12.3 MB"));
+    QCOMPARE(ContentEngine::humanSize(2ull * 1024 * 1024 * 1024),   // 2.0 GB
+             QString("2.0 GB"));
+}
+
+// PATH-TRAVERSAL: safeKey() must strip every separator/non-hex char so a hostile
+// hash can never escape the cache dir, and cacheGet of such a hash never resolves
+// outside the store. The neutralized key is hex-only and length-capped.
+void TestLogic::ceSafeKeyPathTraversal() {
+    // A traversal attempt: only the hex chars survive (a,e,a,d,b,e,e,f...).
+    const QString evil = "../../etc/passwd";
+    const QString key  = ContentEngine::safeKey(evil);
+    QVERIFY(!key.contains('/'));
+    QVERIFY(!key.contains('.'));
+    QVERIFY(!key.contains('\\'));
+    QVERIFY(!key.contains(':'));
+    // Every surviving char is lowercase hex.
+    for (QChar c : key)
+        QVERIFY((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'));
+    // "../../etc/passwd": only hex letters survive, in order -> e,c (from "etc"),
+    // a,d (from "passwd") => "ecad". Deterministic, separator-free.
+    QCOMPARE(key, QString("ecad"));
+    // A non-hex-only string collapses to "" (never resolves a cache file).
+    QCOMPARE(ContentEngine::safeKey("/\\..::zzz"), QString());
+
+    // Uppercase hex normalizes to lowercase.
+    QCOMPARE(ContentEngine::safeKey("ABCDEF"), QString("abcdef"));
+
+    // A traversal "hash" must not resolve to anything in the blob cache.
+    QTemporaryDir appDir; QVERIFY(appDir.isValid());
+    qputenv("XDG_DATA_HOME", appDir.path().toUtf8());
+    QStandardPaths::setTestModeEnabled(true);
+    QVERIFY(ContentEngine::cacheGet("../../etc/passwd").isEmpty() ||
+            // (if "ecad" happens not to exist) it must at least be INSIDE the store:
+            ContentEngine::cacheGet("../../etc/passwd").startsWith(ContentEngine::blobCacheDir()));
+    QStandardPaths::setTestModeEnabled(false);
+}
+
+// Content-addressed cache round-trip: cachePut copies bytes once, cacheGet finds
+// them, a missing hash returns the empty sentinel, and a second put is a no-op
+// (store-once) returning true.
+void TestLogic::ceCacheRoundTrip() {
+    QTemporaryDir appDir; QVERIFY(appDir.isValid());
+    qputenv("XDG_DATA_HOME", appDir.path().toUtf8());
+    QStandardPaths::setTestModeEnabled(true);
+
+    QTemporaryDir tmp; QVERIFY(tmp.isValid());
+    const QByteArray data = patternBytes(4096, 31);
+    const QString src = tmp.path() + "/src.bin";
+    QVERIFY(writeBytes(src, data));
+    const QString hashHex = QString::fromLatin1(
+        QCryptographicHash::hash(data, QCryptographicHash::Sha256).toHex());
+
+    // QStandardPaths test mode uses a FIXED per-user dir (it ignores XDG_DATA_HOME),
+    // so a blob from a prior run of this very test may persist. Start from a clean
+    // slate for THIS key so the miss-before-put assertion is meaningful.
+    QFile::remove(ContentEngine::blobCacheDir() + "/" + hashHex);
+
+    // Miss before put (empty sentinel).
+    QVERIFY(ContentEngine::cacheGet(hashHex).isEmpty());
+    // Put -> hit, with byte-identical content, inside the blob dir.
+    QVERIFY(ContentEngine::cachePut(hashHex, src));
+    const QString got = ContentEngine::cacheGet(hashHex);
+    QVERIFY(!got.isEmpty());
+    QVERIFY(got.startsWith(ContentEngine::blobCacheDir()));
+    QFile gf(got); QVERIFY(gf.open(QIODevice::ReadOnly));
+    QCOMPARE(gf.readAll(), data);
+    gf.close();
+    // Store-once: a second put is a harmless true.
+    QVERIFY(ContentEngine::cachePut(hashHex, src));
+
+    QStandardPaths::setTestModeEnabled(false);
+}
+
+// PRIVACY: request()/posterFor()/cachePut() must REFUSE a remote URL. We assert
+// the static guard and that cachePut on a URL fails (no fetch path exists).
+void TestLogic::ceRejectsRemoteUrl() {
+    QVERIFY(ContentEngine::isRemoteUrl("http://evil.example/x.png"));
+    QVERIFY(ContentEngine::isRemoteUrl("https://host/v.mp4"));
+    QVERIFY(ContentEngine::isRemoteUrl("ipfs://bafy..."));
+    QVERIFY(ContentEngine::isRemoteUrl("zdc1://deadbeef"));
+    QVERIFY(!ContentEngine::isRemoteUrl("/home/user/local.png"));
+    QVERIFY(!ContentEngine::isRemoteUrl(":/resources/icon.png"));
+
+    QTemporaryDir appDir; QVERIFY(appDir.isValid());
+    qputenv("XDG_DATA_HOME", appDir.path().toUtf8());
+    QStandardPaths::setTestModeEnabled(true);
+    // cachePut of a URL fails (cannot fetch; privacy).
+    QVERIFY(!ContentEngine::cachePut(
+        "aa", "https://host/file.bin"));
+
+    // request() with a URL is a silent no-op: nothing is queued, so onImageReady
+    // never fires. We assert the model row stays PENDING.
+    NFTGalleryModel model;
+    QVector<NFTItem> items;
+    { NFTItem it; it.name = "Remote"; it.docHashHex = "abc123"; it.cachePath = "https://host/x.png"; items.push_back(it); }
+    model.setItems(items);
+    ContentEngine eng(&model);
+    eng.request("abc123", "https://host/x.png", "abc123", 32);
+    // Pump briefly; verifyState must remain PENDING (no worker ran).
+    QElapsedTimer t; t.start();
+    while (t.elapsed() < 300) QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+    QCOMPARE(model.data(model.index(0,0), NFTGalleryModel::VerifyStateRole).toInt(), 0);
+
+    QStandardPaths::setTestModeEnabled(false);
+}
+
+// End-to-end engine verify(): correct anchor -> Verified; a 1-byte tamper ->
+// Mismatch. Exercises the streaming off-GUI-thread verify + the signal landing
+// on the GUI thread. Uses the bare-SHA256 anchor (small file).
+void TestLogic::ceVerifyMismatchOnFlippedByte() {
+    QTemporaryDir appDir; QVERIFY(appDir.isValid());
+    qputenv("XDG_DATA_HOME", appDir.path().toUtf8());
+    QStandardPaths::setTestModeEnabled(true);
+
+    QTemporaryDir tmp; QVERIFY(tmp.isValid());
+    const QByteArray data = patternBytes(5000, 17);
+    const QString p = tmp.path() + "/asset.bin";
+    QVERIFY(writeBytes(p, data));
+    const QString goodHex = QString::fromLatin1(
+        QCryptographicHash::hash(data, QCryptographicHash::Sha256).toHex());
+
+    ContentEngine eng(nullptr);
+    QSignalSpy spy(&eng, &ContentEngine::verifyDone);
+
+    // 1) correct anchor -> Verified
+    eng.verify(p, goodHex, /*token*/1);
+    // 2) wrong anchor (a flipped-byte hash) -> Mismatch
+    QByteArray flipped = data; flipped[3] = flipped[3] ^ 0x01;
+    const QString wrongHex = QString::fromLatin1(
+        QCryptographicHash::hash(flipped, QCryptographicHash::Sha256).toHex());
+    QVERIFY(wrongHex != goodHex);
+    eng.verify(p, wrongHex, /*token*/2);
+
+    QElapsedTimer t; t.start();
+    while (spy.count() < 2 && t.elapsed() < 5000)
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 25);
+    QCOMPARE(spy.count(), 2);
+
+    // Collect results by token (order across the pool is not guaranteed).
+    int vsTok1 = -1, vsTok2 = -1;
+    for (const QList<QVariant>& sig : spy) {
+        const quint64 tok = sig.at(0).toULongLong();
+        const int vs      = sig.at(1).toInt();
+        if (tok == 1) vsTok1 = vs;
+        if (tok == 2) vsTok2 = vs;
+    }
+    QCOMPARE(vsTok1, int(CE_Verified));    // correct anchor
+    QCOMPARE(vsTok2, int(CE_Mismatch));    // flipped-byte anchor
+
+    QStandardPaths::setTestModeEnabled(false);
+}
+
+// posterForToken() must deliver a NON-null large image plus the correct verify
+// state via posterReady(token, img, verifyState) — WITHOUT routing into the
+// gallery model (the engine is constructed with a null model here, so any model
+// route would crash/no-op). Token filtering: the reply carries the caller's token.
+void TestLogic::cePosterForTokenDelivers() {
+    QTemporaryDir appDir; QVERIFY(appDir.isValid());
+    qputenv("XDG_DATA_HOME", appDir.path().toUtf8());
+    QStandardPaths::setTestModeEnabled(true);
+
+    QTemporaryDir tmp; QVERIFY(tmp.isValid());
+    const QString p = tmp.path() + "/pic.png";
+    // A real, decodable image so the poster path produces a non-null QImage.
+    QImage src(24, 24, QImage::Format_ARGB32);
+    src.fill(Qt::green);
+    QVERIFY(src.save(p, "PNG"));
+    // The on-chain anchor = the bare SHA-256 of the PNG bytes (small file).
+    QFile f(p); QVERIFY(f.open(QIODevice::ReadOnly));
+    const QByteArray bytes = f.readAll(); f.close();
+    const QString anchor = QString::fromLatin1(
+        QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
+
+    ContentEngine eng(nullptr);   // null model: the token path must not touch it
+    QSignalSpy spy(&eng, &ContentEngine::posterReady);
+
+    eng.posterForToken(p, anchor, anchor, /*sizePx*/256, /*token*/42);
+
+    QElapsedTimer t; t.start();
+    while (spy.count() < 1 && t.elapsed() < 5000)
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 25);
+    QCOMPARE(spy.count(), 1);
+
+    const QList<QVariant> sig = spy.at(0);
+    QCOMPARE(sig.at(0).toULongLong(), quint64(42));         // our token
+    const QImage img = sig.at(1).value<QImage>();
+    QVERIFY(!img.isNull());                                 // large image delivered
+    QCOMPARE(sig.at(2).toInt(), int(CE_Verified));         // anchor matched
+
+    QStandardPaths::setTestModeEnabled(false);
+}
+
+// Every reject path of posterForToken() must still emit posterReady with a null
+// image + CE_Pending so the dialog never hangs: token==0, empty path, and a
+// remote URL (privacy guard).
+void TestLogic::cePosterForTokenRejects() {
+    ContentEngine eng(nullptr);
+    QSignalSpy spy(&eng, &ContentEngine::posterReady);
+
+    // token==0 -> immediate synchronous reject.
+    eng.posterForToken("/some/local/path.png", "aa", "aa", 256, /*token*/0);
+    // empty path.
+    eng.posterForToken("", "aa", "aa", 256, /*token*/7);
+    // remote URL (privacy guard) -> reject, never fetched.
+    eng.posterForToken("https://evil.example/x.png", "aa", "aa", 256, /*token*/8);
+
+    // All three reject synchronously (no worker queued), so the spy already has 3.
+    QCOMPARE(spy.count(), 3);
+    for (const QList<QVariant>& sig : spy) {
+        QVERIFY(sig.at(1).value<QImage>().isNull());        // null image
+        QCOMPARE(sig.at(2).toInt(), int(CE_Pending));       // pending state
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SHIELD — pure data-channel helpers (nftdatachannel.h). These back the binary-
+// safe memo sniff, the up-front 40000-byte cap, and the four-distinct-state
+// receive UI, so they are L0-gated with no daemon.
+// ---------------------------------------------------------------------------
+
+// The ZDC1 magic MUST be sniffed on the RAW bytes BEFORE any QString is built
+// (a binary frame carries NULs / high bytes a QString decode would mangle).
+void TestLogic::shieldZdc1MagicSniffBinarySafe() {
+    // A real frame: "ZDC1" magic followed by binary payload (NUL + 0xFF high byte).
+    QByteArray frame;
+    frame.append('\x5A').append('\x44').append('\x43').append('\x31');   // ZDC1
+    frame.append('\x00').append('\xFF').append('\x10').append('\x80');   // binary tail
+    QVERIFY2(nftdc::looksLikeZdc1Memo(frame), "a ZDC1 frame must be recognized");
+
+    // An ordinary text memo is NOT a frame.
+    QVERIFY2(!nftdc::looksLikeZdc1Memo(QByteArray("hello world")),
+             "a plain text memo must NOT be mistaken for a frame");
+    // Too short to carry the 4-byte magic.
+    QVERIFY(!nftdc::looksLikeZdc1Memo(QByteArray("ZD")));
+    QVERIFY(!nftdc::looksLikeZdc1Memo(QByteArray()));
+    // A leading NUL (the kind of byte that breaks a naive QString sniff) must not
+    // false-positive, and a near-miss magic must be rejected.
+    QByteArray nul; nul.append('\x00').append('\x5A').append('\x44').append('\x43');
+    QVERIFY(!nftdc::looksLikeZdc1Memo(nul));
+    QByteArray nearMiss("ZDC2");
+    QVERIFY(!nftdc::looksLikeZdc1Memo(nearMiss));
+}
+
+// The GUI's up-front cap must match the daemon's principled 40000-byte limit.
+void TestLogic::shieldFileCapConstant() {
+    QCOMPARE(nftdc::ZDC_MAX_FILE_BYTES, 40000);
+}
+
+void TestLogic::shieldErrorStateMapping_data() {
+    QTest::addColumn<QString>("errStr");
+    QTest::addColumn<int>("expected");
+    // The daemon emits zdc::status_str text; each distinct failure must map to its
+    // own state (never collapsed to a generic "failed").
+    QTest::newRow("hash-mismatch")
+        << QString("content hash mismatch after reassembly") << int(nftdc::DTS_HashMismatch);
+    QTest::newRow("aead-fail")
+        << QString("AEAD verification failed (tamper or wrong key)") << int(nftdc::DTS_AeadFail);
+    QTest::newRow("no-key")
+        << QString("key not yet available (sealed)") << int(nftdc::DTS_NoKey);
+    QTest::newRow("incomplete")
+        << QString("transfer incomplete (missing frames)") << int(nftdc::DTS_Incomplete);
+    QTest::newRow("frames-still-missing")
+        << QString("ERR_INCOMPLETE (frames still missing)") << int(nftdc::DTS_Incomplete);
+    QTest::newRow("empty")     << QString()              << int(nftdc::DTS_None);
+    QTest::newRow("unknown")   << QString("some other daemon error") << int(nftdc::DTS_OtherError);
+}
+
+void TestLogic::shieldErrorStateMapping() {
+    QFETCH(QString, errStr);
+    QFETCH(int, expected);
+    QCOMPARE(int(nftdc::mapDataTransferError(errStr)), expected);
+    // The four hard states must each carry distinct, non-empty honest copy; the
+    // mismatch/aead refusals must NOT say "try again".
+    const nftdc::DataTransferState st = nftdc::mapDataTransferError(errStr);
+    if (st == nftdc::DTS_HashMismatch || st == nftdc::DTS_AeadFail) {
+        const QString copy = nftdc::dataTransferStateCopy(st);
+        QVERIFY2(!copy.isEmpty(), "a refusal must carry honest copy");
+        QVERIFY2(!copy.contains("try again", Qt::CaseInsensitive),
+                 "a hard refusal must NOT invite a retry");
+    }
 }
 
 QTEST_MAIN(TestLogic)

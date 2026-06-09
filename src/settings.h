@@ -69,6 +69,22 @@ public:
     bool    getShowCachedBalance();
     void    setShowCachedBalance(bool show);
 
+    // Opt-out (default ON): show the native "Collections" NFT gallery tab (Phase
+    // C0). Pure GUI, fixture-driven, off the money path; gating its creation
+    // keeps the nav-rail<->tab index mapping clean when disabled.
+    bool    getShowNFTGallery();
+    void    setShowNFTGallery(bool show);
+
+    // Opt-in (default OFF): the SHIELD data-channel for private FILE transfers.
+    // This is the user's stated INTENT, persisted as a GUI preference; the actual
+    // capability is the daemon -datachannel flag (default off), which the dialog
+    // adds to zclassic.conf + prompts a restart. HONEST: this makes only file
+    // CONTENT private — NFT ownership is always public and the ciphertext is
+    // stored on-chain forever. When the daemon flag is still off, every Shield
+    // action probes the RPC and treats -32601 as "off" (it never pretends it's on).
+    bool    getEnableDataChannel();
+    void    setEnableDataChannel(bool on);
+
     // W1-1 (opt-out, default ON): show the MainWindow immediately on startup and
     // run the node-warmup splash as a NON-blocking, dismissible overlay instead of
     // blocking the UI behind a nested d->exec() modal loop for 1-2 minutes. When
@@ -112,6 +128,10 @@ public:
     static bool    isTAddress(QString addr);
 
     static QString getDecimalString(double amt);
+    // zatoshi -> human ZCL decimal string, routed through getDecimalString so the
+    // NFT dialogs format money via the ONE tested path (1 ZCL = 1e8 zat). Replaces
+    // NFTBuyDialog's deleted bespoke humanZcl. L0-tested.
+    static QString zatToDecimalString(qint64 zat);
     // Thousands-separated integer for block heights, e.g. 1700000 -> "1,700,000".
     // Single source of truth so every "block N" string reads the same.
     static QString getHeightString(qint64 height);
