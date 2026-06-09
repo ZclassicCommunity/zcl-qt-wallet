@@ -2,6 +2,7 @@
 // NFTDetailDialog implementation — see nftdetaildialog.h. NATIVE_NFT_GUIDE §2.4.
 // ============================================================================
 #include "nftdetaildialog.h"
+#include "beta7releaseflags.h"
 #include "nftsenddialog.h"
 #include "nftselldialog.h"
 #include "shieldsenddialog.h"
@@ -190,30 +191,32 @@ NFTDetailDialog::NFTDetailDialog(const NFTItem& item, const QVector<NFTItem>& or
     actionRow->addWidget(m_sellBtn, 1);
     info->addLayout(actionRow);
 
-    // ---- SHIELD row (its own labelled row): private FILE content — never private
-    // ownership. "Send file privately…" opens the encrypted-send dialog; "Open private
-    // file" looks up the file linked to THIS token's fingerprint (verify-before-decrypt).
-    auto* shieldCaption = new QLabel(tr("Private file"), this);
-    shieldCaption->setObjectName("nftDetailShieldCaption");
-    shieldCaption->setStyleSheet("color:#9aa0a6;");
-    info->addWidget(shieldCaption);
+    if (ZCL_LEGACY_DATACHANNEL_UI) {
+        // ---- SHIELD row (its own labelled row): private FILE content — never private
+        // ownership. "Send file privately…" opens the encrypted-send dialog; "Open private
+        // file" looks up the file linked to THIS token's fingerprint (verify-before-decrypt).
+        auto* shieldCaption = new QLabel(tr("Private file"), this);
+        shieldCaption->setObjectName("nftDetailShieldCaption");
+        shieldCaption->setStyleSheet("color:#9aa0a6;");
+        info->addWidget(shieldCaption);
 
-    auto* shieldRow = new QHBoxLayout();
-    m_sendFileBtn = new QPushButton(tr("Send file privately…"), this);
-    m_sendFileBtn->setObjectName("nftDetailSendPrivateButton");
-    m_sendFileBtn->setWhatsThis(
-        tr("Encrypts the file's CONTENTS so only your recipient can read it. Ownership "
-           "stays public — only the file is private. The encrypted file is stored "
-           "on-chain permanently."));
-    m_openFileBtn = new QPushButton(tr("Open private file"), this);
-    m_openFileBtn->setObjectName("nftDetailOpenPrivateButton");
-    m_openFileBtn->setWhatsThis(
-        tr("Look up the private file linked to this collectible's fingerprint and, if "
-           "it verifies against the on-chain fingerprint, decrypt and open it."));
-    shieldRow->addWidget(m_sendFileBtn);
-    shieldRow->addWidget(m_openFileBtn);
-    shieldRow->addStretch(1);
-    info->addLayout(shieldRow);
+        auto* shieldRow = new QHBoxLayout();
+        m_sendFileBtn = new QPushButton(tr("Send file privately…"), this);
+        m_sendFileBtn->setObjectName("nftDetailSendPrivateButton");
+        m_sendFileBtn->setWhatsThis(
+            tr("Encrypts the file's CONTENTS so only your recipient can read it. Ownership "
+               "stays public — only the file is private. The encrypted file is stored "
+               "on-chain permanently."));
+        m_openFileBtn = new QPushButton(tr("Open private file"), this);
+        m_openFileBtn->setObjectName("nftDetailOpenPrivateButton");
+        m_openFileBtn->setWhatsThis(
+            tr("Look up the private file linked to this collectible's fingerprint and, if "
+               "it verifies against the on-chain fingerprint, decrypt and open it."));
+        shieldRow->addWidget(m_sendFileBtn);
+        shieldRow->addWidget(m_openFileBtn);
+        shieldRow->addStretch(1);
+        info->addLayout(shieldRow);
+    }
 
     // ---- UTILITY row (quiet): one state-aware verify button + the copy/save tools.
     // The verify button is the SINGLE entry point — its text becomes "Re-check" when
@@ -259,8 +262,10 @@ NFTDetailDialog::NFTDetailDialog(const NFTItem& item, const QVector<NFTItem>& or
     connect(copyFpBtn,   &QPushButton::clicked, this, &NFTDetailDialog::onCopyFingerprint);
     connect(m_recheckBtn,  &QPushButton::clicked, this, &NFTDetailDialog::onVerifyFile);
     connect(m_explorerBtn, &QPushButton::clicked, this, &NFTDetailDialog::onViewInExplorer);
-    connect(m_sendFileBtn, &QPushButton::clicked, this, &NFTDetailDialog::onSendPrivateFile);
-    connect(m_openFileBtn, &QPushButton::clicked, this, &NFTDetailDialog::onOpenPrivateFile);
+    if (ZCL_LEGACY_DATACHANNEL_UI) {
+        connect(m_sendFileBtn, &QPushButton::clicked, this, &NFTDetailDialog::onSendPrivateFile);
+        connect(m_openFileBtn, &QPushButton::clicked, this, &NFTDetailDialog::onOpenPrivateFile);
+    }
 
     if (m_engine) {
         connect(m_engine, &ContentEngine::posterReady,
@@ -560,6 +565,8 @@ void NFTDetailDialog::backfillTransfers() {
 }
 
 void NFTDetailDialog::onSendPrivateFile() {
+    if (!ZCL_LEGACY_DATACHANNEL_UI)
+        return;
     // SHIELD: open the private-file SEND dialog. HONEST: this encrypts FILE CONTENT
     // only — it does NOT make ownership private (the dialog repeats that). Modal.
     ShieldSendDialog dlg(m_rpc, this);
@@ -567,6 +574,8 @@ void NFTDetailDialog::onSendPrivateFile() {
 }
 
 void NFTDetailDialog::onOpenPrivateFile() {
+    if (!ZCL_LEGACY_DATACHANNEL_UI)
+        return;
     // SHIELD Mode A: open the private file linked to THIS token's fingerprint, with the
     // token's docHashHex as the expected anchor (verify-before-decrypt). Modal.
     ShieldReceiveDialog dlg(m_rpc, this);

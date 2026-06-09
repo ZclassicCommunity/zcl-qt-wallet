@@ -19,6 +19,7 @@
 #include "nftmintdialog.h"
 #include "nftbuydialog.h"
 #include "nftcommon.h"
+#include "beta7releaseflags.h"
 #include "shieldsenddialog.h"
 #include "shieldreceivedialog.h"
 #include "flowlayout.h"
@@ -2038,21 +2039,26 @@ void MainWindow::setupSettingsModal() {
             settings.chkNatpmp->setToolTip(tr("Automatic port opening is available only when running an embedded zclassicd."));
         }
 
-        // Private file transfers (ZDC1 data-channel). Default OFF. The daemon reads
-        // -datachannel only at launch, so a change is written to zclassic.conf and
-        // takes effect on the next restart. Only meaningful with the embedded daemon
-        // (we edit its conf); disable + explain for an external node. HONEST tooltip:
-        // only file content is private; ownership stays public; ciphertext is permanent.
-        settings.chkDataChannel->setChecked(Settings::getInstance()->getEnableDataChannel());
-        if (!rpc->isEmbedded()) {
-            settings.chkDataChannel->setEnabled(false);
-            settings.chkDataChannel->setToolTip(tr(
-                "Private file transfers are configured on the node. With an external "
-                "zclassicd, add datachannel=1 to its config and restart it."));
+        if (!ZCL_LEGACY_DATACHANNEL_UI) {
+            settings.chkDataChannel->hide();
+            settings.label_datachannel->hide();
         } else {
-            settings.chkDataChannel->setToolTip(tr(
-                "Makes file CONTENTS private — not NFT ownership (always public). The "
-                "encrypted file is stored on every node permanently and can't be deleted."));
+            // Private file transfers (ZDC1 data-channel). Default OFF. The daemon reads
+            // -datachannel only at launch, so a change is written to zclassic.conf and
+            // takes effect on the next restart. Only meaningful with the embedded daemon
+            // (we edit its conf); disable + explain for an external node. HONEST tooltip:
+            // only file content is private; ownership stays public; ciphertext is permanent.
+            settings.chkDataChannel->setChecked(Settings::getInstance()->getEnableDataChannel());
+            if (!rpc->isEmbedded()) {
+                settings.chkDataChannel->setEnabled(false);
+                settings.chkDataChannel->setToolTip(tr(
+                    "Private file transfers are configured on the node. With an external "
+                    "zclassicd, add datachannel=1 to its config and restart it."));
+            } else {
+                settings.chkDataChannel->setToolTip(tr(
+                    "Makes file CONTENTS private — not NFT ownership (always public). The "
+                    "encrypted file is stored on every node permanently and can't be deleted."));
+            }
         }
 
         // Custom fees
@@ -2160,34 +2166,36 @@ void MainWindow::setupSettingsModal() {
                     QMessageBox::Ok);
             }
 
-            // Private file transfers (ZDC1 data-channel). Persist the GUI intent and, for
-            // the embedded daemon, write datachannel=1/0 to zclassic.conf so the RPCs are
-            // registered on the next restart. HONEST prompt: this changes only file-content
-            // privacy; ownership stays public, and any file already sent is permanent. Only
-            // act on a CHANGE (and only edit the conf when we own the node's config).
-            bool wasDataChannel = Settings::getInstance()->getEnableDataChannel();
-            bool dataChannel = settings.chkDataChannel->isChecked();
-            if (dataChannel != wasDataChannel && rpc->isEmbedded()) {
-                Settings::getInstance()->setEnableDataChannel(dataChannel);
-                if (dataChannel) {
-                    Settings::addToZClassicConf(zclassicConfLocation, "datachannel=1");
-                    QMessageBox::information(this, tr("Enable private file transfers"),
-                        tr("Private file transfers will be available the next time ZclWallet "
-                           "restarts its node. Remember: this makes only a file's CONTENTS "
-                           "private — who owns an NFT is always public, and an encrypted file "
-                           "you send is stored on-chain permanently and can't be deleted."),
-                        QMessageBox::Ok);
-                } else {
-                    Settings::removeFromZClassicConf(zclassicConfLocation, "datachannel");
-                    QMessageBox::information(this, tr("Disable private file transfers"),
-                        tr("Private file transfers will be turned off the next time ZclWallet "
-                           "restarts its node. Files already sent remain on-chain permanently — "
-                           "turning this off does not and cannot delete them."),
-                        QMessageBox::Ok);
+            if (ZCL_LEGACY_DATACHANNEL_UI) {
+                // Private file transfers (ZDC1 data-channel). Persist the GUI intent and, for
+                // the embedded daemon, write datachannel=1/0 to zclassic.conf so the RPCs are
+                // registered on the next restart. HONEST prompt: this changes only file-content
+                // privacy; ownership stays public, and any file already sent is permanent. Only
+                // act on a CHANGE (and only edit the conf when we own the node's config).
+                bool wasDataChannel = Settings::getInstance()->getEnableDataChannel();
+                bool dataChannel = settings.chkDataChannel->isChecked();
+                if (dataChannel != wasDataChannel && rpc->isEmbedded()) {
+                    Settings::getInstance()->setEnableDataChannel(dataChannel);
+                    if (dataChannel) {
+                        Settings::addToZClassicConf(zclassicConfLocation, "datachannel=1");
+                        QMessageBox::information(this, tr("Enable private file transfers"),
+                            tr("Private file transfers will be available the next time ZclWallet "
+                               "restarts its node. Remember: this makes only a file's CONTENTS "
+                               "private — who owns an NFT is always public, and an encrypted file "
+                               "you send is stored on-chain permanently and can't be deleted."),
+                            QMessageBox::Ok);
+                    } else {
+                        Settings::removeFromZClassicConf(zclassicConfLocation, "datachannel");
+                        QMessageBox::information(this, tr("Disable private file transfers"),
+                            tr("Private file transfers will be turned off the next time ZclWallet "
+                               "restarts its node. Files already sent remain on-chain permanently — "
+                               "turning this off does not and cannot delete them."),
+                            QMessageBox::Ok);
+                    }
+                } else if (dataChannel != wasDataChannel) {
+                    // External node: we can't edit its conf. Persist the intent and guide.
+                    Settings::getInstance()->setEnableDataChannel(dataChannel);
                 }
-            } else if (dataChannel != wasDataChannel) {
-                // External node: we can't edit its conf. Persist the intent and guide.
-                Settings::getInstance()->setEnableDataChannel(dataChannel);
             }
 
             if (!isUsingTor && settings.chkTor->isChecked()) {
@@ -3180,21 +3188,24 @@ void MainWindow::setupNFTTab() {
     // private FILE content only — never private ownership.
     auto* actionRow = new FlowLayout(/*margin=*/0, /*hSpacing=*/8, /*vSpacing=*/8);
     actionRow->setObjectName("nftActionRow");
-    nftSendFileBtn = new QPushButton(tr("Send file"), nftTab);
-    nftSendFileBtn->setObjectName("nftSendPrivateFileButton");
-    // Honesty in the tooltip: only the file's CONTENTS are encrypted; ownership stays
-    // public, and the encrypted file is stored on every node permanently.
-    nftSendFileBtn->setToolTip(tr(
-        "Send a file whose contents are private (encrypted) to one recipient. "
-        "Ownership stays public — only the file is private. The encrypted file is "
-        "stored on every node permanently and can never be deleted."));
-    actionRow->addWidget(nftSendFileBtn);
-    nftRecvFileBtn = new QPushButton(tr("Receive file"), nftTab);
-    nftRecvFileBtn->setObjectName("nftReceivePrivateFileButton");
-    nftRecvFileBtn->setToolTip(tr(
-        "Receive a file whose contents are private (encrypted), addressed to you. "
-        "Ownership stays public — only the file is private."));
-    actionRow->addWidget(nftRecvFileBtn);
+    if (ZCL_LEGACY_DATACHANNEL_UI) {
+        nftSendFileBtn = new QPushButton(tr("Send file"), nftTab);
+        nftSendFileBtn->setObjectName("nftSendPrivateFileButton");
+        // Honesty in the tooltip: only the file's CONTENTS are encrypted; ownership stays
+        // public, and the encrypted file is stored on every node permanently.
+        nftSendFileBtn->setToolTip(tr(
+            "Send a file whose contents are private (encrypted) to one recipient. "
+            "Ownership stays public — only the file is private. The encrypted file is "
+            "stored on every node permanently and can never be deleted."));
+        actionRow->addWidget(nftSendFileBtn);
+
+        nftRecvFileBtn = new QPushButton(tr("Receive file"), nftTab);
+        nftRecvFileBtn->setObjectName("nftReceivePrivateFileButton");
+        nftRecvFileBtn->setToolTip(tr(
+            "Receive a file whose contents are private (encrypted), addressed to you. "
+            "Ownership stays public — only the file is private."));
+        actionRow->addWidget(nftRecvFileBtn);
+    }
     nftBuyBtn = new QPushButton(tr("Buy"), nftTab);
     nftBuyBtn->setObjectName("nftBuyAnNftButton");
     nftBuyBtn->setToolTip(tr("Buy a collectible from an offer."));
@@ -3308,8 +3319,10 @@ void MainWindow::setupNFTTab() {
 
     QObject::connect(nftMintBtn, &QPushButton::clicked, this, &MainWindow::openMintDialog);
     QObject::connect(nftBuyBtn,  &QPushButton::clicked, this, &MainWindow::openBuyDialog);
-    QObject::connect(nftSendFileBtn, &QPushButton::clicked, this, &MainWindow::openShieldSendDialog);
-    QObject::connect(nftRecvFileBtn, &QPushButton::clicked, this, &MainWindow::openShieldReceiveDialog);
+    if (ZCL_LEGACY_DATACHANNEL_UI) {
+        QObject::connect(nftSendFileBtn, &QPushButton::clicked, this, &MainWindow::openShieldSendDialog);
+        QObject::connect(nftRecvFileBtn, &QPushButton::clicked, this, &MainWindow::openShieldReceiveDialog);
+    }
 
     // --- the gallery view --------------------------------------------------
     auto* view = new QListView(nftTab);
@@ -3474,6 +3487,8 @@ void MainWindow::openBuyDialog() {
 // data-channel). HONEST: ownership stays public; only the file's bytes are private, and
 // the ciphertext is stored on-chain forever (the dialog earns permanence consent).
 void MainWindow::openShieldSendDialog() {
+    if (!ZCL_LEGACY_DATACHANNEL_UI)
+        return;
     ShieldSendDialog dlg(rpc, this);
     dlg.exec();
 }
@@ -3481,6 +3496,8 @@ void MainWindow::openShieldSendDialog() {
 // SHIELD: open the "Receive a private file" dialog (verify-before-decrypt). Lists this
 // session's transfers and accepts a transfer id / fingerprint for cross-wallet receive.
 void MainWindow::openShieldReceiveDialog() {
+    if (!ZCL_LEGACY_DATACHANNEL_UI)
+        return;
     ShieldReceiveDialog dlg(rpc, this);
     dlg.exec();
 }

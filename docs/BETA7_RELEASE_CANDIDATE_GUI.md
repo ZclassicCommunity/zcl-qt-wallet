@@ -36,7 +36,9 @@ Before beta7 GUI release:
 4. Run `contrib/check-ai-denylist.sh`.
 5. Run `git diff --check` on the exact GUI changes being shipped.
 6. Confirm the production GUI hides or dev-gates legacy private file transport;
-   beta7 file delivery is off-chain verified mirror fetch only.
+   beta7 file delivery is off-chain verified mirror fetch only. Cleared by the
+   `ZCL_ENABLE_LEGACY_DATACHANNEL_UI` compile gate: normal builds hide the UI
+   and cannot write `datachannel=1`.
 7. Build portable Linux through `/home/rhett/zclbuild` using the proot pipeline,
    not a host glibc build.
 8. Run the real-display matrix from `/home/rhett/zclbuild/focal/build/run.sh all`.
@@ -66,7 +68,10 @@ Before beta7 GUI release:
 - Final daemon candidate must get one clean full build/gtest pass after the latest
   consolidation commits.
 - GUI source changes must be reviewed separately from docs/safety-gate changes.
-- Legacy on-chain file-transfer UI must be hidden or release-build gated.
+- Cleared: legacy on-chain file-transfer UI is hidden behind the developer-only
+  `ZCL_ENABLE_LEGACY_DATACHANNEL_UI` compile gate. Normal beta7 builds do not
+  expose Collections Send/Receive file, NFT private-file actions, or the
+  Settings `datachannel=1` write path.
 - AI implementation, if included in beta7, must pass the denylist and prompt
   injection tests described in `docs/BETA7_AI_ASSISTANT_GUI_PLAN.md`.
 - All published asset hashes must be recomputed from the gated build artifacts,

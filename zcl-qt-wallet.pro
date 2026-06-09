@@ -98,6 +98,7 @@ HEADERS += \
     src/nftsenddialog.h \
     src/nftselldialog.h \
     src/nftbuydialog.h \
+    src/beta7releaseflags.h \
     src/shieldsenddialog.h \
     src/shieldreceivedialog.h \
     src/nftdatachannel.h \
