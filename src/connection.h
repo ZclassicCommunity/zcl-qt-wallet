@@ -43,6 +43,44 @@ struct ConnectionConfig {
 
 class Connection;
 
+// IDIOTPROOF NODE-SWAP support. When the wallet attaches to a FOREIGN (we-did-not-spawn)
+// ZClassic node that is too OLD to do collectibles, the Collections guidance panel offers
+// "Use this wallet's built-in node". That swap is a STATE MACHINE so its progress + every
+// failure path are honest, retryable, and never a dead-end. These are top-level (not nested
+// in ConnectionLoader) so the L0/L1 tests can name them without poking private internals.
+//
+// NodeSwapState — the externally-visible phase of the swap, for progress copy + test
+// markers. Idle before/after; the rest are the live phases. Each maps 1:1 to a stderr
+// "ZQW-E2E swap: ..." marker (see swapMarkerForState) the headless E2E harness asserts on.
+enum class NodeSwapState {
+    Idle,             // not running / finished cleanly into the built-in node
+    Stopping,         // sent the graceful "stop" RPC; polling for the port+lock to free
+    StartingBuiltIn,  // port freed; launching + warming up our own embedded node
+    Supported,        // built-in node up, NFT probe resolved Supported — done
+    ServiceGuidance,  // the old node is a systemd/auto-restart service — show the command
+    Failed            // an honest, retryable failure (never a spinner-forever)
+};
+
+// FOREIGN-NODE classification, filled best-effort from /proc for the node bound to our RPC
+// port (pid+cmdline via the standard pidfile, same scan cred-discovery already uses). A
+// plain value type so the L0 parser test can build it from sample /proc strings.
+struct ForeignNodeInfo {
+    qint64  pid       = 0;        // 0 == unknown (no pidfile / cross-user / stale)
+    QString exePath;             // /proc/<pid>/exe target (empty if unreadable)
+    QString cmdline;             // space-joined args (NEVER logged — may carry creds)
+    // The foreign node's command-line -datadir, parsed from the RAW NUL-separated args (so a
+    // datadir path containing spaces is preserved exactly — unlike re-parsing `cmdline`).
+    // EMPTY == no -datadir on the cmdline (it used the conf/default datadir). NEVER logged.
+    QString cmdDataDir;
+    bool    isSystemService = false;   // would auto-restart if stopped -> don't fight it
+    QString serviceUnit;         // best-effort unit name ("zclassicd" / "zclassicd.service")
+};
+
+// SERVICE DETECTION (pure, L0-testable) lives in its own tiny header so the L0 unit suite
+// can compile + test it WITHOUT linking connection.cpp: classifyForeignServiceFromProc() +
+// nodeSwapServiceStopCommand().
+#include "nodeswapdetect.h"
+
 class ConnectionLoader {
 
 public:
@@ -50,6 +88,32 @@ public:
     ~ConnectionLoader();
 
     void loadConnection();
+
+    // IDIOTPROOF NODE-SWAP entry point (user-initiated from the Collections "Use this
+    // wallet's built-in node" button). Spun up on a FRESH ConnectionLoader (the connect-
+    // time one is deleted post-handoff, exactly like launchBlockchainRepair). Runs the swap
+    // state machine: detect the foreign node, refuse to fight a systemd service (show the
+    // exact `systemctl stop` command + Retry instead), else GRACEFULLY "stop" the old node,
+    // wait for the port+lock to free, start our OWN embedded node on the SAME datadir, then
+    // re-probe NFT capability. NEVER kill -9, never corrupt the datadir; every failure ends
+    // on an honest retryable message. UAF-safe: guards all async on the ezAlive token + a
+    // QPointer<MainWindow>.
+    void startNodeSwap();
+
+    // TEST SEAM (ZCL_WIDGET_TEST): drive the swap state machine WITHOUT a daemon. Lets the
+    // L1 test assert the state transitions + the panel/marker behaviour deterministically.
+    // setSwapTestMode(true) makes startNodeSwap() short-circuit the real stop/start/poll
+    // (no RPC, no QProcess) and instead step the machine through testStepSwap() calls.
+    void setSwapTestMode(bool on) { swapTestMode = on; }
+    NodeSwapState swapState() const { return swapStateValue; }
+    // Step the machine to `next` (test-only) and run the same side effects (panel copy,
+    // stderr marker) the production transition would, minus the real I/O.
+    void testStepSwap(NodeSwapState next) { setSwapState(next); }
+    // The exact systemctl command we'd surface for a detected service unit — asserted by
+    // the L1 service-guidance test without a real service running.
+    static QString serviceStopCommandFor(const QString& unit);
+    // The stderr marker string for a state (also the basis of the panel/test assertions).
+    static QString swapMarkerForState(NodeSwapState s);
 
     // SELF-HEAL: manual-override entry point. Spun up fresh from MainWindow's
     // always-reachable Help -> "Repair / Re-download blockchain…" action AFTER the
@@ -289,6 +353,39 @@ private:
     // probed at most once. -1 unknown, 0 absent, 1 present.
     int     ezBootstrapRpcProbed = -1;
 
+    // ---- IDIOTPROOF NODE-SWAP state machine (see startNodeSwap) ----
+    NodeSwapState swapStateValue = NodeSwapState::Idle;
+    bool          swapTestMode   = false;   // test seam: skip the real stop/start/poll I/O
+    QElapsedTimer swapPollTimer;            // bounds the stop-wait window (<=~25s)
+    int           swapRebindPolls = 0;      // consecutive polls a node re-bound after stop
+    ForeignNodeInfo swapForeign;            // the detected old node (pid/cmdline/service)
+    // Detect the foreign node currently on our RPC port: pid+cmdline via the standard
+    // pidfile -> /proc scan (reused from cred discovery), exe via /proc/<pid>/exe, and the
+    // system-service classification via classifyForeignServiceFromProc(). Best-effort: any
+    // field may stay empty/0 on a cross-user or non-Linux host (then we still offer the
+    // graceful-stop path, never a dead-end). NEVER logs the cmdline (may carry creds).
+    ForeignNodeInfo detectForeignNode(const std::shared_ptr<ConnectionConfig>& cfg);
+    // Centralised transition: set swapStateValue, emit the stderr E2E marker, and push the
+    // matching honest progress/guidance copy to the Collections panel via MainWindow.
+    void setSwapState(NodeSwapState s);
+    // Poll step (<=~25s): the RPC port is free AND the datadir lock released -> start our
+    // built-in node; a node RE-BOUND within a few polls -> fall back to service guidance;
+    // timeout -> a retryable Failed. Re-armed via singleShot, guarded by ezAlive.
+    void swapPollForFree();
+    // True iff 127.0.0.1:<port> currently REFUSES a connect (the foreign node's RPC is gone)
+    // AND the datadir lock (.lock under blocks/, same as a bitcoin-core datadir) is free.
+    bool swapPortAndLockFree();
+    // The port we probe/own across the swap (the foreign node's RPC port, then ours).
+    QString swapRpcPort;
+    // DATADIR-PIN (safety point #4): the foreign node's command-line -datadir, parsed from
+    // swapForeign.cmdline. When non-empty it is pinned as -datadir onto the embedded launch so
+    // the swap adopts the IDENTICAL wallet.dat (funds stay visible). EMPTY == nothing to pin
+    // (the foreign node used the conf/default datadir, which our embedded node resolves too).
+    // A DIVERGENT cmdline -datadir never reaches here: startNodeSwap() refuses that swap up
+    // front (routes to ServiceGuidance) rather than launch on the wrong datadir. Set only for
+    // the duration of a swap launch and consumed by startEmbeddedZClassicd().
+    QString swapPinDataDir;
+
     // Edit #2 (blocker #2): bounded counter for the getinfo error handler's CATCH-ALL
     // branch (any QNetworkReply error not otherwise handled, incl. an InternalServerError
     // whose body did not parse). For the first kMaxUnexpectedErrPolls polls we re-schedule
@@ -315,6 +412,10 @@ private:
     // an empty string (-> caller falls back) when there is no embedded payload,
     // on a hash mismatch, or on macOS (notarization forbids exec of an extracted file).
     QString ensureDaemonExtracted();
+    // True iff THIS executable carries an appended embedded-daemon payload (the single-file
+    // release: trailing 8-byte "ZQWDMON1" magic). Cheap (reads 8 bytes). Used to prefer our
+    // bundled daemon over a foreign `zclassicd` sibling. Always false on macOS (never embeds).
+    bool hasEmbeddedDaemon();
 
     QProcess*               ezclassicd  = nullptr;
     QElapsedTimer           ezWarmupTimer;   // measures embedded-node startup/warmup time

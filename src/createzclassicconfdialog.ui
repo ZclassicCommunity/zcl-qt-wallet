@@ -11,7 +11,7 @@
    </rect>
   </property>
   <property name="windowTitle">
-   <string>Configure zclassic.conf</string>
+   <string>Set up ZClassic</string>
   </property>
   <layout class="QGridLayout" name="gridLayout">
    <item row="0" column="1">
@@ -58,7 +58,7 @@
      <item>
       <widget class="QPushButton" name="btnAdvancedConfig">
        <property name="text">
-        <string>Show Advanced Configuration</string>
+        <string>Advanced settings</string>
        </property>
        <property name="checkable">
         <bool>true</bool>

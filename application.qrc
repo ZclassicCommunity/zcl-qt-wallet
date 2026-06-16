@@ -12,6 +12,15 @@
         <file>res/icons/shield-lock.svg</file>
         <file>res/icons/eye.svg</file>
         <file>res/icons/eye-off.svg</file>
+        <file>res/icons/check.svg</file>
+        <file>res/icons/x.svg</file>
+        <file>res/icons/question.svg</file>
+    </qresource>
+    <qresource prefix="/nft">
+        <file>res/nft/sample1.png</file>
+        <file>res/nft/sample2.png</file>
+        <file>res/nft/sample3.png</file>
+        <file>res/nft/sample4.png</file>
     </qresource>
     <qresource prefix="/img">
         <file>res/zclassicdlogo.gif</file>

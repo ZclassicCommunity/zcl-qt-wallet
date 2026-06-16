@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- check mark: NFT bytes VERIFIED (SHA-256 matches docHashHex). Single solid
+     #000000 fill used as an alpha mask and tinted to the green badge color at
+     paint time by NFTGalleryDelegate::tintedIcon(). 16px artboard. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <path fill="#000000" d="M6.2 11.3 2.9 8.0l1.1-1.1 2.2 2.2 5.7-5.7 1.1 1.1z"/>
+</svg>

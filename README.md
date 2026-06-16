@@ -9,16 +9,16 @@ A private, single-file ZClassic wallet — with a full ZClassic node built right
 
 ## Download & run
 
-**Latest release: v2.1.2-beta6** — always grab whatever GitHub marks as **Latest**:
+**Latest release: v2.1.2-beta7** — always grab whatever GitHub marks as **Latest**:
 **https://github.com/ZclassicCommunity/zcl-qt-wallet/releases/latest**
 
 Download the **one** file for your computer and open it:
 
 | Your computer | Download | First-time open |
 |---|---|---|
-| **Windows** | `zclwallet-v2.1.2-beta6-win64.exe` | Double-click. If you see **"Windows protected your PC"**, click **More info → Run anyway**. |
-| **macOS** (Apple Silicon) | `zclwallet-v2.1.2-beta6-macos-arm64.dmg` | Open the `.dmg` and drag **ZclWallet** to Applications. On first launch macOS says **"Apple could not verify … is free from malware"** — that's expected (the app is signed but not yet notarized). See **[Opening on macOS](#opening-on-macos)** just below. |
-| **Linux** | `zclwallet-v2.1.2-beta6-linux-x86_64` | `chmod +x zclwallet-v2.1.2-beta6-linux-x86_64 && ./zclwallet-v2.1.2-beta6-linux-x86_64` — or right-click → Properties → *Allow executing as program*, then double-click. _(glibc ≥ 2.29; no Qt install needed.)_ |
+| **Windows** | `zclwallet-v2.1.2-beta7-win64.exe` | Double-click. If you see **"Windows protected your PC"**, click **More info → Run anyway**. |
+| **macOS** (Apple Silicon) | `macOS-zclwallet-v2.1.2-beta7.dmg` | Open the `.dmg` and drag **ZclWallet** to Applications. On first launch macOS says **"Apple could not verify … is free from malware"** — that's expected (the app is signed but not yet notarized). See **[Opening on macOS](#opening-on-macos)** just below. |
+| **Linux** | `linux-zclwallet-v2.1.2-beta7` | `chmod +x linux-zclwallet-v2.1.2-beta7 && ./linux-zclwallet-v2.1.2-beta7` — or right-click → Properties → *Allow executing as program*, then double-click. _(glibc ≥ 2.29; no Qt install needed.)_ |
 
 ### Opening on macOS
 
@@ -44,6 +44,23 @@ ZClassic supports **shielded z-addresses**, which keep your balances and transfe
 - The **Balance** tab shows your **Shielded** and **Transparent** funds separately, plus the **Total** — so you always know what's private and what's public.
 
 The tabs are: **Balance · Send · Receive · Transactions · zclassicd**.
+
+## NFTs / Collectibles (dev/testnet stage)
+
+The wallet has a native **Collections** tab for ZClassic NFTs — 100% built-in, **no web browser**, no marketplace, no external site. Everything renders and verifies locally.
+
+- **Browse what you own.** The Collections gallery shows each NFT this wallet holds, with its picture, name, and a public/private pill — fed straight from your built-in node.
+- **Mint from a file.** "Make a collectible" lets you drag in any image (or other file), give it a name, and create a 1-of-1 NFT. Your file **never leaves your computer** — only a fingerprint (a SHA-256 of the file) goes on-chain. Minting is public and permanent.
+- **Verify the image.** Every card shows a badge that checks the picture against its on-chain fingerprint:
+  - ✓ **"This image matches its on-chain fingerprint."** — the bytes you have are exactly what was minted.
+  - ✗ **"This image does NOT match what was recorded on-chain."** — don't trust it.
+  - ? **Checking / Image not downloaded.** — the wallet never auto-fetches a remote file (that would leak your IP and interest); you supply the bytes.
+
+- **Send / gift a collectible.** Open any collectible and choose **Send / Gift** to transfer it to a friend's address. The wallet refuses to send an item whose picture fails its on-chain check, and an ordinary send never accidentally spends (burns) a collectible's carrier output.
+
+The badge means only "these bytes match the on-chain fingerprint" — **never** genuine / official / original. The name and image aren't unique (anyone can mint another reusing them); only the mint id is one of a kind. NFTs ride a **non-consensus overlay** (ZSLP) that the node re-derives from the chain — a forgery can be mined but credits nobody. Treat the feature as **dev/testnet-stage**, not mainnet-ready. (The node's NFT index is on by default; for the daemon/CLI side and the full design, see the [zclassic node repo](https://github.com/ZclassicCommunity/zclassic) → `doc/nft/`.)
+
+Two more collectible features — **private files/NFTs** over the shielded data channel (SHIELD) and **selling** a collectible for ZCL via an atomic swap (SELL) — are built on the node today (dev/testnet) and driven from the command line; native wallet screens for them are coming. For the CLI walkthroughs see the zclassic node repo → `doc/nft/` (start with `NATIVE_NFT_GUIDE.md`) and the `qa/zslp/` regtest scripts.
 
 ## Verify your download
 

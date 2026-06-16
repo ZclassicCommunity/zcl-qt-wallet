@@ -43,9 +43,31 @@ CONFIG += c++14
 SOURCES += \
     src/main.cpp \
     src/mainwindow.cpp \
+    src/flowlayout.cpp \
     src/rpc.cpp \
     src/balancestablemodel.cpp \
     src/privacybadgedelegate.cpp \
+    src/nftgallerymodel.cpp \
+    src/nftgallerydelegate.cpp \
+    src/contentengine.cpp \
+    src/nftimagecache.cpp \
+    src/nftasyncdialog.cpp \
+    src/nftcommon.cpp \
+    src/nftdetaildialog.cpp \
+    src/nftmintdialog.cpp \
+    src/nftsenddialog.cpp \
+    src/nftselldialog.cpp \
+    src/nftbuydialog.cpp \
+    src/nftlistingsdialog.cpp \
+    src/nftmarketdialog.cpp \
+    src/collectioncreatedialog.cpp \
+    src/collectionbrowsedialog.cpp \
+    src/shieldsenddialog.cpp \
+    src/shieldreceivedialog.cpp \
+    src/namescommon.cpp \
+    src/nameregisterdialog.cpp \
+    src/nameresolvedialog.cpp \
+    src/nametransferdialog.cpp \
     src/3rdparty/qrcode/BitBuffer.cpp \
     src/3rdparty/qrcode/QrCode.cpp \
     src/3rdparty/qrcode/QrSegment.cpp \
@@ -66,11 +88,36 @@ SOURCES += \
 HEADERS += \
     src/notifyserver.h \
     src/securerandom.h \
+    src/flowlayout.h \
     src/mainwindow.h \
     src/precompiled.h \
     src/rpc.h \
     src/balancestablemodel.h \
     src/privacybadgedelegate.h \
+    src/nft.h \
+    src/nftgallerymodel.h \
+    src/nftgallerydelegate.h \
+    src/contentengine.h \
+    src/nftimagecache.h \
+    src/nftasyncdialog.h \
+    src/nftcommon.h \
+    src/nftdetaildialog.h \
+    src/nftmintdialog.h \
+    src/nftsenddialog.h \
+    src/nftselldialog.h \
+    src/nftbuydialog.h \
+    src/nftlistingsdialog.h \
+    src/nftmarketdialog.h \
+    src/beta7releaseflags.h \
+    src/collectioncreatedialog.h \
+    src/collectionbrowsedialog.h \
+    src/shieldsenddialog.h \
+    src/shieldreceivedialog.h \
+    src/namescommon.h \
+    src/nameregisterdialog.h \
+    src/nameresolvedialog.h \
+    src/nametransferdialog.h \
+    src/nftdatachannel.h \
     src/3rdparty/qrcode/BitBuffer.hpp \
     src/3rdparty/qrcode/QrCode.hpp \
     src/3rdparty/qrcode/QrSegment.hpp \

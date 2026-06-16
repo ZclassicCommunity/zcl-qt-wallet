@@ -263,7 +263,7 @@ and an LGPL relink-objects tarball.
 | Var | Meaning |
 |---|---|
 | `QT_STATIC` | base dir of a statically built Qt 5.15 (e.g. `/opt/qt-static`) |
-| `APP_VERSION` | version string, must match `src/version.h` (currently `2.1.2-beta5`) |
+| `APP_VERSION` | version string, must match `src/version.h` (currently `2.1.2-beta7`) |
 | `PREV_VERSION` | prior version string (used for an in-place `sed` version bump in `.pro`/README) |
 | `ZCASH_DIR` | a zclassic checkout that has the daemon staged at `$ZCASH_DIR/artifacts/zclassicd` |
 
@@ -275,8 +275,8 @@ and an LGPL relink-objects tarball.
 ```bash
 cd /home/rhett/github/zcl-qt-wallet
 QT_STATIC=/opt/qt-static \
-APP_VERSION=2.1.2-beta5 \
-PREV_VERSION=2.1.2-beta5 \
+APP_VERSION=2.1.2-beta7 \
+PREV_VERSION=2.1.2-beta6 \
 ZCASH_DIR=/home/rhett/github/zclassic \
 bash src/scripts/mkrelease.sh
 ```
@@ -396,8 +396,8 @@ cp /home/rhett/github/zclassic/release/x86_64-w64-mingw32/zclassicd.exe /tmp/zcl
 # (if you built with build.sh instead: cp src/zclassicd.exe /tmp/ && x86_64-w64-mingw32-strip -s /tmp/zclassicd.exe)
 
 # Append the footer to a copy of the GUI .exe:
-cp /home/rhett/github/zcl-qt-wallet/release/zclwallet.exe /tmp/zclwallet-v2.1.2-beta5-win64.exe
-python3 - /tmp/zclassicd.exe /tmp/zclwallet-v2.1.2-beta5-win64.exe <<'PYEOF'
+cp /home/rhett/github/zcl-qt-wallet/release/zclwallet.exe /tmp/zclwallet-v2.1.2-beta7-win64.exe
+python3 - /tmp/zclassicd.exe /tmp/zclwallet-v2.1.2-beta7-win64.exe <<'PYEOF'
 import sys, hashlib, struct
 d = open(sys.argv[1], 'rb').read()
 with open(sys.argv[2], 'ab') as f:
@@ -411,7 +411,7 @@ PYEOF
 **Verify the footer round-trips** (magic, sha, and that the embedded slice is a PE):
 
 ```bash
-python3 - /tmp/zclwallet-v2.1.2-beta5-win64.exe <<'PYEOF'
+python3 - /tmp/zclwallet-v2.1.2-beta7-win64.exe <<'PYEOF'
 import os, struct, hashlib, sys
 p = sys.argv[1]; sz = os.path.getsize(p)
 with open(p, 'rb') as f:
@@ -451,7 +451,7 @@ cd /path/to/zclassic && ./zcutil/build.sh -j$(sysctl -n hw.ncpu)
 
 ```bash
 cd /path/to/zcl-qt-wallet
-src/scripts/mkmacdmg.sh -q /path/to/static/Qt -z /path/to/zclassic -v 2.1.2-beta5
+src/scripts/mkmacdmg.sh -q /path/to/static/Qt -z /path/to/zclassic -v 2.1.2-beta7
 ```
 
 `mkmacdmg.sh` flow:
@@ -500,7 +500,7 @@ Privacy & Security → Automation).
 
 > If you intend to **notarize** (vs ad-hoc) you need a Developer ID identity and
 > `xcrun notarytool` / stapling — that is beyond this doc and is done by the mac
-> maintainer. The published `2.1.2-beta5` `.dmg`'s exact sign/notarize status is not
+> maintainer. The `2.1.2-beta7` `.dmg`'s exact sign/notarize status is not
 > verifiable from the Linux build box; confirm with the mac maintainer and commit
 > the precise invocation.
 
@@ -620,9 +620,9 @@ In-repo and already tracked (reference, do **not** re-commit): `src/scripts/mkre
 `src/scripts/mkmacdmg.sh`.
 
 ### Known open items
-- **Version is hard-coded** (`src/version.h` → `APP_VERSION "2.1.2-beta5"`); the
+- **Version is hard-coded** (`src/version.h` → `APP_VERSION "2.1.2-beta7"`); the
   proot release scripts also hard-code it and must be bumped together with a tag.
 - **Repo links verified** — the README and docs reference `github.com/ZclassicCommunity/zcl-qt-wallet`
   throughout (the old `ZClassicFoundation/zclwallet` upstream references were removed).
-- The published `2.1.2-beta5` macOS `.dmg` sign/notarize details are owned by the mac
+- The `2.1.2-beta7` macOS `.dmg` sign/notarize details are owned by the mac
   maintainer and are not verifiable from the Linux box.
