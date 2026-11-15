@@ -304,131 +304,23 @@ Artifacts produced in `artifacts/`:
 
 ---
 
-## 7. Windows — static-Qt cross build from Linux
+## 7. Windows — portable static build
 
-The Windows GUI is cross-compiled from Linux using the apt mingw gcc-13 (the *same*
-toolchain that builds `zclassicd.exe`, so GUI and daemon are ABI-consistent) plus a
-from-source **static cross-Qt**. **MXE is intentionally not used** (it needs
-passwordless sudo and rebuilds its own gcc, 4-8h).
+Use the tracked [Windows build and packaging instructions](../contrib/cross/README.md).
+The scripts accept explicit toolchain paths and enforce static runtime linking.
+A static Qt library alone is insufficient: beta6's GUI still imported GCC,
+C++ and pthread DLLs, causing startup failures on clean Windows installations.
 
-These two scripts currently live **outside the repo** at `/home/rhett/` and should
-be committed (see [appendix](#appendix-uncommitted-tooling-to-be-committed)); their
-exact contents are reproduced here.
+Build the GUI with `CONFIG+=zqw_portable` (the cross-build script sets this),
+then use `sh contrib/cross/package-win.sh GUI.exe DAEMON.exe OUTPUT.exe`.
+The packager checks both components for non-system DLL imports and writes the
+existing hash-verified ZQWDMON1 footer without a manual embed step. The daemon
+source and consensus rules are unchanged. The beta6 embedded daemon already
+passes the import check; the GUI requires a rebuild.
 
-### 7a. Build the daemon `.exe` (env var, not positional)
-
-```bash
-cd /home/rhett/github/zclassic
-ZQW_STATIC_GOMP=1 ./zcutil/build-release.sh win64 -j$(nproc)
-# -> release/x86_64-w64-mingw32/zclassicd.exe  (already stripped, ~13.5MB)
-```
-
-> If you build the daemon by hand with `./zcutil/build.sh`, **`HOST` must be an
-> environment variable**: `HOST=x86_64-w64-mingw32 ./zcutil/build.sh -j$(nproc)`.
-> Passing `./zcutil/build.sh HOST=…` as a positional arg silently builds a Linux
-> ELF. Then strip manually: `x86_64-w64-mingw32-strip -s src/zclassicd.exe`.
-
-### 7b. Build static cross-Qt (one-time, `build-qtbase-win.sh`)
-
-```bash
-bash /home/rhett/build-qtbase-win.sh
-# -> /home/rhett/qt-win-static/bin/qmake + static libQt5{Core,Gui,Widgets,Network}.a
-```
-
-The configure line it uses:
-
-```bash
-./configure \
-  -opensource -confirm-license \
-  -release -static \
-  -xplatform win32-g++ \
-  -device-option CROSS_COMPILE=x86_64-w64-mingw32- \
-  -prefix /home/rhett/qt-win-static \
-  -qt-zlib -qt-libpng -qt-libjpeg -qt-freetype -qt-pcre -qt-harfbuzz \
-  -no-opengl -no-openssl -no-dbus -no-icu \
-  -nomake examples -nomake tests
-```
-
-> `-no-openssl` is intentional and safe: the wallet's RPC is plain HTTP to
-> localhost; HTTPS price/update calls are best-effort and already silenced. Do not
-> "fix" it by adding OpenSSL.
-
-### 7c. Cross-build the GUI `.exe` (`build-gui-win.sh`)
-
-```bash
-bash /home/rhett/build-gui-win.sh
-# -> /home/rhett/github/zcl-qt-wallet/release/zclwallet.exe  (~20MB, static Qt)
-```
-
-It (a) stages the daemon's mingw libsodium to **both** `res/liblibsodium.a` (the name
-`win32-g++ -llibsodium` + `PRE_TARGETDEPS` expects) **and** `res/libsodium.a` (so the
-Linux `buildlibsodium.sh` extra-target never fires); (b) `make distclean; rm -f
-Makefile .qmake.stash`; (c) qmake with the explicit mingw `QMAKE_*` toolchain
-(`DEPENDS=/home/rhett/github/zclassic/depends/x86_64-w64-mingw32`):
-
-```bash
-/home/rhett/qt-win-static/bin/qmake zcl-qt-wallet.pro -spec win32-g++ CONFIG+=release \
-  "QMAKE_CC=x86_64-w64-mingw32-gcc" \
-  "QMAKE_CXX=x86_64-w64-mingw32-g++" \
-  "QMAKE_LINK=x86_64-w64-mingw32-g++" \
-  "QMAKE_LINK_C=x86_64-w64-mingw32-gcc" \
-  "QMAKE_AR=x86_64-w64-mingw32-ar cqs" \
-  "QMAKE_RC=x86_64-w64-mingw32-windres" \
-  "QMAKE_OBJCOPY=x86_64-w64-mingw32-objcopy" \
-  "QMAKE_STRIP=x86_64-w64-mingw32-strip" \
-  "INCLUDEPATH+=$DEPENDS/include" \
-  "LIBS+=-L$DEPENDS/lib"
-make -j$(nproc)
-```
-
-> **`build-gui-win.sh` stops at the bare `.exe` — it does NOT embed the daemon.**
-> Shipping that bare `.exe` would give a GUI with no daemon. You must do the embed
-> step below.
-
-### 7d. Embed the daemon into the `.exe` (MANUAL — no committed Windows script does this)
-
-There is currently **no committed Windows embed helper**; the ZQWDMON1 footer-append
-is the same logic as `mkrelease.sh:100-108`, run by hand:
-
-```bash
-# Stage a STRIPPED daemon .exe:
-cp /home/rhett/github/zclassic/release/x86_64-w64-mingw32/zclassicd.exe /tmp/zclassicd.exe
-# (if you built with build.sh instead: cp src/zclassicd.exe /tmp/ && x86_64-w64-mingw32-strip -s /tmp/zclassicd.exe)
-
-# Append the footer to a copy of the GUI .exe:
-cp /home/rhett/github/zcl-qt-wallet/release/zclwallet.exe /tmp/zclwallet-v2.1.2-beta5-win64.exe
-python3 - /tmp/zclassicd.exe /tmp/zclwallet-v2.1.2-beta5-win64.exe <<'PYEOF'
-import sys, hashlib, struct
-d = open(sys.argv[1], 'rb').read()
-with open(sys.argv[2], 'ab') as f:
-    f.write(d)                            # daemon bytes
-    f.write(hashlib.sha256(d).digest())   # sha256 (32)
-    f.write(struct.pack('<Q', len(d)))    # len    (8, little-endian)
-    f.write(b'ZQWDMON1')                  # magic  (8)
-PYEOF
-```
-
-**Verify the footer round-trips** (magic, sha, and that the embedded slice is a PE):
-
-```bash
-python3 - /tmp/zclwallet-v2.1.2-beta5-win64.exe <<'PYEOF'
-import os, struct, hashlib, sys
-p = sys.argv[1]; sz = os.path.getsize(p)
-with open(p, 'rb') as f:
-    f.seek(-48, 2); h = f.read(32); dl = struct.unpack('<Q', f.read(8))[0]; m = f.read(8)
-    f.seek(sz - 48 - dl); d = f.read(dl)
-print('magic', m, 'len', dl, 'gui_size', sz-48-dl,
-      'sha_ok', hashlib.sha256(d).digest() == h, 'embedded_PE', d[:2] == b'MZ')
-PYEOF
-# expect: magic b'ZQWDMON1' ... sha_ok True embedded_PE True
-```
-
-> **Windows runtime-test caveat:** the cross-built `.exe` is build-verified (valid
-> PE32+, static Qt, footer + embedded-daemon sha round-trip), but should be smoke-
-> tested on a real Windows machine — particularly the `%LOCALAPPDATA%` daemon-extract
-> path (`connection.cpp` `Q_OS_WIN` branch) and the snapshot download.
-
----
+A full static Qt 5.15 installation including QtSvg is required. Build and test
+on a clean Windows environment before publishing; packaging regression tests
+alone do not establish that the wallet GUI starts correctly.
 
 ## 8. macOS — `.app` / `.dmg` + ad-hoc codesign
 

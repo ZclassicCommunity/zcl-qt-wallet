@@ -22,6 +22,9 @@
 // ============================================================================
 #include <QtTest/QtTest>
 #include <QtGlobal>
+#include "filepermissions.h"
+#include "embeddeddaemon.h"
+#include <QCryptographicHash>
 #include <QStandardItemModel>
 
 #include "settings.h"
@@ -169,6 +172,7 @@ class TestLogic : public QObject {
     Q_OBJECT
 
 private slots:
+    void embeddedDaemon_integrity();
     void initTestCase();
     void cleanupTestCase();
 
@@ -199,6 +203,7 @@ private slots:
     void sentTxStore_perms_and_testnetName();   // G4
     void sentTxStore_gating();                  // G1
     void sentTxStore_roundTrip();
+    void sentTxStore_invalidHistoryPreserved();
 
     // --- H1 / H2 classifiers (mirrored) ---
     void dbCorruptionMarkers_data();   // H1
@@ -514,15 +519,8 @@ void TestLogic::sentTxStore_perms_and_testnetName() {
     QString expected = QDir(sandboxAppData()).filePath("testnet-senttxstore.dat");
     QVERIFY2(QFile::exists(expected), qPrintable("missing: " + expected));
 
-    // Permissions must be owner-read + owner-write only (0600), no group/other.
-    QFile::Permissions p = QFile::permissions(expected);
-    QVERIFY(p.testFlag(QFileDevice::ReadOwner));
-    QVERIFY(p.testFlag(QFileDevice::WriteOwner));
-    QVERIFY(!p.testFlag(QFileDevice::ReadGroup));
-    QVERIFY(!p.testFlag(QFileDevice::WriteGroup));
-    QVERIFY(!p.testFlag(QFileDevice::ReadOther));
-    QVERIFY(!p.testFlag(QFileDevice::WriteOther));
-    QVERIFY(!p.testFlag(QFileDevice::ExeOwner));
+    // POSIX mode bits on Unix; actual DACL on Windows (Qt flags are approximate).
+    QVERIFY2(testFileIsOwnerOnly(expected), "send history must be owner-only");
 
     SentTxStore::deleteHistory();
     Settings::getInstance()->setTestnet(false);
@@ -591,6 +589,81 @@ void TestLogic::sentTxStore_roundTrip() {
 // =====================================================================
 // H1 — db-corruption / startup-marker / long-warmup classifiers (mirror)
 // =====================================================================
+void TestLogic::embeddedDaemon_integrity() {
+    QTemporaryDir temp;
+    QVERIFY(temp.isValid());
+    const QByteArray payload("fixture daemon bytes");
+    QByteArray bundle("GUI");
+    bundle += payload;
+    bundle += QCryptographicHash::hash(payload, QCryptographicHash::Sha256);
+    quint64 length = payload.size();
+    for (int i = 0; i < 8; ++i) bundle += char((length >> (8 * i)) & 255);
+    bundle += "ZQWDMON1";
+    const QString source = temp.filePath("bundle");
+    auto write = [](const QString& path, const QByteArray& bytes) {
+        QFile f(path);
+        return f.open(QIODevice::WriteOnly) && f.write(bytes) == bytes.size();
+    };
+    QVERIFY(write(source, bundle));
+    QString error;
+    const QString path = extractEmbeddedDaemon(source, temp.path(), &error);
+    QVERIFY2(!path.isEmpty(), qPrintable(error));
+#ifdef Q_OS_WIN
+    QVERIFY(testFileIsOwnerOnly(path));
+#else
+    const auto permissions = QFile::permissions(path);
+    QVERIFY(permissions & QFileDevice::ExeOwner);
+    QVERIFY(permissions & QFileDevice::ReadOwner);
+    QVERIFY(permissions & QFileDevice::WriteOwner);
+    QVERIFY(!(permissions & (QFileDevice::ReadGroup | QFileDevice::WriteGroup |
+        QFileDevice::ExeGroup | QFileDevice::ReadOther | QFileDevice::WriteOther |
+        QFileDevice::ExeOther)));
+#endif
+    QCOMPARE(extractEmbeddedDaemon(source, temp.path(), &error), path);
+    // Same-size cache corruption must be repaired, not trusted by size/name.
+    QVERIFY(write(path, QByteArray(payload.size(), 'x')));
+    QCOMPARE(extractEmbeddedDaemon(source, temp.path(), &error), path);
+    QFile repaired(path);
+    QVERIFY(repaired.open(QIODevice::ReadOnly));
+    QCOMPARE(repaired.readAll(), payload);
+    repaired.close();
+    // Invalid source + invalid cache must fail without publishing bad bytes.
+    QVERIFY(write(path, QByteArray(payload.size(), 'x')));
+    bundle[3] = 'X';
+    QVERIFY(write(source, bundle));
+    QVERIFY(extractEmbeddedDaemon(source, temp.path(), &error).isEmpty());
+    QVERIFY(error.contains("hash mismatch"));
+    QVERIFY(repaired.open(QIODevice::ReadOnly));
+    QCOMPARE(repaired.readAll(), QByteArray(payload.size(), 'x'));
+    repaired.close();
+    // Oversized and truncated footers are rejected before extraction.
+    bundle[bundle.size() - 9] = char(0xff);
+    QVERIFY(write(source, bundle));
+    QVERIFY(extractEmbeddedDaemon(source, temp.path(), &error).isEmpty());
+    QVERIFY(error.contains("length"));
+    QVERIFY(write(source, "ZQWDMON1"));
+    QVERIFY(extractEmbeddedDaemon(source, temp.path(), &error).isEmpty());
+}
+void TestLogic::sentTxStore_invalidHistoryPreserved() {
+    Settings::getInstance()->setTestnet(false);
+    QSettings().setValue("options/savesenttx", true);
+    SentTxStore::deleteHistory();
+    const QString path = QDir(sandboxAppData()).filePath("senttxstore.dat");
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    const QByteArray damaged("[{incomplete-history");
+    QCOMPARE(file.write(damaged), qint64(damaged.size()));
+    file.close();
+    Tx tx; tx.fromAddr = addr::ZS_SAPLING; tx.fee = 0.0001;
+    ToFields recipient; recipient.addr = addr::ZS_ZBOARD; recipient.amount = 1;
+    tx.toAddrs.append(recipient);
+    SentTxStore::addToSentTx(tx, "fixture-txid");
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    QCOMPARE(file.readAll(), damaged);
+    file.close();
+    SentTxStore::deleteHistory();
+}
+
 void TestLogic::dbCorruptionMarkers_data() {
     QTest::addColumn<QString>("text");
     QTest::addColumn<bool>("hit");

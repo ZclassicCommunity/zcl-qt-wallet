@@ -1,5 +1,7 @@
 #include "senttxstore.h"
 #include "settings.h"
+#include "privatefile.h"
+#include <QSaveFile>
 
 /// Get the location of the app data file to be written. 
 QString SentTxStore::writeableFile() {
@@ -68,18 +70,17 @@ void SentTxStore::addToSentTx(Tx tx, QString txid) {
         QJsonArray a;
         jsonDoc.setArray(a);
 
-        QFile newFile(writeableFile());
-        newFile.open(QFile::WriteOnly);
-        // 0600: this file records every outgoing shielded send (recipient addresses
-        // + amounts) as plaintext JSON. Restrict it to the owner so other local
-        // users/processes cannot harvest the user's private send history. (On
-        // Windows the POSIX bits map weakly; this mainly hardens Linux/macOS.)
-        newFile.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
-        newFile.write(jsonDoc.toJson());
-        newFile.close();
     } else {
-        data.open(QFile::ReadOnly);    
-        jsonDoc = QJsonDocument().fromJson(data.readAll());
+        if (!data.open(QFile::ReadOnly)) {
+            qWarning() << "Cannot read sent transaction history:" << data.errorString();
+            return;
+        }
+        QJsonParseError error;
+        jsonDoc = QJsonDocument::fromJson(data.readAll(), &error);
+        if (data.error() != QFileDevice::NoError || error.error != QJsonParseError::NoError || !jsonDoc.isArray()) {
+            qWarning() << "Cannot update invalid or unreadable sent transaction history";
+            return;
+        }
         data.close();
     }
 
@@ -112,11 +113,10 @@ void SentTxStore::addToSentTx(Tx tx, QString txid) {
 
     jsonDoc.setArray(list);
 
-    QFile writer(writeableFile());
-    if (writer.open(QFile::WriteOnly | QFile::Truncate)) {
-        // 0600 owner-only (see above): this is the plaintext shielded send history.
-        writer.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
-        writer.write(jsonDoc.toJson());
+    QSaveFile writer(writeableFile());
+    const QByteArray bytes = jsonDoc.toJson();
+    if (!writer.open(QIODevice::WriteOnly) || !makeFileOwnerOnly(writer) ||
+        writer.write(bytes) != bytes.size() || !writer.commit()) {
+        qWarning() << "Cannot atomically save private sent transaction history:" << writer.errorString();
     }
-    writer.close();
 }

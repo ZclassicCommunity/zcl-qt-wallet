@@ -12,7 +12,6 @@ public:
 
 private:
   QFile *file      = nullptr;
-  bool m_showDate;
 
 signals:
 

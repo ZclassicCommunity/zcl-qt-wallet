@@ -47,6 +47,7 @@ DEPENDPATH  += $$PWD/../../res
 # QTEST_MAIN). Mirror of zcl-qt-wallet.pro SOURCES minus main.cpp, plus the
 # qrcode 3rdparty + singleapplication + the test itself.
 SOURCES += \
+    ../../src/embeddeddaemon.cpp \
     ../../src/mainwindow.cpp \
     ../../src/rpc.cpp \
     ../../src/balancestablemodel.cpp \
@@ -110,5 +111,6 @@ PRE_TARGETDEPS += $$PWD/../../res/libsodium.a
 # Static-Qt offscreen platform plugin import (no X server in the chroot). qmake
 # emits the Q_IMPORT_PLUGIN glue from QTPLUGIN into a generated _plugin_import.cpp.
 static {
-    QTPLUGIN.platforms = qoffscreen
+    win32: QTPLUGIN.platforms = qwindows
+    else: QTPLUGIN.platforms = qoffscreen
 }

@@ -58,6 +58,7 @@
 #include <QColor>
 #include <QStyle>
 #include <memory>
+#include <future>
 
 #include <QLocalSocket>
 #include <QSignalSpy>
@@ -82,6 +83,9 @@
 #include "settings.h"
 #include "connection.h"
 #include "notifyserver.h"
+#include "logger.h"
+#include "../filepermissions.h"
+#include "privatefile.h"
 
 // Kept alive for the whole process so QStandardPaths/QSettings stay isolated.
 static QTemporaryDir* g_homeDir = nullptr;
@@ -98,9 +102,10 @@ static QLocalSocket* notifySendLine(const QString& path, const QByteArray& paylo
     QLocalSocket* c = new QLocalSocket();
     c->connectToServer(path);
     if (!c->waitForConnected(1000)) { delete c; return nullptr; }
-    c->write(payload);
+    if (c->write(payload) != payload.size()) { delete c; return nullptr; }
     c->flush();
-    c->waitForBytesWritten(1000);
+    // The server shares this thread. Let the caller's event loop deliver the
+    // write; a synchronous wait here stalls the very receiver we are testing.
     return c;
 }
 
@@ -133,6 +138,78 @@ private:
     }
 
 private slots:
+
+#ifdef Q_OS_WIN
+    void privateFileCheckRejectsPublicRead() {
+        QTemporaryDir temp;
+        QVERIFY(temp.isValid());
+        const QString path = temp.filePath("private.dat");
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        QVERIFY(makeFileOwnerOnly(file));
+        file.close();
+        QVERIFY(testFileIsOwnerOnly(path));
+        BYTE everyone[SECURITY_MAX_SID_SIZE];
+        DWORD size = sizeof(everyone);
+        QVERIFY(CreateWellKnownSid(WinWorldSid, nullptr, everyone, &size));
+        alignas(DWORD) BYTE aclBytes[sizeof(ACL) + sizeof(ACCESS_ALLOWED_ACE) + SECURITY_MAX_SID_SIZE];
+        auto acl = reinterpret_cast<PACL>(aclBytes);
+        QVERIFY(InitializeAcl(acl, sizeof(aclBytes), ACL_REVISION));
+        QVERIFY(AddAccessAllowedAce(acl, ACL_REVISION, FILE_ALL_ACCESS, everyone));
+        SECURITY_DESCRIPTOR descriptor;
+        QVERIFY(InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION));
+        QVERIFY(SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE));
+        QVERIFY(SetFileSecurityW(reinterpret_cast<LPCWSTR>(path.utf16()),
+                                 DACL_SECURITY_INFORMATION, &descriptor));
+        QVERIFY(file.open(QIODevice::ReadWrite)); // user access still works
+        file.close();
+        QVERIFY(!testFileIsOwnerOnly(path));      // but public access must fail
+    }
+#endif
+
+    void notify_connectorRoundTrip() {
+        NotifyServer server;
+        const QString path = notifySockPath("roundtrip");
+        QVERIFY(server.start(path));
+        QSignalSpy notified(&server, &NotifyServer::notified);
+        const QString token = server.token();
+        const QString id(64, 'a');
+        QElapsedTimer elapsed;
+        elapsed.start();
+        auto result = std::async(std::launch::async, [path, token, id]() {
+            return NotifyServer::sendNotify(path, token, id);
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(result.wait_for(std::chrono::milliseconds(0)) ==
+                                 std::future_status::ready, 3000);
+        QCOMPARE(result.get(), 0);
+        QCOMPARE(notified.size(), 1);
+        qInfo() << "Local notification round trip (ms):" << elapsed.elapsed();
+    }
+
+    void logger_createsFreshProfileDirectory() {
+        QTemporaryDir temp;
+        QVERIFY(temp.isValid());
+        const QString path = temp.filePath("new/profile/wallet.log");
+        {
+            Logger logger(nullptr, path);
+            logger.write("fresh-profile-test");
+            QCOMPARE(logger.findChildren<QFile*>().size(), 1);
+        }
+        QFile log(path);
+        QVERIFY(log.open(QIODevice::ReadOnly));
+        QVERIFY(log.readAll().contains("fresh-profile-test"));
+    }
+
+    void logger_unwritablePathDoesNotCrash() {
+        QTemporaryDir temp;
+        QVERIFY(temp.isValid());
+        QFile blocker(temp.filePath("file"));
+        QVERIFY(blocker.open(QIODevice::WriteOnly));
+        blocker.close();
+        Logger logger(nullptr, blocker.fileName() + "/wallet.log");
+        logger.write("not-written");
+        QVERIFY(!QFile::exists(blocker.fileName() + "/wallet.log"));
+    }
 
     // Between every test, invalidate any stray modal-dismisser poll chain (bump the
     // generation so a leftover QTimer::singleShot re-arm self-cancels on its next
@@ -1563,10 +1640,7 @@ private slots:
         QCOMPARE(fileTok, srv.token());
         QFile tf(NotifyServer::defaultTokenPath());
         QVERIFY(tf.exists());
-        const QFile::Permissions groupOther =
-            QFileDevice::ReadGroup  | QFileDevice::WriteGroup |
-            QFileDevice::ReadOther  | QFileDevice::WriteOther;
-        QVERIFY2((tf.permissions() & groupOther) == 0, "token file must be 0600 (no group/other)");
+        QVERIFY2(testFileIsOwnerOnly(tf.fileName()), "token file must be owner-only");
 
         // sendNotify input gates — these return BEFORE any socket I/O, so they are
         // deterministic single-threaded:
@@ -2370,7 +2444,20 @@ int main(int argc, char* argv[]) {
     // SAFETY: isolate HOME *before* QApplication so QStandardPaths::HomeLocation
     // and QSettings never touch the real ~/.zclassic or the user's config.
     g_homeDir = new QTemporaryDir();
+    if (!g_homeDir->isValid())
+        return 1;
+    // Windows known-folder paths ignore HOME/XDG overrides. Test mode also
+    // moves AppDataLocation (and the ../../ZClassic config lookup) under qttest.
+    QStandardPaths::setTestModeEnabled(true);
+    QSettings::setDefaultFormat(QSettings::IniFormat);
+    QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, g_homeDir->path());
     if (g_homeDir->isValid()) {
+        // The notify token's Windows fallback uses TempLocation, which Qt's
+        // test mode does not redirect. Isolate it before any NotifyServer.
+        qputenv("TMP", g_homeDir->path().toLocal8Bit());
+        qputenv("TEMP", g_homeDir->path().toLocal8Bit());
+        qputenv("TMPDIR", g_homeDir->path().toLocal8Bit());
+        qputenv("XDG_RUNTIME_DIR", g_homeDir->path().toLocal8Bit());
         qputenv("HOME", g_homeDir->path().toLocal8Bit());
         qputenv("XDG_CONFIG_HOME", (g_homeDir->path() + "/.config").toLocal8Bit());
         qputenv("XDG_DATA_HOME",   (g_homeDir->path() + "/.local/share").toLocal8Bit());

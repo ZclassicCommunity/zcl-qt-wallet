@@ -30,7 +30,7 @@ TEMPLATE = app
 DEFINES += \
     QT_DEPRECATED_WARNINGS
 
-INCLUDEPATH  += src/3rdparty/
+INCLUDEPATH  += $$PWD/src $$PWD/src/3rdparty
 
 RESOURCES     = application.qrc
 
@@ -40,7 +40,18 @@ UI_DIR = src
 
 CONFIG += c++14
 
+# A static Qt build alone still imports GCC's exception, C++ and pthread DLLs.
+# Portable Windows releases must link ALL third-party runtimes statically.
+contains(CONFIG, zqw_portable) {
+    !win32-g++: error(zqw_portable requires the MinGW Windows toolchain)
+    contains(QT_CONFIG, shared): error(zqw_portable requires static Qt)
+    QMAKE_CFLAGS += -ffunction-sections -fdata-sections
+    QMAKE_CXXFLAGS += -ffunction-sections -fdata-sections
+    QMAKE_LFLAGS += -static -static-libgcc -static-libstdc++ -Wl,--gc-sections
+}
+
 SOURCES += \
+    src/embeddeddaemon.cpp \
     src/main.cpp \
     src/mainwindow.cpp \
     src/rpc.cpp \
@@ -64,8 +75,10 @@ SOURCES += \
     src/notifyserver.cpp
 
 HEADERS += \
+    src/embeddeddaemon.h \
     src/notifyserver.h \
     src/securerandom.h \
+    src/privatefile.h \
     src/mainwindow.h \
     src/precompiled.h \
     src/rpc.h \
