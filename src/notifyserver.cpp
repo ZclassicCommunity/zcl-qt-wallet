@@ -1,5 +1,7 @@
 #include "notifyserver.h"
 #include "securerandom.h"   // CSPRNG per-session token
+#include "privatefile.h"
+#include <QSaveFile>
 
 #include <QLocalServer>
 #include <QLocalSocket>
@@ -271,21 +273,20 @@ QString NotifyServer::readTokenFile(const QString& path) {
 
 bool NotifyServer::writeTokenFile() const {
     const QString p = defaultTokenPath();
-    QDir().mkpath(QFileInfo(p).absolutePath());
+    if (!QDir().mkpath(QFileInfo(p).absolutePath()))
+        return false;
 #ifndef Q_OS_WIN
     mode_t oldMask = ::umask(0077);   // born 0600 (no group/other), no TOCTOU window
 #endif
-    QFile f(p);
+    QSaveFile f(p);
     bool ok = f.open(QIODevice::WriteOnly | QIODevice::Truncate);
 #ifndef Q_OS_WIN
     ::umask(oldMask);
 #endif
     if (!ok)
         return false;
-    f.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);   // narrows a pre-existing file too
-    f.write(sessionToken.toLatin1());
-    f.close();
-    return true;
+    const QByteArray bytes = sessionToken.toLatin1();
+    return makeFileOwnerOnly(f) && f.write(bytes) == bytes.size() && f.commit();
 }
 
 int NotifyServer::sendNotify(const QString& socketPath, const QString& token, const QString& id) {
@@ -300,10 +301,16 @@ int NotifyServer::sendNotify(const QString& socketPath, const QString& token, co
     if (!s.waitForConnected(800))
         return 4;   // nobody listening (foreign daemon, or GUI closed)
 
-    s.write(token.toLatin1() + ' ' + id.toLatin1() + '\n');
+    const QByteArray payload = token.toLatin1() + ' ' + id.toLatin1() + '\n';
+    if (s.write(payload) != payload.size())
+        return 5;
     s.flush();
-    s.waitForBytesWritten(800);
-    s.waitForReadyRead(800);
+    // A Windows named pipe can finish the write during flush(). Waiting for
+    // another bytesWritten signal then burns the entire timeout per notify.
+    if (s.bytesToWrite() > 0 && !s.waitForBytesWritten(800))
+        return 5;
+    if (s.bytesAvailable() == 0 && !s.waitForReadyRead(800))
+        return 5;
     const QByteArray ack = s.readAll();
     s.disconnectFromServer();
     return (ack == "OK\n") ? 0 : 5;   // 0 only when the server acknowledged

@@ -5,11 +5,11 @@
 # zlib/pcre/libpng/freetype/harfbuzz are used; no OpenSSL/GL/DBus/ICU (the wallet talks
 # plain HTTP to the local RPC; HTTPS price/update are best-effort and already silenced).
 set -euo pipefail
-SRC=/home/rhett/mxe/pkg/qtbase-everywhere-opensource-src-5.15.19.tar.xz
-WORK=/home/rhett/qtwin
-PREFIX=/home/rhett/qt-win-static
+SRC="${SRC:?Set SRC to the Qt 5.15 qtbase source archive}"
+WORK="${WORK:?Set WORK to a dedicated Qt build directory}"
+PREFIX="${PREFIX:?Set PREFIX to the static Windows Qt install directory}"
 mkdir -p "$WORK"; cd "$WORK"
-DIR=qtbase-everywhere-src-5.15.19
+DIR="${DIR:-qtbase-everywhere-src-5.15.19}"
 [ -d "$DIR" ] || { echo "[extract] $SRC"; tar xf "$SRC"; }
 cd "$DIR"
 
@@ -27,7 +27,7 @@ if [ ! -f Makefile ]; then
 fi
 
 echo "[make] qtbase (this is the long part)"
-make -j"$(nproc)"
+make -j"${JOBS:-$(nproc)}"
 echo "[make install] -> $PREFIX"
 make install
 echo "QTBASE_WIN_DONE prefix=$PREFIX qmake=$PREFIX/bin/qmake"

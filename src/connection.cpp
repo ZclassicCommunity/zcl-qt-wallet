@@ -1,4 +1,5 @@
 #include "connection.h"
+#include "embeddeddaemon.h"
 #include "mainwindow.h"
 #include "settings.h"
 #include "securerandom.h"   // CONF-1: CSPRNG rpcpassword / notify token
@@ -688,6 +689,10 @@ bool ConnectionLoader::startEmbeddedZClassicd(const QStringList& extraArgs) {
     ezStdErr.clear();
 
     ezclassicd = new QProcess(main);
+    // By default the node writes persistent diagnostics to debug.log. Do not
+    // buffer unused stdout for the lifetime of a full-node session. Explicit
+    // printtoconsole output is discarded; startup stderr is still captured below.
+    ezclassicd->setStandardOutputFile(QProcess::nullDevice());
     QObject::connect(ezclassicd, &QProcess::started, [=] () {
         //qDebug() << "zclassicd started";
     });
@@ -724,7 +729,8 @@ bool ConnectionLoader::startEmbeddedZClassicd(const QStringList& extraArgs) {
         main->logger->write(QString("zclassicd finished: code=%1 status=%2")
                             .arg(exitCode).arg((int)exitStatus));
         // Drain any final stderr the readyRead signal hasn't delivered yet.
-        if (ezclassicd) ezStdErr.append(ezclassicd->readAllStandardError());
+        if (ezclassicd)
+            ezStdErr = (ezStdErr + QString::fromLocal8Bit(ezclassicd->readAllStandardError())).right(64 * 1024);
         if (ezWarmupTimer.isValid())
             ezNodeQuitDuringStartup = true;   // died before we ever connected
     });
@@ -741,10 +747,14 @@ bool ConnectionLoader::startEmbeddedZClassicd(const QStringList& extraArgs) {
     QObject::connect(ezclassicd, &QProcess::readyReadStandardError, [=]() {
         auto output = ezclassicd->readAllStandardError();
         main->logger->write("zclassicd stderr:" + output);
-        ezStdErr.append(output);
+        // Keep enough recent context for startup diagnosis, with bounded memory.
+        ezStdErr = (ezStdErr + QString::fromLocal8Bit(output)).right(64 * 1024);
     });
 
-    // Startup-speed defaults. -dbcache/-par/-maxsigcachesize apply on every launch.
+    // Startup-speed defaults. -par/-maxsigcachesize apply on every launch.
+    // Leave -dbcache to the daemon and zclassic.conf: forcing 450 MiB here
+    // disabled its 64-bit 1024 MiB default (2048 MiB during a rebuild) and
+    // overrode the user's cache setting, causing unnecessary disk flushes.
     // -checkblocks is added only on a NORMAL launch (gated below): the default
     // 288-block startup re-verification (~12h of 2.5-min blocks, re-read every launch)
     // is the bulk of the visible warmup; the chain was already validated when first
@@ -770,8 +780,7 @@ bool ConnectionLoader::startEmbeddedZClassicd(const QStringList& extraArgs) {
             }
         }
     }
-    launchArgs << "-dbcache=450"          // bigger chainstate cache
-               << "-par=0"                // auto-detect cores: parallel script
+    launchArgs << "-par=0"                // auto-detect cores: parallel script
                                           // verification (startup verify + IBD;
                                           // daemon default is single-threaded)
                << "-maxsigcachesize=128"; // fewer redundant signature re-verifies
@@ -828,132 +837,11 @@ QString ConnectionLoader::ensureDaemonExtracted() {
 #ifdef Q_OS_DARWIN
     return QString();   // never extract+exec on macOS (hardened-runtime / signed build)
 #else
-    static const QByteArray MAGIC = QByteArrayLiteral("ZQWDMON1");   // 8 bytes
-    const qint64 LEN_BYTES   = 8;
-    const qint64 HASH_BYTES  = 32;
-    const qint64 FOOTER      = MAGIC.size() + LEN_BYTES + HASH_BYTES;   // 48
-
-    QFile self(QCoreApplication::applicationFilePath());
-    if (!self.open(QIODevice::ReadOnly)) {
-        main->logger->write("ensureDaemonExtracted: cannot open self for reading: " + self.errorString());
-        return QString();
-    }
-    const qint64 selfSize = self.size();
-    if (selfSize < FOOTER)
-        return QString();
-
-    // Check the trailing magic; absent on a plain (un-bundled) GUI build.
-    self.seek(selfSize - MAGIC.size());
-    if (self.read(MAGIC.size()) != MAGIC)
-        return QString();
-
-    // Read the little-endian length and the expected hash.
-    self.seek(selfSize - MAGIC.size() - LEN_BYTES);
-    QByteArray lenBytes = self.read(LEN_BYTES);
-    quint64 len = 0;
-    for (int i = 0; i < LEN_BYTES; i++)
-        len |= (quint64)(uchar)lenBytes.at(i) << (8 * i);
-
-    self.seek(selfSize - MAGIC.size() - LEN_BYTES - HASH_BYTES);
-    QByteArray wantHash = self.read(HASH_BYTES);
-
-    const qint64 payloadOffset = selfSize - FOOTER - (qint64)len;
-    // Reject a zero/absurd/negative length: a corrupt or tampered 8-byte footer must
-    // not drive a multi-hour read that looks like a first-run hang. The current
-    // static-libgomp Linux daemon is ~176 MiB, so allow static release payloads
-    // while still bounding corrupted lengths well below multi-GiB reads.
-    const quint64 MAX_EMBEDDED_DAEMON_BYTES = 512ull * 1024 * 1024;
-    if (len == 0 || len > MAX_EMBEDDED_DAEMON_BYTES || payloadOffset < 0) {
-        main->logger->write("ensureDaemonExtracted: invalid embedded payload size=" + QString::number(len));
-        return QString();
-    }
-
-    // Content-addressed cache dir: name = first 16 hex chars of the daemon hash,
-    // so an app upgrade (new daemon) lands in a fresh dir and is re-extracted,
-    // while an unchanged daemon is reused. Other stamp dirs are pruned.
-    const QString stamp = QString::fromLatin1(wantHash.toHex().left(16));
-    QDir cacheRoot(QStandardPaths::writableLocation(QStandardPaths::CacheLocation));
-    cacheRoot.mkpath("zclassic-node");
-    QDir nodeDir(cacheRoot.filePath("zclassic-node"));
-    for (const QString& d : nodeDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot)) {
-        if (d != stamp)
-            QDir(nodeDir.filePath(d)).removeRecursively();
-    }
-    nodeDir.mkpath(stamp);
-
-#ifdef Q_OS_WIN
-    const QString outName = "zqw-zclassicd.exe";
-#else
-    const QString outName = "zqw-zclassicd";
-#endif
-    const QString outPath  = QDir(nodeDir.filePath(stamp)).filePath(outName);
-    const QString partPath = outPath + ".part";
-
-    auto makeExecutable = [](const QString& p) {
-#ifndef Q_OS_WIN
-        QFile::setPermissions(p, QFile::permissions(p)
-            | QFileDevice::ExeOwner | QFileDevice::ExeUser
-            | QFileDevice::ExeGroup | QFileDevice::ExeOther);
-#else
-        Q_UNUSED(p);
-#endif
-    };
-
-    // Fast path: already extracted (content-addressed dir + size match). Avoids
-    // re-hashing ~14MB on every launch.
-    if (QFile::exists(outPath) && QFileInfo(outPath).size() == (qint64)len) {
-        makeExecutable(outPath);
-        return outPath;
-    }
-    QFile::remove(outPath);
-
-    // Extract the payload to a .part file, hashing as we go.
-    if (!self.seek(payloadOffset)) {
-        main->logger->write("ensureDaemonExtracted: seek to payload offset failed");
-        return QString();
-    }
-    // Refuse to start a partial extract on a near-full disk (leaves a junk .part).
-    const qint64 avail = QStorageInfo(nodeDir.filePath(stamp)).bytesAvailable();
-    if (avail >= 0 && avail < (qint64)len + (16ll << 20)) {
-        main->logger->write(QString("ensureDaemonExtracted: insufficient disk: need %1 have %2")
-                                .arg((qint64)len + (16ll << 20)).arg(avail));
-        return QString();
-    }
-    QFile out(partPath);
-    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        main->logger->write("ensureDaemonExtracted: cannot open .part for writing: " + out.errorString());
-        return QString();
-    }
-
-    QCryptographicHash hasher(QCryptographicHash::Sha256);
-    qint64 remaining = (qint64)len;
-    const qint64 CHUNK = 1 << 20;
-    bool ok = true;
-    while (remaining > 0) {
-        QByteArray buf = self.read(qMin(CHUNK, remaining));
-        if (buf.isEmpty()) { ok = false; break; }
-        hasher.addData(buf);
-        if (out.write(buf) != buf.size()) { ok = false; break; }
-        remaining -= buf.size();
-    }
-    out.close();
-
-    if (!ok || remaining != 0 || hasher.result() != wantHash) {
-        main->logger->write("Embedded daemon payload failed verification; falling back");
-        QFile::remove(partPath);
-        return QString();
-    }
-
-    // Atomically publish, then set the exec bit.
-    QFile::remove(outPath);
-    if (!QFile::rename(partPath, outPath)) {
-        main->logger->write("ensureDaemonExtracted: rename .part -> final failed");
-        QFile::remove(partPath);
-        return QString();
-    }
-    makeExecutable(outPath);
-    main->logger->write("Extracted embedded daemon to " + outPath);
-    return outPath;
+    QString error;
+    const QString path = extractEmbeddedDaemon(QCoreApplication::applicationFilePath(),
+        QStandardPaths::writableLocation(QStandardPaths::CacheLocation), &error);
+    if (path.isEmpty()) main->logger->write("Embedded daemon: " + error);
+    return path;
 #endif // Q_OS_DARWIN
 }
 

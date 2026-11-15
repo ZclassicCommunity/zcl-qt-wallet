@@ -19,6 +19,7 @@ CONFIG  -= app_bundle
 # We run guiless via QT_QPA_PLATFORM=offscreen (no X server needed). svg is needed
 # by privacybadgedelegate.cpp (QSvgRenderer for the tinted badge icons).
 QT      += core testlib widgets network gui svg
+win32: LIBS += -ladvapi32
 
 # PRIV-13/14: compile the privacybadgedelegate test seams (testClassify/...). The
 # define gates ONLY the static forwarding accessors in privacybadgedelegate.h; it
@@ -40,6 +41,12 @@ INCLUDEPATH += $$PWD/shim
 INCLUDEPATH += $$PWD/../src
 INCLUDEPATH += $$PWD/../src/3rdparty
 
+# Quoted includes search the product source directory BEFORE INCLUDEPATH.
+# Preload the shims (which share product header guards) so clean/shadow builds
+# do not accidentally pull the full RPC/UI dependency graph into this suite.
+CONFIG += precompile_header
+PRECOMPILED_HEADER = $$PWD/shim/preload.h
+
 # addresscombo.h + privacybadgedelegate.h carry Q_OBJECT -> qmake must run moc on
 # them (generates the vtable). Listing them in HEADERS triggers that without
 # touching the source files.
@@ -51,6 +58,7 @@ HEADERS += ../src/privacybadgedelegate.h
 # tests exercise ONLY classify*/labelFor/colorFor via the test seam (no painting),
 # but linking the whole TU keeps the tested logic byte-identical to production.
 SOURCES += \
+    ../src/embeddeddaemon.cpp \
     ../src/settings.cpp \
     ../src/senttxstore.cpp \
     ../src/addresscombo.cpp \
@@ -60,5 +68,6 @@ SOURCES += \
 
 # Static-Qt offscreen platform plugin import (no X server in the chroot).
 static {
-    QTPLUGIN.platforms = qoffscreen
+    win32: QTPLUGIN.platforms = qwindows
+    else: QTPLUGIN.platforms = qoffscreen
 }
